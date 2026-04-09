@@ -1,13 +1,13 @@
 import sys
 
-from tools.bun import install_bun_packages
-from tools.curl_shell import install_curl_shell_scripts
-from tools.git_repos import install_git_repos
 from tools.log import Color, log
-from tools.mcp import install_mcp_servers
-from tools.npm import install_npm_packages
 from tools.state import load_json, migrate_state_file, save_json
-from tools.uv import install_uv_packages
+from tools.user.bun import install_bun_packages
+from tools.user.curl_shell import install_curl_shell_scripts
+from tools.user.git_repos import install_git_repos
+from tools.user.mcp import install_mcp_servers
+from tools.user.npm import install_npm_packages
+from tools.user.uv import install_uv_packages
 
 
 def main():
