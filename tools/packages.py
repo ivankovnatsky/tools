@@ -63,9 +63,7 @@ def migrate_state_file(new_state_file: str):
             return
 
 
-def run_command(
-    cmd: List[str], env: Dict = None, cwd: str = None
-) -> tuple[int, str, str]:
+def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int, str, str]:
     result = subprocess.run(
         cmd, capture_output=True, text=True, env=env or os.environ.copy(), cwd=cwd
     )
@@ -134,9 +132,7 @@ def pkg_install_spec(name: str, version: str) -> str:
 def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
     """Check if declared version differs from state."""
     declared = get_pkg_version(pkg_info)
-    stored = (
-        state.get(manager, {}).get("packages", {}).get(pkg, {}).get("version", "latest")
-    )
+    stored = state.get(manager, {}).get("packages", {}).get(pkg, {}).get("version", "latest")
     return declared != stored
 
 
@@ -191,9 +187,7 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
     to_install = []
     for pkg, pkg_info in packages.items():
         binary = get_pkg_binary(pkg_info)
-        if not (bun_bin / binary).exists() or version_changed(
-            pkg, pkg_info, state, "bun"
-        ):
+        if not (bun_bin / binary).exists() or version_changed(pkg, pkg_info, state, "bun"):
             to_install.append(pkg_install_spec(pkg, get_pkg_version(pkg_info)))
     if to_install:
         log(f"Installing bun packages: {', '.join(to_install)}", Color.GREEN)
@@ -272,9 +266,7 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
     to_install = []
     for pkg, pkg_info in packages.items():
         binary = get_pkg_binary(pkg_info)
-        if not (npm_bin / binary).exists() or version_changed(
-            pkg, pkg_info, state, "npm"
-        ):
+        if not (npm_bin / binary).exists() or version_changed(pkg, pkg_info, state, "npm"):
             to_install.append(pkg_install_spec(pkg, get_pkg_version(pkg_info)))
     if to_install:
         log(f"Installing npm packages: {', '.join(to_install)}", Color.GREEN)
@@ -474,9 +466,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
         return True
 
     env = os.environ.copy()
-    env["PATH"] = (
-        f"{paths['nodejs']}:{paths['npmBin']}:{paths['python']}:{env.get('PATH', '')}"
-    )
+    env["PATH"] = f"{paths['nodejs']}:{paths['npmBin']}:{paths['python']}:{env.get('PATH', '')}"
 
     desired = set(servers.keys())
     current = get_installed_mcp_servers(claude_cli, env)
@@ -582,9 +572,7 @@ def install_curl_shell_scripts(scripts: Dict[str, str], paths: Dict, state: Dict
         shell = scripts[url]
         log(f"Running: curl -fsSL {url} | {shell}", Color.GREEN)
 
-        shell_path = (
-            f"{paths.get('bash', '/bin')}/{shell}" if shell == "bash" else shell
-        )
+        shell_path = f"{paths.get('bash', '/bin')}/{shell}" if shell == "bash" else shell
 
         curl_cmd = [f"{paths['curl']}/curl", "-fsSL", url]
         curl_proc = subprocess.Popen(
@@ -690,29 +678,21 @@ def main():
 
     bun_packages = bun_config.get("packages", {})
     bun_only_config = {"configFile": bun_config.get("configFile")}
-    success &= install_bun_packages(
-        bun_packages, config["paths"], state, bun_only_config
-    )
+    success &= install_bun_packages(bun_packages, config["paths"], state, bun_only_config)
 
     npm_packages = npm_config.get("packages", {})
     npm_only_config = {"configFile": npm_config.get("configFile")}
-    success &= install_npm_packages(
-        npm_packages, config["paths"], state, npm_only_config
-    )
+    success &= install_npm_packages(npm_packages, config["paths"], state, npm_only_config)
 
     if config.get("uv", {}).get("packages"):
         success &= install_uv_packages(config["uv"]["packages"], config["paths"], state)
 
     # Always call install_mcp_servers to handle both installation and removal
     # Even if servers is empty, we need to remove any existing servers
-    success &= install_mcp_servers(
-        config.get("mcp", {}).get("servers", {}), config["paths"], state
-    )
+    success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), config["paths"], state)
 
     if config.get("curlShell"):
-        success &= install_curl_shell_scripts(
-            config["curlShell"], config["paths"], state
-        )
+        success &= install_curl_shell_scripts(config["curlShell"], config["paths"], state)
 
     if config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], config["paths"], state)
