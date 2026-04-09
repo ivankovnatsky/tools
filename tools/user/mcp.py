@@ -2,7 +2,7 @@ import os
 from typing import Dict, Set
 
 from tools.log import Color, log
-from tools.util import run_command, substitute_secrets
+from tools.util import SecretSubstitutionError, run_command, substitute_secrets
 
 
 def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Set[str]:
@@ -77,9 +77,20 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                     server_name,
                 ]
                 secret_paths = server_config.get("secretPaths", {})
+                header_failed = False
                 for header in server_config.get("headers", []):
-                    processed_header = substitute_secrets(header, secret_paths)
+                    try:
+                        processed_header = substitute_secrets(header, secret_paths)
+                    except SecretSubstitutionError as e:
+                        log(
+                            f"Skipping {server_name}: {e}",
+                            Color.RED,
+                        )
+                        header_failed = True
+                        break
                     cmd.extend(["-H", processed_header])
+                if header_failed:
+                    continue
                 args = server_config.get("args", [])
                 if args:
                     cmd.append("--")
@@ -108,9 +119,10 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
         state.setdefault("mcp", {})["servers"] = {
             name: {
                 "installed": True,
-                "scope": config["scope"],
-                "transport": config["transport"],
-                "url": config["url"],
+                "scope": config.get("scope"),
+                "transport": config.get("transport"),
+                "url": config.get("url"),
+                "command": config.get("command"),
             }
             for name, config in servers.items()
         }
