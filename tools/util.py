@@ -1,0 +1,61 @@
+import os
+import subprocess
+from typing import Dict, List
+
+from tools.log import Color, log
+
+
+def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int, str, str]:
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, env=env or os.environ.copy(), cwd=cwd
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def get_pkg_binary(pkg_info: Dict) -> str:
+    """Extract binary name from package info dict."""
+    return pkg_info.get("binary", "")
+
+
+def get_pkg_version(pkg_info: Dict) -> str:
+    """Extract version from package info dict."""
+    return pkg_info.get("version", "latest")
+
+
+def get_pkg_subpackages(pkg_info: Dict) -> Dict:
+    """Extract subpackages dict from package info dict."""
+    return pkg_info.get("subpackages", {})
+
+
+def get_pkg_post_install(pkg_info: Dict) -> str:
+    """Extract postInstall command from package info dict."""
+    return pkg_info.get("postInstall", "")
+
+
+def pkg_install_spec(name: str, version: str) -> str:
+    """Build package@version install specifier."""
+    if version and version != "latest":
+        return f"{name}@{version}"
+    return name
+
+
+def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
+    """Check if declared version differs from state."""
+    declared = get_pkg_version(pkg_info)
+    stored = state.get(manager, {}).get("packages", {}).get(pkg, {}).get("version", "latest")
+    return declared != stored
+
+
+def substitute_secrets(text: str, secret_paths: Dict[str, str]) -> str:
+    """Replace @VARIABLE@ placeholders with content from secret files."""
+    result = text
+    for var_name, file_path in secret_paths.items():
+        placeholder = f"@{var_name}@"
+        if placeholder in result:
+            try:
+                with open(file_path, "r") as f:
+                    secret_value = f.read().strip()
+                result = result.replace(placeholder, secret_value)
+            except Exception as e:
+                log(f"Failed to read secret file {file_path}: {e}", Color.RED)
+    return result
