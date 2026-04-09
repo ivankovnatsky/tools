@@ -21,7 +21,7 @@
         };
 
         # Keep in sync with pyproject.toml
-        pythonPackages = ps: with ps; [ ];
+        pythonPackages = ps: with ps; [ pyyaml ];
 
         toolsPackage = pkgs.python3Packages.buildPythonApplication {
           pname = "tools";
