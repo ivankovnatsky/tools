@@ -52,7 +52,7 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            pkgs.python3
+            (pkgs.python3.withPackages pythonPackages)
             pkgs.poetry
             pkgs.treefmt
             pkgs.nixfmt-rfc-style
