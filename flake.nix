@@ -57,7 +57,7 @@
             pkgs.treefmt
             pkgs.nixfmt-rfc-style
             pkgs.ruff
-            pkgs.nodePackages.prettier
+            pkgs.prettier
             pkgs.python3Packages.pre-commit-hooks
             pkgs.just
           ];
