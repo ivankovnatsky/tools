@@ -46,16 +46,28 @@ def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
     return declared != stored
 
 
+class SecretSubstitutionError(Exception):
+    """Raised when a referenced secret file cannot be read."""
+
+
 def substitute_secrets(text: str, secret_paths: Dict[str, str]) -> str:
-    """Replace @VARIABLE@ placeholders with content from secret files."""
+    """Replace @VARIABLE@ placeholders with content from secret files.
+
+    Raises SecretSubstitutionError if a referenced secret file cannot be read,
+    so callers fail fast instead of passing half-substituted text downstream.
+    """
     result = text
     for var_name, file_path in secret_paths.items():
         placeholder = f"@{var_name}@"
-        if placeholder in result:
-            try:
-                with open(file_path, "r") as f:
-                    secret_value = f.read().strip()
-                result = result.replace(placeholder, secret_value)
-            except Exception as e:
-                log(f"Failed to read secret file {file_path}: {e}", Color.RED)
+        if placeholder not in result:
+            continue
+        try:
+            with open(file_path, "r") as f:
+                secret_value = f.read().strip()
+        except Exception as e:
+            log(f"Failed to read secret file {file_path}: {e}", Color.RED)
+            raise SecretSubstitutionError(
+                f"cannot read secret file {file_path} for @{var_name}@: {e}"
+            ) from e
+        result = result.replace(placeholder, secret_value)
     return result
