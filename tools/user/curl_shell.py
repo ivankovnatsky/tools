@@ -47,6 +47,15 @@ def install_curl_shell_scripts(scripts: Dict[str, str], paths: Dict, state: Dict
 
         curl_proc.stdout.close()
         stdout, stderr = shell_proc.communicate()
+        curl_proc.wait()
+
+        if curl_proc.returncode != 0:
+            curl_stderr = curl_proc.stderr.read().decode() if curl_proc.stderr else ""
+            log(
+                f"Failed to fetch {url} (curl exit {curl_proc.returncode}): {curl_stderr}",
+                Color.RED,
+            )
+            continue
 
         if shell_proc.returncode != 0:
             log(f"Failed to run script from {url}: {stderr.decode()}", Color.RED)
