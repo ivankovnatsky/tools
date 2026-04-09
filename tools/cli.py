@@ -23,7 +23,7 @@ def main():
     else:
         config = load_config(config_path)
 
-    state_file = config["stateFile"]
+    state_file = os.path.expanduser(config["stateFile"])
     migrate_state_file(state_file)
     state = load_json(state_file)
 
