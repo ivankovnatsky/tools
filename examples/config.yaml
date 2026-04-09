@@ -8,7 +8,7 @@
 #
 # Supported formats in a config directory: .json, .yaml, .yml, .toml.
 
-stateFile: ~/.config/home-manager/tools/state.json
+stateFile: ~/.local/state/tools/state.json
 
 paths:
   bun: ~/.bun
