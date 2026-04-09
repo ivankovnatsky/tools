@@ -11,6 +11,12 @@ gh repo create ivankovnatsky/tools --public \
   --description "Declarative configuration manager"
 ```
 
+Cloned locally:
+
+```console
+gh repo clone ivankovnatsky/tools
+```
+
 Local `main` branch initialized with an empty commit:
 
 ```console
