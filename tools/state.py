@@ -1,12 +1,21 @@
 import json
 import os
 import shutil
-from typing import Dict
+from typing import Dict, List
 
 from tools.log import Color, log
 
 LEGACY_STATE_DIRS = [
     "manual-packages",  # Original name, renamed to "tools" in 2026-01
+]
+
+# Full legacy state file paths, tried in order. Used when the state
+# file was relocated into a different parent directory (e.g. moving
+# out of ~/.config/ into the XDG state dir).
+# Each entry is expanded with os.path.expanduser at lookup time.
+LEGACY_STATE_FILES: List[str] = [
+    "~/.config/home-manager/tools/state.json",
+    "~/.config/home-manager/manual-packages/state.json",
 ]
 
 
@@ -28,20 +37,36 @@ def migrate_state_file(new_state_file: str):
     if os.path.exists(new_state_file):
         return
 
-    # Get the base directory pattern: ~/.config/home-manager/<name>/state.json
-    # We replace the current dir name with each legacy name to check
+    # 1. Sibling-directory renames: same parent dir, different leaf name.
     state_dir = os.path.dirname(new_state_file)
     parent_dir = os.path.dirname(state_dir)
     state_filename = os.path.basename(new_state_file)
 
     for legacy_dir in LEGACY_STATE_DIRS:
         old_state_file = os.path.join(parent_dir, legacy_dir, state_filename)
-        if os.path.exists(old_state_file):
-            log(
-                f"Migrating state file from {old_state_file} to {new_state_file}",
-                Color.YELLOW,
-            )
-            os.makedirs(os.path.dirname(new_state_file), exist_ok=True)
-            shutil.copy2(old_state_file, new_state_file)
-            log("State file migrated successfully", Color.GREEN)
+        if os.path.exists(old_state_file) and os.path.abspath(old_state_file) != os.path.abspath(
+            new_state_file
+        ):
+            _migrate(old_state_file, new_state_file)
             return
+
+    # 2. Full-path relocations: file used to live somewhere else
+    # entirely (e.g. ~/.config/home-manager/tools/state.json before the
+    # move to ~/.local/state/tools/state.json).
+    for legacy_template in LEGACY_STATE_FILES:
+        old_state_file = os.path.expanduser(legacy_template)
+        if os.path.exists(old_state_file) and os.path.abspath(old_state_file) != os.path.abspath(
+            new_state_file
+        ):
+            _migrate(old_state_file, new_state_file)
+            return
+
+
+def _migrate(old_state_file: str, new_state_file: str):
+    log(
+        f"Migrating state file from {old_state_file} to {new_state_file}",
+        Color.YELLOW,
+    )
+    os.makedirs(os.path.dirname(new_state_file), exist_ok=True)
+    shutil.copy2(old_state_file, new_state_file)
+    log("State file migrated successfully", Color.GREEN)
