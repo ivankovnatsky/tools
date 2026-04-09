@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Declarative configuration manager"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+]
 
 [project.scripts]
 tools = "tools.cli:main"
