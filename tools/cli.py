@@ -1,5 +1,7 @@
+import os
 import sys
 
+from tools.config import load_config, load_config_dir
 from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.bun import install_bun_packages
@@ -12,11 +14,14 @@ from tools.user.uv import install_uv_packages
 
 def main():
     if len(sys.argv) < 3 or sys.argv[1] != "--config":
-        log("Usage: tools --config <config.json>", Color.RED)
+        log("Usage: tools --config <file-or-directory>", Color.RED)
         sys.exit(1)
 
     config_path = sys.argv[2]
-    config = load_json(config_path)
+    if os.path.isdir(config_path):
+        config = load_config_dir(config_path)
+    else:
+        config = load_config(config_path)
 
     state_file = config["stateFile"]
     migrate_state_file(state_file)
