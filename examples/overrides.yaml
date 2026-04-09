@@ -1,0 +1,16 @@
+# Sample host override file.
+#
+# Demonstrates per-host overrides of the shared `paths` block — for
+# hosts where packages must live outside `$HOME` (e.g. on external
+# storage).
+#
+# With `tools --config examples/`, this file is merged on top of
+# `config.yaml` lexicographically: `config.yaml` loads first, then
+# `overrides.yaml` replaces any overlapping scalar keys while leaving
+# untouched keys alone.
+
+paths:
+  bun: /Volumes/Storage/Data/bun
+  npm: /Volumes/Storage/Data/npm
+  uv: /Volumes/Storage/Data/uv/tools
+  gitRepos: /Volumes/Storage/Data/Sources
