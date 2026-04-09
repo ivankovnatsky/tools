@@ -1,3 +1,11 @@
+[formatter.end-of-file-fixer]
+command = "end-of-file-fixer"
+includes = ["*.py", "*.toml", "*.nix", "*.md", "*.json", "*.yml", "*.yaml", "*.lock", ".gitignore", ".envrc"]
+
+[formatter.trailing-whitespace-fixer]
+command = "trailing-whitespace-fixer"
+includes = ["*.py", "*.toml", "*.nix", "*.md", "*.json", "*.yml", "*.yaml"]
+
 [formatter.ruff]
 command = "ruff"
 options = ["format"]
@@ -14,5 +22,5 @@ includes = ["*.nix"]
 
 [formatter.prettier]
 command = "prettier"
-options = ["--write"]
+options = ["--write", "--prose-wrap", "always"]
 includes = ["*.md", "*.json", "*.yml", "*.yaml"]
