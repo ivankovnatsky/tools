@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 
 [project.scripts]
-tools = "tools.packages:main"
+tools = "tools.cli:main"
 
 [tool.ruff]
 line-length = 100
