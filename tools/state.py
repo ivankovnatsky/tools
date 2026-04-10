@@ -20,10 +20,10 @@ LEGACY_STATE_FILES: List[str] = [
 
 
 def _remove_if_dir(path: str):
-    """Remove path if it is a directory (created by mistake)."""
+    """Remove path if it is an empty directory (created by mistake)."""
     if os.path.isdir(path):
-        log(f"Removing directory at {path} (should be a file)", Color.YELLOW)
-        shutil.rmtree(path)
+        log(f"Removing empty directory at {path} (should be a file)", Color.YELLOW)
+        os.rmdir(path)
 
 
 def load_json(path: str) -> Dict:
