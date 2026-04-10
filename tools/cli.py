@@ -4,6 +4,7 @@ import sys
 import click
 
 from tools.config import deep_merge, load_config, load_config_dir
+from tools.diff import show_diff
 from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.brew import install_brew_packages
@@ -101,9 +102,11 @@ def apply(config):
 @click.option("--config", multiple=True, default=["."])
 def diff(config):
     """Show what would change (dry-run)."""
-    _load_merged_config(list(config))
-    log("diff is not implemented yet", Color.YELLOW)
-    sys.exit(1)
+    config_paths = list(config)
+    merged = _load_merged_config(config_paths)
+    config_dir = _resolve_config_dir(config_paths)
+    if not show_diff(merged, config_dir):
+        sys.exit(1)
 
 
 @main.command(hidden=True)
