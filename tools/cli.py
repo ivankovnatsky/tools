@@ -48,10 +48,10 @@ def main():
     success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), config["paths"], state)
 
     if config.get("curlShell"):
-        success &= install_curl_shell_scripts(config["curlShell"], config["paths"], state)
+        success &= install_curl_shell_scripts(config["curlShell"], state)
 
     if config.get("gitRepos"):
-        success &= install_git_repos(config["gitRepos"], config["paths"], state)
+        success &= install_git_repos(config["gitRepos"], state)
 
     save_json(state_file, state)
 
