@@ -1,3 +1,11 @@
+# Show what would change (dry-run)
+diff:
+    tools diff
+
+# Apply config to bring system to desired state
+deploy:
+    tools deploy
+
 # Format and lint code
 format:
     treefmt
