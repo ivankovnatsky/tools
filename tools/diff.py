@@ -11,9 +11,6 @@ from tools.log import Color, log
 from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
 
 
-def _section(title: str):
-    log(f"\n{title}:", Color.BLUE)
-
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     changes = []
@@ -312,8 +309,9 @@ def show_diff(config: dict, config_dir: str) -> bool:
 
     if sections:
         has_changes = True
-        for title, items in sections:
-            _section(title)
+        for i, (title, items) in enumerate(sections):
+            prefix = "\n" if i > 0 else ""
+            log(f"{prefix}{title}:", Color.BLUE)
             for item in items:
                 log(item, Color.YELLOW)
 
