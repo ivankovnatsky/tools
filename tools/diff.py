@@ -245,41 +245,46 @@ def _diff_brew(brew_config: Dict):
 
 def show_diff(config: dict, config_dir: str) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
-    state_file = os.path.expanduser(config["stateFile"])
     state = {}
-    if os.path.exists(state_file):
+    state_path = config.get("stateFile")
+    if state_path:
         from tools.state import load_json
 
-        state = load_json(state_file)
+        state_file = os.path.expanduser(state_path)
+        if os.path.exists(state_file):
+            state = load_json(state_file)
 
     has_changes = False
+    paths = config.get("paths", {})
 
     sections = []
 
     bun_config = config.get("bun", {})
     bun_packages = bun_config.get("packages", {})
-    if bun_packages or state.get("bun", {}).get("packages"):
+    if (bun_packages or state.get("bun", {}).get("packages")) and paths.get("bunBin"):
         changes = _diff_bun(
-            bun_packages, config["paths"], state, {"configFile": bun_config.get("configFile")}
+            bun_packages, paths, state, {"configFile": bun_config.get("configFile")}
         )
         if changes:
             sections.append(("bun", changes))
 
     npm_config = config.get("npm", {})
     npm_packages = npm_config.get("packages", {})
-    if npm_packages or state.get("npm", {}).get("packages"):
+    if (npm_packages or state.get("npm", {}).get("packages")) and paths.get("npmBin"):
         changes = _diff_npm(
-            npm_packages, config["paths"], state, {"configFile": npm_config.get("configFile")}
+            npm_packages, paths, state, {"configFile": npm_config.get("configFile")}
         )
         if changes:
             sections.append(("npm", changes))
 
-    if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
-        changes = _diff_uv(config.get("uv", {}).get("packages", {}), config["paths"], state)
+    if (config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages")) and paths.get(
+        "uvBin"
+    ):
+        changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
         if changes:
             sections.append(("uv", changes))
 
-    changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), config["paths"], state)
+    changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)
     if changes:
         sections.append(("mcp", changes))
 
