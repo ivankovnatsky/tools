@@ -47,10 +47,13 @@ def pkg_install_spec(name: str, version: str, source: str = "") -> str:
 
 
 def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
-    """Check if declared version differs from state."""
-    declared = get_pkg_version(pkg_info)
-    stored = state.get(manager, {}).get("packages", {}).get(pkg, {}).get("version", "latest")
-    return declared != stored
+    """Check if declared version or source differs from state."""
+    pkg_state = state.get(manager, {}).get("packages", {}).get(pkg, {})
+    declared_version = get_pkg_version(pkg_info)
+    stored_version = pkg_state.get("version", "latest")
+    declared_source = get_pkg_source(pkg_info)
+    stored_source = pkg_state.get("source", "")
+    return declared_version != stored_version or declared_source != stored_source
 
 
 class SecretSubstitutionError(Exception):
