@@ -1,7 +1,7 @@
 import os
 import sys
 
-from tools.config import load_config, load_config_dir
+from tools.config import deep_merge, load_config, load_config_dir
 from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.bun import install_bun_packages
@@ -12,16 +12,32 @@ from tools.user.npm import install_npm_packages
 from tools.user.uv import install_uv_packages
 
 
+def _parse_config_args(argv: list[str]) -> list[str]:
+    """Extract config paths from repeated --config arguments."""
+    paths = []
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--config" and i + 1 < len(argv):
+            paths.append(argv[i + 1])
+            i += 2
+        else:
+            i += 1
+    return paths
+
+
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] != "--config":
-        log("Usage: tools --config <file-or-directory>", Color.RED)
+    config_paths = _parse_config_args(sys.argv)
+    if not config_paths:
+        log("Usage: tools --config <file-or-dir> [--config <file> ...]", Color.RED)
         sys.exit(1)
 
-    config_path = sys.argv[2]
-    if os.path.isdir(config_path):
-        config = load_config_dir(config_path)
-    else:
-        config = load_config(config_path)
+    config: dict = {}
+    for config_path in config_paths:
+        if os.path.isdir(config_path):
+            loaded = load_config_dir(config_path)
+        else:
+            loaded = load_config(config_path)
+        config = deep_merge(config, loaded)
 
     state_file = os.path.expanduser(config["stateFile"])
     migrate_state_file(state_file)
