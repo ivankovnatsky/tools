@@ -27,6 +27,8 @@ _DARWIN = {
     "curl": "/usr/bin/curl",
     "bash": "/bin/bash",
     "perl": "/usr/bin/perl",
+    "brew": "/opt/homebrew/bin/brew",
+    "mas": "/opt/homebrew/bin/mas",
 }
 
 # Generic Linux (Debian, Arch, Ubuntu, Fedora, ...).

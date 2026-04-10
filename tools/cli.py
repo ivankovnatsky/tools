@@ -4,6 +4,7 @@ import sys
 from tools.config import deep_merge, load_config, load_config_dir
 from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
+from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.git_repos import install_git_repos
@@ -68,6 +69,10 @@ def main():
 
     if config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], state)
+
+    # Always call install_brew_packages to handle both installation and removal
+    # Even if brew section is empty, we need to remove any existing packages
+    success &= install_brew_packages(config.get("brew", {}), state)
 
     save_json(state_file, state)
 
