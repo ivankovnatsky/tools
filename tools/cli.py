@@ -39,27 +39,30 @@ def _load_merged_config(config_paths: list[str]) -> dict:
 
 def _deploy(config: dict, config_dir: str) -> bool:
     """Apply config to bring system to desired state. Returns True on success."""
-    state_file = os.path.expanduser(config["stateFile"])
+    state_file = os.path.expanduser(
+        config.get("stateFile", "~/.local/state/tools/state.json")
+    )
     migrate_state_file(state_file)
     state = load_json(state_file)
 
     success = True
+    paths = config.get("paths", {})
 
     bun_config = config.get("bun", {})
     npm_config = config.get("npm", {})
 
     bun_packages = bun_config.get("packages", {})
     bun_only_config = {"configFile": bun_config.get("configFile")}
-    success &= install_bun_packages(bun_packages, config["paths"], state, bun_only_config)
+    success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
 
     npm_packages = npm_config.get("packages", {})
     npm_only_config = {"configFile": npm_config.get("configFile")}
-    success &= install_npm_packages(npm_packages, config["paths"], state, npm_only_config)
+    success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
 
     if config.get("uv", {}).get("packages"):
-        success &= install_uv_packages(config["uv"]["packages"], config["paths"], state)
+        success &= install_uv_packages(config["uv"]["packages"], paths, state)
 
-    success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), config["paths"], state)
+    success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
 
     if config.get("curlShell"):
         success &= install_curl_shell_scripts(config["curlShell"], state)
