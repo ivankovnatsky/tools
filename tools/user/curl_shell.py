@@ -3,9 +3,10 @@ import subprocess
 from typing import Dict
 
 from tools.log import Color, log
+from tools.system_paths import system_bin, system_dir, system_dir_optional
 
 
-def install_curl_shell_scripts(scripts: Dict[str, str], paths: Dict, state: Dict):
+def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     """Install scripts via curl piped to shell interpreter."""
     if not scripts:
         return True
@@ -18,11 +19,17 @@ def install_curl_shell_scripts(scripts: Dict[str, str], paths: Dict, state: Dict
         log("All curl shell scripts already installed", Color.BLUE)
         return True
 
+    curl_bin = system_bin("curl")
+    bash_dir = system_dir("bash")
+    curl_dir = system_dir("curl")
+    perl_dir = system_dir_optional("perl")
+
     env = os.environ.copy()
-    env["PATH"] = (
-        f"{paths.get('bash', '/bin')}:{paths['curl']}:"
-        f"{paths.get('perl', '')}:{paths.get('coreutils', '')}:{env.get('PATH', '')}"
-    )
+    path_parts = [bash_dir, curl_dir]
+    if perl_dir:
+        path_parts.append(perl_dir)
+    path_parts.append(env.get("PATH", ""))
+    env["PATH"] = ":".join(path_parts)
 
     state_changed = False
 
@@ -30,9 +37,9 @@ def install_curl_shell_scripts(scripts: Dict[str, str], paths: Dict, state: Dict
         shell = scripts[url]
         log(f"Running: curl -fsSL {url} | {shell}", Color.GREEN)
 
-        shell_path = f"{paths.get('bash', '/bin')}/{shell}" if shell == "bash" else shell
+        shell_path = f"{bash_dir}/{shell}" if shell == "bash" else shell
 
-        curl_cmd = [f"{paths['curl']}/curl", "-fsSL", url]
+        curl_cmd = [curl_bin, "-fsSL", url]
         curl_proc = subprocess.Popen(
             curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
         )
