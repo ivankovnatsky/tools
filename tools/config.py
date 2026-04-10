@@ -54,9 +54,7 @@ def _load_raw(path: str) -> Dict[str, Any]:
     raise ValueError(f"Unsupported config file suffix {suffix!r}: {path}")
 
 
-def load_config(
-    path: str, _seen: Optional[Set[str]] = None
-) -> Dict[str, Any]:
+def load_config(path: str, _seen: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Load a config file and resolve include directives.
 
     If the file contains an ``include:`` key with a list of relative
@@ -88,8 +86,7 @@ def load_config(
 
     if not isinstance(includes, list):
         raise TypeError(
-            f"include: must be a list of paths, got {type(includes).__name__} "
-            f"in {path}"
+            f"include: must be a list of paths, got {type(includes).__name__} in {path}"
         )
 
     base_dir = os.path.dirname(abs_path)
@@ -147,9 +144,7 @@ def load_config_dir(path: str) -> Dict[str, Any]:
     return _load_flat_dir(path)
 
 
-def _load_host_config(
-    config_dir: str, machines_dir: str
-) -> Dict[str, Any]:
+def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
     """Load config for the current host from machines/<hostname>.*."""
     hostname = _get_hostname()
 
@@ -163,8 +158,7 @@ def _load_host_config(
 
     if not host_file:
         log(
-            f"No machine config found for hostname {hostname!r} "
-            f"in {machines_dir}",
+            f"No machine config found for hostname {hostname!r} in {machines_dir}",
             Color.YELLOW,
         )
 
