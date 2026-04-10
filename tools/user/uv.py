@@ -94,6 +94,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
                 "installed": True,
                 "binary": get_pkg_binary(pkg_info),
                 "version": get_pkg_version(pkg_info),
+                "source": get_pkg_source(pkg_info),
             }
             for pkg, pkg_info in packages.items()
         }
