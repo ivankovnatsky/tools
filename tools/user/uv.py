@@ -5,6 +5,7 @@ from typing import Dict, Set
 from tools.log import Color, log
 from tools.util import (
     get_pkg_binary,
+    get_pkg_source,
     get_pkg_version,
     pkg_install_spec,
     run_command,
@@ -71,7 +72,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
 
         for pkg in to_install:
             pkg_info = packages[pkg]
-            spec = pkg_install_spec(pkg, get_pkg_version(pkg_info))
+            spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), get_pkg_source(pkg_info))
             cmd = [f"{paths['uv']}/uv", "tool", "install", spec]
             # Force reinstall if already present but version changed
             if pkg in current:
