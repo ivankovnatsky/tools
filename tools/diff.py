@@ -11,7 +11,6 @@ from tools.log import Color, log
 from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
 
 
-
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     changes = []
     bun_bin = Path(paths["bunBin"])
