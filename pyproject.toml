@@ -9,6 +9,7 @@ description = "Declarative configuration manager"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "click",
     "pyyaml",
 ]
 
