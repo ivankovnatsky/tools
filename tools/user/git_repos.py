@@ -3,10 +3,11 @@ import shutil
 from typing import Dict
 
 from tools.log import Color, log
+from tools.system_paths import system_bin, system_dir
 from tools.util import run_command
 
 
-def install_git_repos(repos: Dict[str, str], paths: Dict, state: Dict):
+def install_git_repos(repos: Dict[str, str], state: Dict):
     """Clone or update git repositories to specified paths."""
     if not repos:
         return True
@@ -16,8 +17,16 @@ def install_git_repos(repos: Dict[str, str], paths: Dict, state: Dict):
     to_install = desired - installed
     to_remove = installed - desired
 
+    if not to_install and not to_remove:
+        log("All git repos already installed", Color.BLUE)
+        if installed != desired:
+            state.setdefault("gitRepos", {})["installed"] = list(installed)
+        return True
+
+    git_bin = system_bin("git")
+
     env = os.environ.copy()
-    env["PATH"] = f"{paths['git']}:{env.get('PATH', '')}"
+    env["PATH"] = f"{system_dir('git')}:{env.get('PATH', '')}"
 
     state_changed = False
 
@@ -35,7 +44,7 @@ def install_git_repos(repos: Dict[str, str], paths: Dict, state: Dict):
 
         if os.path.exists(expanded_path):
             log(f"Updating git repo: {dest_path}", Color.BLUE)
-            cmd = [f"{paths['git']}/git", "-C", expanded_path, "pull", "--ff-only"]
+            cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
             returncode, stdout, stderr = run_command(cmd, env)
             if returncode != 0:
                 log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
@@ -43,7 +52,7 @@ def install_git_repos(repos: Dict[str, str], paths: Dict, state: Dict):
             log(f"Cloning git repo: {repo_url} -> {dest_path}", Color.GREEN)
             parent_dir = os.path.dirname(expanded_path)
             os.makedirs(parent_dir, exist_ok=True)
-            cmd = [f"{paths['git']}/git", "clone", repo_url, expanded_path]
+            cmd = [git_bin, "clone", repo_url, expanded_path]
             returncode, stdout, stderr = run_command(cmd, env)
             if returncode != 0:
                 log(f"Failed to clone {repo_url}: {stderr}", Color.RED)
@@ -51,9 +60,6 @@ def install_git_repos(repos: Dict[str, str], paths: Dict, state: Dict):
 
         installed.add(dest_path)
         state_changed = True
-
-    if not to_install and not to_remove:
-        log("All git repos already installed", Color.BLUE)
 
     if state_changed or installed != desired:
         state.setdefault("gitRepos", {})["installed"] = list(installed)
