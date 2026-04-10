@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -13,25 +14,8 @@ from tools.user.npm import install_npm_packages
 from tools.user.uv import install_uv_packages
 
 
-def _parse_config_args(argv: list[str]) -> list[str]:
-    """Extract config paths from repeated --config arguments."""
-    paths = []
-    i = 1
-    while i < len(argv):
-        if argv[i] == "--config" and i + 1 < len(argv):
-            paths.append(argv[i + 1])
-            i += 2
-        else:
-            i += 1
-    return paths
-
-
-def main():
-    config_paths = _parse_config_args(sys.argv)
-    if not config_paths:
-        log("Usage: tools --config <file-or-dir> [--config <file> ...]", Color.RED)
-        sys.exit(1)
-
+def _load_merged_config(config_paths: list[str]) -> dict:
+    """Load and merge config from one or more paths."""
     config: dict = {}
     for config_path in config_paths:
         if os.path.isdir(config_path):
@@ -39,7 +23,11 @@ def main():
         else:
             loaded = load_config(config_path)
         config = deep_merge(config, loaded)
+    return config
 
+
+def _deploy(config: dict) -> bool:
+    """Apply config to bring system to desired state. Returns True on success."""
     state_file = os.path.expanduser(config["stateFile"])
     migrate_state_file(state_file)
     state = load_json(state_file)
@@ -60,8 +48,6 @@ def main():
     if config.get("uv", {}).get("packages"):
         success &= install_uv_packages(config["uv"]["packages"], config["paths"], state)
 
-    # Always call install_mcp_servers to handle both installation and removal
-    # Even if servers is empty, we need to remove any existing servers
     success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), config["paths"], state)
 
     if config.get("curlShell"):
@@ -70,14 +56,56 @@ def main():
     if config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], state)
 
-    # Always call install_brew_packages to handle both installation and removal
-    # Even if brew section is empty, we need to remove any existing packages
     success &= install_brew_packages(config.get("brew", {}), state)
 
     save_json(state_file, state)
+    return success
 
-    if not success:
+
+def cmd_deploy(args):
+    config = _load_merged_config(args.config)
+    if not _deploy(config):
         sys.exit(1)
+
+
+def cmd_diff(args):
+    # Validate config loads successfully before reporting unimplemented
+    _load_merged_config(args.config)
+    log("diff is not implemented yet", Color.YELLOW)
+    sys.exit(1)
+
+
+def cmd_reconcile(args):
+    log("reconcile is not implemented yet", Color.YELLOW)
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tools", description="Declarative configuration manager")
+    sub = parser.add_subparsers(dest="command")
+
+    for name in ("deploy", "apply", "diff", "plan", "reconcile"):
+        p = sub.add_parser(name)
+        p.add_argument("--config", action="append")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    if not args.config:
+        args.config = ["."]
+
+    # apply is alias for deploy, plan is alias for diff
+    commands = {
+        "deploy": cmd_deploy,
+        "apply": cmd_deploy,
+        "diff": cmd_diff,
+        "plan": cmd_diff,
+        "reconcile": cmd_reconcile,
+    }
+    commands[args.command](args)
 
 
 if __name__ == "__main__":
