@@ -103,9 +103,11 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     current = set()
     if rc == 0:
         for line in stdout.splitlines():
-            parts = line.strip().split(":")
-            if parts:
-                current.add(parts[0].strip())
+            line = line.strip()
+            if ": " in line and ("http" in line or "stdio" in line or "npx" in line):
+                name = line.split(":")[0].strip()
+                if name:
+                    current.add(name)
 
     desired = set(servers.keys())
     for name in sorted(desired - current):
