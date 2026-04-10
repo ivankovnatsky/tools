@@ -47,6 +47,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
     env["PATH"] = f"{paths['uv']}:{env.get('PATH', '')}"
     env["UV_TOOL_BIN_DIR"] = paths["uvBin"]
     env["UV_TOOL_DIR"] = paths["uvToolDir"]
+    env["UV_LINK_MODE"] = "copy"
 
     if to_remove:
         log(f"Removing UV packages: {', '.join(to_remove)}", Color.RED)
