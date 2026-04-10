@@ -19,7 +19,15 @@ LEGACY_STATE_FILES: List[str] = [
 ]
 
 
+def _remove_if_dir(path: str):
+    """Remove path if it is a directory (created by mistake)."""
+    if os.path.isdir(path):
+        log(f"Removing directory at {path} (should be a file)", Color.YELLOW)
+        shutil.rmtree(path)
+
+
 def load_json(path: str) -> Dict:
+    _remove_if_dir(path)
     if not os.path.exists(path):
         return {}
     with open(path, "r") as f:
@@ -27,6 +35,7 @@ def load_json(path: str) -> Dict:
 
 
 def save_json(path: str, data: Dict):
+    _remove_if_dir(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -34,7 +43,8 @@ def save_json(path: str, data: Dict):
 
 def migrate_state_file(new_state_file: str):
     """Migrate state file from legacy locations to current location."""
-    if os.path.exists(new_state_file):
+    _remove_if_dir(new_state_file)
+    if os.path.isfile(new_state_file):
         return
 
     # 1. Sibling-directory renames: same parent dir, different leaf name.
