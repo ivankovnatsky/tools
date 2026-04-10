@@ -32,8 +32,15 @@ def get_pkg_post_install(pkg_info: Dict) -> str:
     return pkg_info.get("postInstall", "")
 
 
-def pkg_install_spec(name: str, version: str) -> str:
-    """Build package@version install specifier."""
+def get_pkg_source(pkg_info: Dict) -> str:
+    """Extract source URL from package info dict."""
+    return pkg_info.get("source", "")
+
+
+def pkg_install_spec(name: str, version: str, source: str = "") -> str:
+    """Build package install specifier."""
+    if source:
+        return source
     if version and version != "latest":
         return f"{name}@{version}"
     return name
