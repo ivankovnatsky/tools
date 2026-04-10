@@ -1,6 +1,7 @@
-import argparse
 import os
 import sys
+
+import click
 
 from tools.config import deep_merge, load_config, load_config_dir
 from tools.log import Color, log
@@ -73,51 +74,50 @@ def _deploy(config: dict, config_dir: str) -> bool:
     return success
 
 
-def cmd_deploy(args):
-    config = _load_merged_config(args.config)
-    config_dir = _resolve_config_dir(args.config)
-    if not _deploy(config, config_dir):
+@click.group()
+def main():
+    """Declarative configuration manager."""
+
+
+@main.command()
+@click.option("--config", multiple=True, default=["."])
+def deploy(config):
+    """Apply config to bring system to desired state."""
+    config_paths = list(config)
+    merged = _load_merged_config(config_paths)
+    config_dir = _resolve_config_dir(config_paths)
+    if not _deploy(merged, config_dir):
         sys.exit(1)
 
 
-def cmd_diff(args):
-    # Validate config loads successfully before reporting unimplemented
-    _load_merged_config(args.config)
+@main.command(hidden=True)
+@click.option("--config", multiple=True, default=["."])
+def apply(config):
+    """Alias for deploy."""
+    deploy.callback(config)
+
+
+@main.command()
+@click.option("--config", multiple=True, default=["."])
+def diff(config):
+    """Show what would change (dry-run)."""
+    _load_merged_config(list(config))
     log("diff is not implemented yet", Color.YELLOW)
     sys.exit(1)
 
 
-def cmd_reconcile(args):
+@main.command(hidden=True)
+@click.option("--config", multiple=True, default=["."])
+def plan(config):
+    """Alias for diff."""
+    diff.callback(config)
+
+
+@main.command()
+def reconcile():
+    """Continuously watch and apply config changes."""
     log("reconcile is not implemented yet", Color.YELLOW)
     sys.exit(1)
-
-
-def main():
-    parser = argparse.ArgumentParser(prog="tools", description="Declarative configuration manager")
-    sub = parser.add_subparsers(dest="command")
-
-    for name in ("deploy", "apply", "diff", "plan", "reconcile"):
-        p = sub.add_parser(name)
-        p.add_argument("--config", action="append")
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    if not args.config:
-        args.config = ["."]
-
-    # apply is alias for deploy, plan is alias for diff
-    commands = {
-        "deploy": cmd_deploy,
-        "apply": cmd_deploy,
-        "diff": cmd_diff,
-        "plan": cmd_diff,
-        "reconcile": cmd_reconcile,
-    }
-    commands[args.command](args)
 
 
 if __name__ == "__main__":
