@@ -7,11 +7,20 @@ from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
+from tools.user.config_files import install_config_files
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.git_repos import install_git_repos
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.uv import install_uv_packages
+
+
+def _resolve_config_dir(config_paths: list[str]) -> str:
+    """Resolve the config directory from the first --config path."""
+    first = config_paths[0]
+    if os.path.isdir(first):
+        return os.path.abspath(first)
+    return os.path.abspath(os.path.dirname(first))
 
 
 def _load_merged_config(config_paths: list[str]) -> dict:
@@ -26,7 +35,7 @@ def _load_merged_config(config_paths: list[str]) -> dict:
     return config
 
 
-def _deploy(config: dict) -> bool:
+def _deploy(config: dict, config_dir: str) -> bool:
     """Apply config to bring system to desired state. Returns True on success."""
     state_file = os.path.expanduser(config["stateFile"])
     migrate_state_file(state_file)
@@ -56,6 +65,8 @@ def _deploy(config: dict) -> bool:
     if config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], state)
 
+    success &= install_config_files(config.get("configFiles", []), config_dir, state)
+
     success &= install_brew_packages(config.get("brew", {}), state)
 
     save_json(state_file, state)
@@ -64,7 +75,8 @@ def _deploy(config: dict) -> bool:
 
 def cmd_deploy(args):
     config = _load_merged_config(args.config)
-    if not _deploy(config):
+    config_dir = _resolve_config_dir(args.config)
+    if not _deploy(config, config_dir):
         sys.exit(1)
 
 
