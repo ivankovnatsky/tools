@@ -110,10 +110,12 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
                     current.add(name)
 
     desired = set(servers.keys())
+    managed = set(state.get("mcp", {}).get("servers", {}).keys())
     for name in sorted(desired - current):
         changes.append(f"  + install {name}")
-    for name in sorted(current - desired):
-        changes.append(f"  - remove {name}")
+    for name in sorted(managed - desired):
+        if name in current:
+            changes.append(f"  - remove {name}")
 
     return changes
 
