@@ -12,7 +12,7 @@ from tools.util import get_pkg_binary, get_pkg_source, run_command, version_chan
 
 
 def _section(title: str):
-    log(f"\n=== {title} ===", Color.BLUE)
+    log(f"\n{title}:", Color.BLUE)
 
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
