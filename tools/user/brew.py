@@ -9,6 +9,14 @@ from tools.util import run_command
 _BREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 
 
+def _normalize_tap(tap: str) -> str:
+    """Normalize tap name: user/homebrew-foo -> user/foo."""
+    parts = tap.split("/", 1)
+    if len(parts) == 2 and parts[1].startswith("homebrew-"):
+        return f"{parts[0]}/{parts[1][len('homebrew-') :]}"
+    return tap
+
+
 def _brew_bin() -> str | None:
     """Return the brew binary path, checking system_paths first then PATH."""
     path = system_bin_optional("brew")
@@ -125,7 +133,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
 
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
-    desired_taps = set(brew_config.get("taps", []))
+    desired_taps = {_normalize_tap(t) for t in brew_config.get("taps", [])}
     desired_mas = brew_config.get("masApps", {})  # {name: app_id}
 
     cleanup = brew_config.get("onActivation", {}).get("cleanup") == "zap"
