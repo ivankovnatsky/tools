@@ -92,11 +92,21 @@ def main():
 @click.option(
     "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
 )
-def deploy(config, scope):
+@click.option("--approve", is_flag=True, help="Skip confirmation prompt.")
+def deploy(config, scope, approve):
     """Apply config to bring system to desired state."""
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
+
+    if not approve:
+        has_changes = not show_diff(merged, config_dir, scope)
+        if not has_changes:
+            return
+        if not click.confirm("\nProceed with deploy?"):
+            log("Aborted.", Color.YELLOW)
+            sys.exit(1)
+
     if not _deploy(merged, config_dir, scope):
         sys.exit(1)
 
@@ -104,9 +114,10 @@ def deploy(config, scope):
 @main.command(hidden=True)
 @click.option("--config", multiple=True, default=["."])
 @click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
-def apply(config, scope):
+@click.option("--approve", is_flag=True)
+def apply(config, scope, approve):
     """Alias for deploy."""
-    deploy.callback(config, scope)
+    deploy.callback(config, scope, approve)
 
 
 @main.command()
