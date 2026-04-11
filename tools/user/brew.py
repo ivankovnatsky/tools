@@ -120,6 +120,8 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     env = os.environ.copy()
     brew_dir = os.path.dirname(brew)
     env["PATH"] = f"{brew_dir}:{env.get('PATH', '')}"
+    for key, value in brew_config.get("environment", {}).items():
+        env[key] = str(value)
 
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
