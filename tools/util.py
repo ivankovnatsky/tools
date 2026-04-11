@@ -46,13 +46,22 @@ def pkg_install_spec(name: str, version: str, source: str = "") -> str:
     return name
 
 
+def get_pkg_commit(pkg_info: Dict) -> str:
+    """Extract commit pin from package info dict."""
+    return pkg_info.get("commit", "")
+
+
 def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
-    """Check if declared version or source differs from state."""
+    """Check if declared version, source, or commit differs from state."""
     pkg_state = state.get(manager, {}).get("packages", {}).get(pkg, {})
     declared_version = get_pkg_version(pkg_info)
     stored_version = pkg_state.get("version", "latest")
     declared_source = get_pkg_source(pkg_info)
     stored_source = pkg_state.get("source", "")
+    declared_commit = get_pkg_commit(pkg_info)
+    stored_commit = pkg_state.get("commit", "")
+    if declared_commit and declared_commit != stored_commit:
+        return True
     return declared_version != stored_version or declared_source != stored_source
 
 
