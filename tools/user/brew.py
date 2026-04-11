@@ -2,7 +2,7 @@ import os
 import shutil
 import sys
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_bin_optional
 from tools.util import run_command
 
@@ -288,7 +288,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         or mas_to_remove
     )
     if not any_changes:
-        log("All brew packages in sync", Color.BLUE)
+        debug("All brew packages in sync", Color.BLUE)
 
     # --- Update state ---
     if state_changed or "brew" not in state:

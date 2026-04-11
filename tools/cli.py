@@ -5,7 +5,7 @@ import click
 
 from tools.config import deep_merge, load_config, load_config_dir
 from tools.diff import ALL_SECTIONS, show_diff
-from tools.log import Color, log
+from tools.log import Color, log, set_verbose
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
@@ -83,8 +83,10 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
 
 
 @click.group()
-def main():
+@click.option("-v", "--verbose", is_flag=True, help="Show debug output.")
+def main(verbose):
     """Declarative configuration manager."""
+    set_verbose(verbose)
 
 
 @main.command()

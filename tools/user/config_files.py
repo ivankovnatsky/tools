@@ -4,7 +4,7 @@ import stat
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 
 
 def _file_hash(path: str) -> str:
@@ -145,6 +145,6 @@ def install_config_files(config_files: List[Dict[str, str]], config_dir: str, st
         state["configFiles"] = merged
 
     if not changed and config_files:
-        log("All config files up to date", Color.BLUE)
+        debug("All config files up to date", Color.BLUE)
 
     return success

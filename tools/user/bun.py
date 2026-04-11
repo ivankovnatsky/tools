@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Dict
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.util import (
     get_pkg_binary,
     get_pkg_version,
@@ -75,7 +75,7 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
         state_changed = True
 
     if not to_remove and not to_install:
-        log("All bun packages in sync", Color.BLUE)
+        debug("All bun packages in sync", Color.BLUE)
 
     # Update state
     if state_changed or state_packages != desired:

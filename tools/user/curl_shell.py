@@ -2,7 +2,7 @@ import os
 import subprocess
 from typing import Dict
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_dir, system_dir_optional
 
 
@@ -16,7 +16,7 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     to_install = desired - installed
 
     if not to_install:
-        log("All curl shell scripts already installed", Color.BLUE)
+        debug("All curl shell scripts already installed", Color.BLUE)
         return True
 
     curl_bin = system_bin("curl")

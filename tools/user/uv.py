@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Dict, Set
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.util import (
     get_pkg_binary,
     get_pkg_commit,
@@ -93,7 +93,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
                 log(f"Installed: {spec}", Color.GREEN)
                 state_changed = True
     elif not to_remove:
-        log("All UV packages already installed", Color.BLUE)
+        debug("All UV packages already installed", Color.BLUE)
 
     if state_changed or state_packages != desired:
         uv_state = {}
