@@ -202,6 +202,8 @@ def _diff_brew(brew_config: Dict):
 
     env = os.environ.copy()
     env["PATH"] = f"{os.path.dirname(brew)}:{env.get('PATH', '')}"
+    for key, value in brew_config.get("environment", {}).items():
+        env[key] = str(value)
 
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
