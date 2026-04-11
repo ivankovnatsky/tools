@@ -224,12 +224,17 @@ def _diff_brew(brew_config: Dict):
         {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
     )
 
+    tap_changes = []
     for tap in sorted(desired_taps - installed_taps):
-        changes.append(f"  + tap {tap}")
+        tap_changes.append(f"    + tap {tap}")
+
+    formula_changes = []
     for formula in sorted(desired_brews - installed_formulas):
-        changes.append(f"  + install {formula}")
+        formula_changes.append(f"    + install {formula}")
+
+    cask_changes = []
     for cask in sorted(desired_casks - installed_casks):
-        changes.append(f"  + install --cask {cask}")
+        cask_changes.append(f"    + install {cask}")
 
     cleanup = brew_config.get("onActivation", {}).get("cleanup") == "zap"
     if cleanup:
@@ -238,20 +243,28 @@ def _diff_brew(brew_config: Dict):
             {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
         )
         for formula in sorted(leaves - desired_brews):
-            changes.append(f"  - remove {formula}")
+            formula_changes.append(f"    - remove {formula}")
         for cask in sorted(installed_casks - desired_casks):
-            changes.append(f"  - remove --cask {cask}")
+            cask_changes.append(f"    - remove {cask}")
         for tap in sorted(installed_taps - desired_taps):
-            changes.append(f"  - untap {tap}")
+            tap_changes.append(f"    - untap {tap}")
 
         rc, stdout, _ = run_command([brew, "autoremove", "--dry-run"], env)
         if rc == 0:
             for line in stdout.splitlines():
                 line = line.strip()
                 if line and not line.startswith("="):
-                    changes.append(f"  - autoremove {line}")
+                    formula_changes.append(f"    - autoremove {line}")
 
-    return changes
+    subsections = []
+    if tap_changes:
+        subsections.append(("taps", tap_changes))
+    if formula_changes:
+        subsections.append(("brews", formula_changes))
+    if cask_changes:
+        subsections.append(("casks", cask_changes))
+
+    return subsections
 
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
@@ -318,17 +331,24 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
             sections.append(("configFiles", changes))
 
     if "brew" in active:
-        changes = _diff_brew(config.get("brew", {}))
-        if changes:
-            sections.append(("brew", changes))
+        brew_subsections = _diff_brew(config.get("brew", {}))
+        if brew_subsections:
+            sections.append(("brew", brew_subsections))
 
     if sections:
         has_changes = True
         for i, (title, items) in enumerate(sections):
             prefix = "\n" if i > 0 else ""
-            log(f"{prefix}{title}:", Color.BLUE)
-            for item in items:
-                log(item, Color.YELLOW)
+            if title == "brew":
+                log(f"{prefix}{title}:", Color.BLUE)
+                for sub_title, sub_items in items:
+                    log(f"  {sub_title}:", Color.BLUE)
+                    for item in sub_items:
+                        log(item, Color.YELLOW)
+            else:
+                log(f"{prefix}{title}:", Color.BLUE)
+                for item in items:
+                    log(item, Color.YELLOW)
 
     if not has_changes:
         log("No changes needed — system is up to date.", Color.GREEN)
