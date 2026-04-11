@@ -103,7 +103,8 @@ def deploy(config, scope, approve):
         has_changes = not show_diff(merged, config_dir, scope)
         if not has_changes:
             return
-        if not click.confirm("\nProceed with deploy?"):
+        answer = click.prompt("\nType 'yes' to deploy", default="no")
+        if answer != "yes":
             log("Aborted.", Color.YELLOW)
             sys.exit(1)
 
