@@ -4,7 +4,7 @@ import sys
 import click
 
 from tools.config import deep_merge, load_config, load_config_dir
-from tools.diff import show_diff
+from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.brew import install_brew_packages
@@ -37,42 +37,46 @@ def _load_merged_config(config_paths: list[str]) -> dict:
     return config
 
 
-def _deploy(config: dict, config_dir: str) -> bool:
+def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Apply config to bring system to desired state. Returns True on success."""
-    state_file = os.path.expanduser(
-        config.get("stateFile", "~/.local/state/tools/state.json")
-    )
+    state_file = os.path.expanduser(config.get("stateFile", "~/.local/state/tools/state.json"))
     migrate_state_file(state_file)
     state = load_json(state_file)
+
+    active = set(scope) if scope else set(ALL_SECTIONS)
 
     success = True
     paths = config.get("paths", {})
 
-    bun_config = config.get("bun", {})
-    npm_config = config.get("npm", {})
+    if "bun" in active:
+        bun_config = config.get("bun", {})
+        bun_packages = bun_config.get("packages", {})
+        bun_only_config = {"configFile": bun_config.get("configFile")}
+        success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
 
-    bun_packages = bun_config.get("packages", {})
-    bun_only_config = {"configFile": bun_config.get("configFile")}
-    success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
+    if "npm" in active:
+        npm_config = config.get("npm", {})
+        npm_packages = npm_config.get("packages", {})
+        npm_only_config = {"configFile": npm_config.get("configFile")}
+        success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
 
-    npm_packages = npm_config.get("packages", {})
-    npm_only_config = {"configFile": npm_config.get("configFile")}
-    success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
-
-    if config.get("uv", {}).get("packages"):
+    if "uv" in active and config.get("uv", {}).get("packages"):
         success &= install_uv_packages(config["uv"]["packages"], paths, state)
 
-    success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
+    if "mcp" in active:
+        success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
 
-    if config.get("curlShell"):
+    if "curlShell" in active and config.get("curlShell"):
         success &= install_curl_shell_scripts(config["curlShell"], state)
 
-    if config.get("gitRepos"):
+    if "gitRepos" in active and config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], state)
 
-    success &= install_config_files(config.get("configFiles", []), config_dir, state)
+    if "configFiles" in active:
+        success &= install_config_files(config.get("configFiles", []), config_dir, state)
 
-    success &= install_brew_packages(config.get("brew", {}), state)
+    if "brew" in active:
+        success &= install_brew_packages(config.get("brew", {}), state)
 
     save_json(state_file, state)
     return success
@@ -85,38 +89,46 @@ def main():
 
 @main.command()
 @click.option("--config", multiple=True, default=["."])
-def deploy(config):
+@click.option(
+    "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
+)
+def deploy(config, scope):
     """Apply config to bring system to desired state."""
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
-    if not _deploy(merged, config_dir):
+    if not _deploy(merged, config_dir, scope):
         sys.exit(1)
 
 
 @main.command(hidden=True)
 @click.option("--config", multiple=True, default=["."])
-def apply(config):
+@click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
+def apply(config, scope):
     """Alias for deploy."""
-    deploy.callback(config)
+    deploy.callback(config, scope)
 
 
 @main.command()
 @click.option("--config", multiple=True, default=["."])
-def diff(config):
+@click.option(
+    "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Diff only these sections."
+)
+def diff(config, scope):
     """Show what would change (dry-run)."""
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
-    if not show_diff(merged, config_dir):
+    if not show_diff(merged, config_dir, scope):
         sys.exit(1)
 
 
 @main.command(hidden=True)
 @click.option("--config", multiple=True, default=["."])
-def plan(config):
+@click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
+def plan(config, scope):
     """Alias for diff."""
-    diff.callback(config)
+    diff.callback(config, scope)
 
 
 @main.command()
