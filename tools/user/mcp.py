@@ -1,4 +1,5 @@
 import os
+import shutil
 from typing import Dict, Set
 
 from tools.log import Color, log
@@ -30,14 +31,21 @@ def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Set[str]:
 
 
 def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
-    claude_cli = paths["claudeCli"]
+    claude_cli = paths.get("claudeCli") or shutil.which("claude")
 
-    if not os.path.exists(claude_cli):
+    if not claude_cli or not os.path.exists(claude_cli):
         log("Claude CLI not found, skipping MCP server configuration", Color.YELLOW)
         return True
 
     env = os.environ.copy()
-    env["PATH"] = f"{paths['nodejs']}:{paths['npmBin']}:{paths['python']}:{env.get('PATH', '')}"
+    extra_paths = [
+        paths.get("nodejs", ""),
+        paths.get("npmBin", ""),
+        paths.get("python", ""),
+    ]
+    extra = ":".join(p for p in extra_paths if p)
+    if extra:
+        env["PATH"] = f"{extra}:{env.get('PATH', '')}"
 
     desired = set(servers.keys())
     current = get_installed_mcp_servers(claude_cli, env)
