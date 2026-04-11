@@ -10,6 +10,8 @@ from typing import Dict, List
 from tools.log import Color, log
 from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
 
+ALL_SECTIONS = ("bun", "npm", "uv", "mcp", "curlShell", "gitRepos", "configFiles", "brew")
+
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     changes = []
@@ -243,7 +245,7 @@ def _diff_brew(brew_config: Dict):
     return changes
 
 
-def show_diff(config: dict, config_dir: str) -> bool:
+def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
     state = {}
     state_path = config.get("stateFile")
@@ -254,57 +256,64 @@ def show_diff(config: dict, config_dir: str) -> bool:
         if os.path.exists(state_file):
             state = load_json(state_file)
 
+    active = set(scope) if scope else set(ALL_SECTIONS)
     has_changes = False
     paths = config.get("paths", {})
 
     sections = []
 
-    bun_config = config.get("bun", {})
-    bun_packages = bun_config.get("packages", {})
-    if (bun_packages or state.get("bun", {}).get("packages")) and paths.get("bunBin"):
-        changes = _diff_bun(
-            bun_packages, paths, state, {"configFile": bun_config.get("configFile")}
-        )
+    if "bun" in active:
+        bun_config = config.get("bun", {})
+        bun_packages = bun_config.get("packages", {})
+        if (bun_packages or state.get("bun", {}).get("packages")) and paths.get("bunBin"):
+            changes = _diff_bun(
+                bun_packages, paths, state, {"configFile": bun_config.get("configFile")}
+            )
+            if changes:
+                sections.append(("bun", changes))
+
+    if "npm" in active:
+        npm_config = config.get("npm", {})
+        npm_packages = npm_config.get("packages", {})
+        if (npm_packages or state.get("npm", {}).get("packages")) and paths.get("npmBin"):
+            changes = _diff_npm(
+                npm_packages, paths, state, {"configFile": npm_config.get("configFile")}
+            )
+            if changes:
+                sections.append(("npm", changes))
+
+    if "uv" in active:
+        if (
+            config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages")
+        ) and paths.get("uvBin"):
+            changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
+            if changes:
+                sections.append(("uv", changes))
+
+    if "mcp" in active:
+        changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)
         if changes:
-            sections.append(("bun", changes))
+            sections.append(("mcp", changes))
 
-    npm_config = config.get("npm", {})
-    npm_packages = npm_config.get("packages", {})
-    if (npm_packages or state.get("npm", {}).get("packages")) and paths.get("npmBin"):
-        changes = _diff_npm(
-            npm_packages, paths, state, {"configFile": npm_config.get("configFile")}
-        )
-        if changes:
-            sections.append(("npm", changes))
-
-    if (config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages")) and paths.get(
-        "uvBin"
-    ):
-        changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
-        if changes:
-            sections.append(("uv", changes))
-
-    changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)
-    if changes:
-        sections.append(("mcp", changes))
-
-    if config.get("curlShell"):
+    if "curlShell" in active and config.get("curlShell"):
         changes = _diff_curl_shell(config["curlShell"], state)
         if changes:
             sections.append(("curlShell", changes))
 
-    if config.get("gitRepos"):
+    if "gitRepos" in active and config.get("gitRepos"):
         changes = _diff_git_repos(config["gitRepos"], state)
         if changes:
             sections.append(("gitRepos", changes))
 
-    changes = _diff_config_files(config.get("configFiles", []), config_dir, state)
-    if changes:
-        sections.append(("configFiles", changes))
+    if "configFiles" in active:
+        changes = _diff_config_files(config.get("configFiles", []), config_dir, state)
+        if changes:
+            sections.append(("configFiles", changes))
 
-    changes = _diff_brew(config.get("brew", {}))
-    if changes:
-        sections.append(("brew", changes))
+    if "brew" in active:
+        changes = _diff_brew(config.get("brew", {}))
+        if changes:
+            sections.append(("brew", changes))
 
     if sections:
         has_changes = True
