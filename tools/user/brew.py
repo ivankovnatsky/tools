@@ -255,6 +255,14 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
                 else:
                     state_changed = True
 
+    # --- Autoremove orphaned deps ---
+    if cleanup and (formulas_to_remove or casks_to_remove):
+        rc, stdout, stderr = run_command([brew, "autoremove"], env)
+        if rc == 0 and stdout.strip():
+            log("Autoremoved orphaned deps", Color.RED)
+        elif rc != 0:
+            log(f"Failed to autoremove: {stderr}", Color.RED)
+
     # --- Summary ---
     any_changes = (
         taps_to_add
