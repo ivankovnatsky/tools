@@ -2,7 +2,7 @@ import os
 import shutil
 from typing import Dict
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_dir
 from tools.util import run_command
 
@@ -18,7 +18,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     to_remove = installed - desired
 
     if not to_install and not to_remove:
-        log("All git repos already installed", Color.BLUE)
+        debug("All git repos already installed", Color.BLUE)
         if installed != desired:
             state.setdefault("gitRepos", {})["installed"] = list(installed)
         return True

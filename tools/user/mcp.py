@@ -2,7 +2,7 @@ import os
 import shutil
 from typing import Dict, Set
 
-from tools.log import Color, log
+from tools.log import Color, debug, log
 from tools.util import SecretSubstitutionError, run_command, substitute_secrets
 
 
@@ -26,7 +26,7 @@ def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Set[str]:
             server_name = line.split(":")[0].strip()
             if not server_name.startswith("claude.ai "):
                 servers.add(server_name)
-    log(f"Detected installed MCP servers: {servers}", Color.BLUE)
+    debug(f"Detected installed MCP servers: {servers}", Color.BLUE)
     return servers
 
 
@@ -121,7 +121,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                 state_changed = True
 
     if not to_install and not to_remove:
-        log("All MCP servers already installed", Color.BLUE)
+        debug("All MCP servers already installed", Color.BLUE)
 
     if state_changed or set(state.get("mcp", {}).get("servers", {}).keys()) != desired:
         state.setdefault("mcp", {})["servers"] = {
