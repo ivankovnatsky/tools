@@ -339,14 +339,13 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         has_changes = True
         for i, (title, items) in enumerate(sections):
             prefix = "\n" if i > 0 else ""
-            if title == "brew":
-                log(f"{prefix}{title}:", Color.BLUE)
+            log(f"{prefix}{title}:", Color.BLUE)
+            if items and isinstance(items[0], tuple):
                 for sub_title, sub_items in items:
                     log(f"  {sub_title}:", Color.BLUE)
                     for item in sub_items:
                         log(item, Color.YELLOW)
             else:
-                log(f"{prefix}{title}:", Color.BLUE)
                 for item in items:
                     log(item, Color.YELLOW)
 
