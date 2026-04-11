@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from tools.log import Color, log
+from tools.user.brew import _normalize_tap
 from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
 
 ALL_SECTIONS = ("bun", "npm", "uv", "mcp", "curlShell", "gitRepos", "configFiles", "brew")
@@ -207,7 +208,7 @@ def _diff_brew(brew_config: Dict):
 
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
-    desired_taps = set(brew_config.get("taps", []))
+    desired_taps = {_normalize_tap(t) for t in brew_config.get("taps", [])}
 
     rc, stdout, _ = run_command([brew, "list", "--formula", "-1"], env)
     installed_formulas = (
