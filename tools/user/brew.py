@@ -195,9 +195,14 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     casks_to_install = desired_casks - installed_casks
     casks_to_remove = (installed_casks - desired_casks) if cleanup else set()
 
+    no_quarantine = brew_config.get("caskArgs", {}).get("no_quarantine", False)
+
     if casks_to_install:
         log(f"Installing casks: {', '.join(sorted(casks_to_install))}", Color.GREEN)
-        cmd = [brew, "install", "--cask"] + sorted(casks_to_install)
+        cmd = [brew, "install", "--cask"]
+        if no_quarantine:
+            cmd.append("--no-quarantine")
+        cmd += sorted(casks_to_install)
         rc, _, stderr = run_command(cmd, env)
         if rc != 0:
             log(f"Failed to install casks: {stderr}", Color.RED)
