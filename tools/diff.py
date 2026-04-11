@@ -256,14 +256,12 @@ def _diff_brew(brew_config: Dict):
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
-    state = {}
-    state_path = config.get("stateFile")
-    if state_path:
-        from tools.state import load_json
+    from tools.state import load_json
 
-        state_file = os.path.expanduser(state_path)
-        if os.path.exists(state_file):
-            state = load_json(state_file)
+    state = {}
+    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
+    if os.path.exists(state_file):
+        state = load_json(state_file)
 
     active = set(scope) if scope else set(ALL_SECTIONS)
     has_changes = False
