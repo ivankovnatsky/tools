@@ -5,6 +5,7 @@ from typing import Dict, Set
 from tools.log import Color, log
 from tools.util import (
     get_pkg_binary,
+    get_pkg_commit,
     get_pkg_source,
     get_pkg_version,
     pkg_install_spec,
@@ -73,7 +74,12 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
 
         for pkg in to_install:
             pkg_info = packages[pkg]
-            spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), get_pkg_source(pkg_info))
+            source = get_pkg_source(pkg_info)
+            commit = get_pkg_commit(pkg_info)
+            if source and commit:
+                spec = f"{source}@{commit}"
+            else:
+                spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), source)
             cmd = [f"{paths['uv']}/uv", "tool", "install", spec]
             # Force reinstall if already present but version changed
             if pkg in current:
@@ -90,14 +96,18 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
         log("All UV packages already installed", Color.BLUE)
 
     if state_changed or state_packages != desired:
-        state.setdefault("uv", {})["packages"] = {
-            pkg: {
+        uv_state = {}
+        for pkg, pkg_info in packages.items():
+            entry = {
                 "installed": True,
                 "binary": get_pkg_binary(pkg_info),
                 "version": get_pkg_version(pkg_info),
                 "source": get_pkg_source(pkg_info),
             }
-            for pkg, pkg_info in packages.items()
-        }
+            commit = get_pkg_commit(pkg_info)
+            if commit:
+                entry["commit"] = commit
+            uv_state[pkg] = entry
+        state.setdefault("uv", {})["packages"] = uv_state
 
     return True
