@@ -244,6 +244,13 @@ def _diff_brew(brew_config: Dict):
         for tap in sorted(installed_taps - desired_taps):
             changes.append(f"  - untap {tap}")
 
+        rc, stdout, _ = run_command([brew, "autoremove", "--dry-run"], env)
+        if rc == 0:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line and not line.startswith("="):
+                    changes.append(f"  - autoremove {line}")
+
     return changes
 
 
