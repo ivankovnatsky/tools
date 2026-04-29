@@ -9,8 +9,8 @@ from tools.log import Color, log, set_verbose
 from tools.state import load_json, migrate_state_file, save_json
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
-from tools.user.config_files import install_config_files
 from tools.user.curl_shell import install_curl_shell_scripts
+from tools.user.files import install_files
 from tools.user.git_repos import install_git_repos
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
@@ -72,8 +72,8 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     if "gitRepos" in active and config.get("gitRepos"):
         success &= install_git_repos(config["gitRepos"], state)
 
-    if "configFiles" in active:
-        success &= install_config_files(config.get("configFiles", []), config_dir, state)
+    if "files" in active:
+        success &= install_files(config.get("files", []) or [], config_dir, state)
 
     if "brew" in active:
         success &= install_brew_packages(config.get("brew", {}), state)

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -11,7 +12,7 @@ from tools.log import Color, log
 from tools.user.brew import _normalize_tap
 from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
 
-ALL_SECTIONS = ("bun", "npm", "uv", "mcp", "curlShell", "gitRepos", "configFiles", "brew")
+ALL_SECTIONS = ("bun", "npm", "uv", "mcp", "curlShell", "gitRepos", "files", "brew")
 
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
@@ -140,49 +141,47 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
     return changes
 
 
-def _diff_config_files(config_files: List[Dict[str, str]], config_dir: str, state: Dict):
-    changes = []
-    state_files = state.get("configFiles", {})
+def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
+    """Dry-run for the unified `files:` section.
+
+    Resolves entries via `_resolve_entries`, compares each desired
+    (target, source, mode) against the live filesystem, and accounts for
+    cleanup against state.
+    """
+    from tools.user.files import _resolve_entries
+
+    state_files = state.get("files", {})
+    changes: List[str] = []
+
+    resolved, errors = _resolve_entries(entries, config_dir)
+    for err in errors:
+        changes.append(f"  ! {err}")
+
     managed_targets = set()
+    for target, source, desired_mode in resolved:
+        managed_targets.add(target)
 
-    skip_dirs = {".git", ".hg", ".svn", "__pycache__"}
-    skip_files = {".DS_Store", ".gitignore", ".gitkeep"}
-
-    for entry in config_files:
-        source_dir = os.path.join(config_dir, entry["dir"])
-        file_type = entry.get("type", "dotfiles")
-
-        if not os.path.isdir(source_dir):
-            changes.append(f"  ! source directory not found: {entry['dir']}")
+        if not os.path.exists(target):
+            changes.append(f"  + create {target}")
             continue
 
-        if file_type == "dotfiles":
-            target_base = os.path.expanduser("~")
-        else:
+        try:
+            with open(source, "rb") as f:
+                src_hash = hashlib.sha256(f.read()).hexdigest()
+            with open(target, "rb") as f:
+                tgt_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            changes.append(f"  ? cannot read {target}")
             continue
 
-        for root, dirs, files in os.walk(source_dir):
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
-            for name in sorted(files):
-                if name in skip_files:
-                    continue
-                source = os.path.join(root, name)
-                rel_path = os.path.relpath(source, source_dir)
-                target = os.path.join(target_base, rel_path)
-                managed_targets.add(target)
+        target_mode = stat.S_IMODE(os.stat(target).st_mode)
+        source_mode = stat.S_IMODE(os.stat(source).st_mode)
+        effective_mode = desired_mode if desired_mode is not None else source_mode
 
-                if not os.path.exists(target):
-                    changes.append(f"  + create {target}")
-                else:
-                    try:
-                        with open(source, "rb") as f:
-                            src_hash = hashlib.sha256(f.read()).hexdigest()
-                        with open(target, "rb") as f:
-                            tgt_hash = hashlib.sha256(f.read()).hexdigest()
-                        if src_hash != tgt_hash:
-                            changes.append(f"  ~ update {target}")
-                    except OSError:
-                        changes.append(f"  ? cannot read {target}")
+        if src_hash != tgt_hash:
+            changes.append(f"  ~ update {target}")
+        elif effective_mode != target_mode:
+            changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
     for target in state_files:
         if target not in managed_targets:
@@ -326,10 +325,10 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if changes:
             sections.append(("gitRepos", changes))
 
-    if "configFiles" in active:
-        changes = _diff_config_files(config.get("configFiles", []), config_dir, state)
+    if "files" in active:
+        changes = _diff_files(config.get("files", []) or [], config_dir, state)
         if changes:
-            sections.append(("configFiles", changes))
+            sections.append(("files", changes))
 
     if "brew" in active:
         brew_subsections = _diff_brew(config.get("brew", {}))
