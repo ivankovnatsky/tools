@@ -14,6 +14,7 @@ from tools.user.files import install_files
 from tools.user.git_repos import install_git_repos
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
+from tools.user.ollama_models import install_ollama_models
 from tools.user.uv import install_uv_packages
 
 
@@ -77,6 +78,9 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
 
     if "brew" in active:
         success &= install_brew_packages(config.get("brew", {}), state)
+
+    if "ollamaModels" in active:
+        success &= install_ollama_models(config.get("ollamaModels", {}) or {}, state)
 
     save_json(state_file, state)
     return success
