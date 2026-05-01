@@ -10,9 +10,41 @@ from typing import Dict, List
 
 from tools.log import Color, log
 from tools.user.brew import _normalize_tap
-from tools.util import get_pkg_binary, get_pkg_source, run_command, version_changed
+from tools.user.ollama_models import diff_ollama_models
+from tools.util import (
+    format_file_diff,
+    get_pkg_binary,
+    get_pkg_source,
+    run_command,
+    version_changed,
+)
 
-ALL_SECTIONS = ("bun", "npm", "uv", "mcp", "curlShell", "gitRepos", "files", "brew")
+ALL_SECTIONS = (
+    "bun",
+    "npm",
+    "uv",
+    "mcp",
+    "curlShell",
+    "gitRepos",
+    "files",
+    "brew",
+    "ollamaModels",
+)
+
+
+def _emit_change(item: str) -> None:
+    """Print one change row.
+
+    Single-line items get the standard yellow change-row treatment.
+    Multi-line items (e.g. inline file content diffs from
+    `format_file_diff`) carry their own ANSI from `delta` or are
+    pre-padded for the difflib fallback, so we print them as-is to
+    avoid the outer yellow wrapper clobbering inner colors.
+    """
+    if "\n" in item:
+        print(item)
+    else:
+        log(item, Color.YELLOW)
 
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
@@ -180,6 +212,9 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
 
         if src_hash != tgt_hash:
             changes.append(f"  ~ update {target}")
+            diff_text = format_file_diff(source, target)
+            if diff_text:
+                changes.append(diff_text)
         elif effective_mode != target_mode:
             changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
@@ -335,6 +370,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if brew_subsections:
             sections.append(("brew", brew_subsections))
 
+    if "ollamaModels" in active:
+        changes = diff_ollama_models(config.get("ollamaModels", {}) or {}, state)
+        if changes:
+            sections.append(("ollamaModels", changes))
+
     if sections:
         has_changes = True
         for i, (title, items) in enumerate(sections):
@@ -344,10 +384,10 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
                 for sub_title, sub_items in items:
                     log(f"  {sub_title}:", Color.BLUE)
                     for item in sub_items:
-                        log(item, Color.YELLOW)
+                        _emit_change(item)
             else:
                 for item in items:
-                    log(item, Color.YELLOW)
+                    _emit_change(item)
 
     if not has_changes:
         log("No changes needed — system is up to date.", Color.GREEN)
