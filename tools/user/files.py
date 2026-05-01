@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 from tools.log import Color, debug, log
 
-
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
 SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
 
@@ -26,14 +25,12 @@ def _parse_mode(value) -> Optional[int]:
         return None
     if isinstance(value, bool):
         # Guard: bool is a subclass of int in Python.
-        raise TypeError(f"files: mode must be an octal string or int, got bool")
+        raise TypeError("files: mode must be an octal string or int, got bool")
     if isinstance(value, int):
         return int(str(value), 8)
     if isinstance(value, str):
         return int(value, 8)
-    raise TypeError(
-        f"files: mode must be an octal string or int, got {type(value).__name__}"
-    )
+    raise TypeError(f"files: mode must be an octal string or int, got {type(value).__name__}")
 
 
 def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[bool], str]:
@@ -139,9 +136,7 @@ def _resolve_entries(
             file_pairs.append((target, source, entry_mode))
             continue
 
-        errors.append(
-            f"entry must have either `dir` or both `source` and `target`: {entry!r}"
-        )
+        errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
 
     # Dedupe by target, file entries win.
     resolved_map: Dict[str, Tuple[str, Optional[int]]] = {}
