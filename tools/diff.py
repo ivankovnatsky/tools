@@ -178,8 +178,8 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
     """Dry-run for the unified `files:` section.
 
     Resolves entries via `_resolve_entries`, compares each desired
-    (target, source, mode) against the live filesystem, and accounts for
-    cleanup against state.
+    (target, source, mode, secrets) against the live filesystem, and
+    accounts for cleanup against state.
     """
     from tools.user.files import _resolve_entries
 
