@@ -149,28 +149,21 @@ def _try_delta(src_bytes: bytes, tgt_bytes: bytes, label_old: str, label_new: st
     return result.stdout
 
 
-def format_file_diff(source_path: str, target_path: str, indent: str = "    ") -> Optional[str]:
-    """Build a printable diff between target (current) and source (desired).
+def format_diff_bytes(
+    src_bytes: bytes, tgt_bytes: bytes, label_path: str, indent: str = "    "
+) -> Optional[str]:
+    """Build a printable diff from in-memory bytes.
 
     Returns a string ready to print, or None when no readable diff is
-    available (binary content, missing files, decode failure). The
-    string is left-padded with `indent` so it nests under existing
-    section headers in `tools diff` output. Output is capped at
-    ``_DIFF_MAX_LINES`` lines with a truncation footer.
+    available (binary content, decode failure). Empty string if the
+    inputs are byte-equal. Output is capped at ``_DIFF_MAX_LINES`` with
+    a truncation footer and left-padded with ``indent``.
     """
-    try:
-        with open(source_path, "rb") as f:
-            src_bytes = f.read()
-        with open(target_path, "rb") as f:
-            tgt_bytes = f.read()
-    except OSError:
-        return None
-
     if src_bytes == tgt_bytes:
         return ""
 
-    label_old = f"a/{target_path}"
-    label_new = f"b/{target_path}"
+    label_old = f"a/{label_path}"
+    label_new = f"b/{label_path}"
 
     rendered = _try_delta(src_bytes, tgt_bytes, label_old, label_new)
     if rendered is None:
@@ -196,3 +189,23 @@ def format_file_diff(source_path: str, target_path: str, indent: str = "    ") -
     if truncated:
         body += f"\n{indent}(... {omitted} more lines)"
     return body
+
+
+def format_file_diff(source_path: str, target_path: str, indent: str = "    ") -> Optional[str]:
+    """Build a printable diff between target (current) and source (desired).
+
+    Returns a string ready to print, or None when no readable diff is
+    available (binary content, missing files, decode failure). The
+    string is left-padded with `indent` so it nests under existing
+    section headers in `tools diff` output. Output is capped at
+    ``_DIFF_MAX_LINES`` lines with a truncation footer.
+    """
+    try:
+        with open(source_path, "rb") as f:
+            src_bytes = f.read()
+        with open(target_path, "rb") as f:
+            tgt_bytes = f.read()
+    except OSError:
+        return None
+
+    return format_diff_bytes(src_bytes, tgt_bytes, target_path, indent)

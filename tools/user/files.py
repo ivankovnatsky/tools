@@ -5,6 +5,7 @@ import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from tools.log import Color, debug, log
+from tools.util import format_diff_bytes
 
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
 SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
@@ -61,8 +62,10 @@ def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[
         if existing == desired and existing_mode == desired_mode:
             return None, source_hash
         action = "Updated"
+        diff_body = format_diff_bytes(desired, existing, target)
     else:
         action = "Created"
+        diff_body = None
 
     try:
         dirname = os.path.dirname(target)
@@ -82,6 +85,8 @@ def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[
         return False, source_hash
 
     log(f"{action}: {target}", Color.GREEN)
+    if diff_body:
+        print(diff_body)
     return True, source_hash
 
 
