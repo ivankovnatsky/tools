@@ -167,12 +167,17 @@ def _resolve_entries(
 
         errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
 
-    # Dedupe by target, file entries win.
+    # Dedupe by target, file entries win — except `secrets` is sticky:
+    # if either the dir-level or file-level entry marks the target as
+    # secret, the resolved entry stays secret. Otherwise a file entry
+    # added (e.g.) just to override the mode would silently downgrade
+    # the suppression flag and re-expose content from a secret directory.
     resolved_map: Dict[str, Tuple[str, Optional[int], bool]] = {}
     for target, source, mode, secrets in dir_pairs:
         resolved_map[target] = (source, mode, secrets)
     for target, source, mode, secrets in file_pairs:
-        resolved_map[target] = (source, mode, secrets)
+        prev_secrets = resolved_map.get(target, (None, None, False))[2]
+        resolved_map[target] = (source, mode, secrets or prev_secrets)
 
     resolved = [
         (target, source, mode, secrets) for target, (source, mode, secrets) in resolved_map.items()
