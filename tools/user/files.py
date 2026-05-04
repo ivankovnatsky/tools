@@ -35,16 +35,18 @@ def _parse_mode(value) -> Optional[int]:
 
 
 def _copy_file(
-    source: str, target: str, mode: Optional[int], secrets: bool = False
+    source: str, target: str, mode: Optional[int], *, secrets: bool = False
 ) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
 
     Returns (result, source_hash) where result is:
     True if written, False on error, None if up to date and mode matches.
 
-    When ``secrets`` is true (or the source content trips the
-    ``looks_like_secret`` heuristic) the inline diff body is suppressed
-    so credentials do not bleed into deploy/activation logs.
+    When ``secrets`` is true — or either side (incoming or existing)
+    trips the ``looks_like_secret`` heuristic — the inline diff body is
+    suppressed so credentials do not bleed into deploy/activation logs.
+    Both sides are checked because a rotation that *removes* a secret
+    from the file would otherwise leak the old value.
     """
     try:
         with open(source, "rb") as f:
@@ -55,7 +57,6 @@ def _copy_file(
 
     source_hash = hashlib.sha256(desired).hexdigest()
     desired_mode = mode if mode is not None else stat.S_IMODE(os.stat(source).st_mode)
-    is_secret = secrets or looks_like_secret(desired)
 
     if os.path.exists(target):
         try:
@@ -69,6 +70,7 @@ def _copy_file(
         if existing == desired and existing_mode == desired_mode:
             return None, source_hash
         action = "Updated"
+        is_secret = secrets or looks_like_secret(desired) or looks_like_secret(existing)
         if is_secret:
             diff_body = None
         else:
@@ -130,7 +132,13 @@ def _resolve_entries(
             errors.append(f"invalid mode in entry {entry!r}: {e}")
             continue
 
-        entry_secrets = bool(entry.get("secrets", False))
+        secrets_raw = entry.get("secrets", False)
+        if not isinstance(secrets_raw, bool):
+            errors.append(
+                f"`secrets` must be a bool, got {type(secrets_raw).__name__} in {entry!r}"
+            )
+            continue
+        entry_secrets = secrets_raw
 
         if "dir" in entry:
             source_dir = os.path.join(config_dir, str(entry["dir"]))
@@ -193,7 +201,7 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
         success = False
 
     for target, source, mode, secrets in resolved:
-        result, source_hash = _copy_file(source, target, mode, secrets)
+        result, source_hash = _copy_file(source, target, mode, secrets=secrets)
         if result is False:
             success = False
         elif result is True:

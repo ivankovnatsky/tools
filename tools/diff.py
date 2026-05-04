@@ -12,7 +12,7 @@ from tools.log import Color, log
 from tools.user.brew import _normalize_tap
 from tools.user.ollama_models import diff_ollama_models
 from tools.util import (
-    format_file_diff,
+    format_diff_bytes,
     get_pkg_binary,
     get_pkg_source,
     looks_like_secret,
@@ -38,7 +38,7 @@ def _emit_change(item: str) -> None:
 
     Single-line items get the standard yellow change-row treatment.
     Multi-line items (e.g. inline file content diffs from
-    `format_file_diff`) carry their own ANSI from `delta` or are
+    `format_diff_bytes`) carry their own ANSI from `delta` or are
     pre-padded for the difflib fallback, so we print them as-is to
     avoid the outer yellow wrapper clobbering inner colors.
     """
@@ -201,6 +201,10 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
         try:
             with open(source, "rb") as f:
                 src_bytes = f.read()
+        except OSError:
+            changes.append(f"  ? cannot read source {source}")
+            continue
+        try:
             with open(target, "rb") as f:
                 tgt_bytes = f.read()
         except OSError:
@@ -215,12 +219,12 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
         effective_mode = desired_mode if desired_mode is not None else source_mode
 
         if src_hash != tgt_hash:
-            is_secret = secrets or looks_like_secret(src_bytes)
+            is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
             if is_secret:
                 changes.append(f"  ~ update {target} (secret, diff suppressed)")
             else:
                 changes.append(f"  ~ update {target}")
-                diff_text = format_file_diff(source, target)
+                diff_text = format_diff_bytes(src_bytes, tgt_bytes, target)
                 if diff_text:
                     changes.append(diff_text)
         elif effective_mode != target_mode:
