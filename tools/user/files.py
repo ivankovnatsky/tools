@@ -5,7 +5,7 @@ import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from tools.log import Color, debug, log
-from tools.util import format_diff_bytes
+from tools.util import format_diff_bytes, looks_like_secret
 
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
 SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
@@ -34,11 +34,17 @@ def _parse_mode(value) -> Optional[int]:
     raise TypeError(f"files: mode must be an octal string or int, got {type(value).__name__}")
 
 
-def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[bool], str]:
+def _copy_file(
+    source: str, target: str, mode: Optional[int], secrets: bool = False
+) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
 
     Returns (result, source_hash) where result is:
     True if written, False on error, None if up to date and mode matches.
+
+    When ``secrets`` is true (or the source content trips the
+    ``looks_like_secret`` heuristic) the inline diff body is suppressed
+    so credentials do not bleed into deploy/activation logs.
     """
     try:
         with open(source, "rb") as f:
@@ -49,6 +55,7 @@ def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[
 
     source_hash = hashlib.sha256(desired).hexdigest()
     desired_mode = mode if mode is not None else stat.S_IMODE(os.stat(source).st_mode)
+    is_secret = secrets or looks_like_secret(desired)
 
     if os.path.exists(target):
         try:
@@ -62,7 +69,10 @@ def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[
         if existing == desired and existing_mode == desired_mode:
             return None, source_hash
         action = "Updated"
-        diff_body = format_diff_bytes(desired, existing, target)
+        if is_secret:
+            diff_body = None
+        else:
+            diff_body = format_diff_bytes(desired, existing, target)
     else:
         action = "Created"
         diff_body = None
@@ -92,20 +102,24 @@ def _copy_file(source: str, target: str, mode: Optional[int]) -> Tuple[Optional[
 
 def _resolve_entries(
     entries: List[Dict[str, object]], config_dir: str
-) -> Tuple[List[Tuple[str, str, Optional[int]]], List[str]]:
-    """Expand a `files:` config into a flat list of (target, source, mode) tuples.
+) -> Tuple[List[Tuple[str, str, Optional[int], bool]], List[str]]:
+    """Expand a `files:` config into a flat list of (target, source, mode, secrets) tuples.
 
     Two entry shapes are supported and may be mixed in the same list:
-      - dir entry:  {dir: <path>, mode?: <octal>}        — walks tree, deploys under ~/
-      - file entry: {source, target, mode?}              — explicit single file
+      - dir entry:  {dir: <path>, mode?: <octal>, secrets?: <bool>}
+      - file entry: {source, target, mode?, secrets?}
+
+    The ``secrets`` flag, when true, suppresses inline content diffs in
+    both ``tools deploy`` and ``tools diff`` for that entry. On a dir
+    entry it propagates to every file walked under that tree.
 
     File entries take precedence over dir entries on the same target.
 
     Returns (resolved, errors). `resolved` is deduped by target, last-write-wins.
     `errors` contains human-readable messages about malformed entries.
     """
-    dir_pairs: List[Tuple[str, str, Optional[int]]] = []
-    file_pairs: List[Tuple[str, str, Optional[int]]] = []
+    dir_pairs: List[Tuple[str, str, Optional[int], bool]] = []
+    file_pairs: List[Tuple[str, str, Optional[int], bool]] = []
     errors: List[str] = []
     home = os.path.expanduser("~")
 
@@ -115,6 +129,8 @@ def _resolve_entries(
         except (TypeError, ValueError) as e:
             errors.append(f"invalid mode in entry {entry!r}: {e}")
             continue
+
+        entry_secrets = bool(entry.get("secrets", False))
 
         if "dir" in entry:
             source_dir = os.path.join(config_dir, str(entry["dir"]))
@@ -129,7 +145,7 @@ def _resolve_entries(
                     source = os.path.join(root, name)
                     rel = os.path.relpath(source, source_dir)
                     target = os.path.join(home, rel)
-                    dir_pairs.append((target, source, entry_mode))
+                    dir_pairs.append((target, source, entry_mode, entry_secrets))
             continue
 
         if "source" in entry and "target" in entry:
@@ -138,19 +154,21 @@ def _resolve_entries(
             if not os.path.isfile(source):
                 errors.append(f"source not found: {entry['source']}")
                 continue
-            file_pairs.append((target, source, entry_mode))
+            file_pairs.append((target, source, entry_mode, entry_secrets))
             continue
 
         errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
 
     # Dedupe by target, file entries win.
-    resolved_map: Dict[str, Tuple[str, Optional[int]]] = {}
-    for target, source, mode in dir_pairs:
-        resolved_map[target] = (source, mode)
-    for target, source, mode in file_pairs:
-        resolved_map[target] = (source, mode)
+    resolved_map: Dict[str, Tuple[str, Optional[int], bool]] = {}
+    for target, source, mode, secrets in dir_pairs:
+        resolved_map[target] = (source, mode, secrets)
+    for target, source, mode, secrets in file_pairs:
+        resolved_map[target] = (source, mode, secrets)
 
-    resolved = [(target, source, mode) for target, (source, mode) in resolved_map.items()]
+    resolved = [
+        (target, source, mode, secrets) for target, (source, mode, secrets) in resolved_map.items()
+    ]
     return resolved, errors
 
 
@@ -174,8 +192,8 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
         log(f"files: {err}", Color.RED)
         success = False
 
-    for target, source, mode in resolved:
-        result, source_hash = _copy_file(source, target, mode)
+    for target, source, mode, secrets in resolved:
+        result, source_hash = _copy_file(source, target, mode, secrets)
         if result is False:
             success = False
         elif result is True:

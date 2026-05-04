@@ -1,5 +1,6 @@
 import difflib
 import os
+import re
 import shutil
 import subprocess
 from typing import Dict, List, Optional
@@ -102,6 +103,32 @@ def substitute_secrets(text: str, secret_paths: Dict[str, str]) -> str:
 def _is_binary(data: bytes) -> bool:
     """Heuristic: a NUL byte in the first 8 KiB means binary."""
     return b"\x00" in data[:8192]
+
+
+# PEM-armored private keys (RSA, EC, OpenSSH, generic) — the header is
+# stable across formats. Match anywhere in the file.
+_PEM_PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+
+# Project-wide secret-substitution placeholder (see substitute_secrets).
+# `files:` does not currently substitute, but the convention is shared
+# and a file whose source contains @VAR@ is a strong secret signal.
+_SECRET_PLACEHOLDER = re.compile(rb"@[A-Z_][A-Z0-9_]*@")
+
+
+def looks_like_secret(data: bytes) -> bool:
+    """Cheap heuristic: does this content likely contain a secret?
+
+    Catches PEM-armored private keys and @VAR@ placeholders. Used as a
+    safety net so deploy/diff output does not leak credentials when the
+    user forgot to mark an entry with ``secrets: true``. False negatives
+    are expected — this is opportunistic, not a security boundary.
+    """
+    head = data[:8192]
+    if _PEM_PRIVATE_KEY.search(head):
+        return True
+    if _SECRET_PLACEHOLDER.search(head):
+        return True
+    return False
 
 
 def _decode_for_diff(data: bytes) -> Optional[List[str]]:

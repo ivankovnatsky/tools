@@ -15,6 +15,7 @@ from tools.util import (
     format_file_diff,
     get_pkg_binary,
     get_pkg_source,
+    looks_like_secret,
     run_command,
     version_changed,
 )
@@ -190,7 +191,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
         changes.append(f"  ! {err}")
 
     managed_targets = set()
-    for target, source, desired_mode in resolved:
+    for target, source, desired_mode, secrets in resolved:
         managed_targets.add(target)
 
         if not os.path.exists(target):
@@ -199,22 +200,29 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
 
         try:
             with open(source, "rb") as f:
-                src_hash = hashlib.sha256(f.read()).hexdigest()
+                src_bytes = f.read()
             with open(target, "rb") as f:
-                tgt_hash = hashlib.sha256(f.read()).hexdigest()
+                tgt_bytes = f.read()
         except OSError:
             changes.append(f"  ? cannot read {target}")
             continue
+
+        src_hash = hashlib.sha256(src_bytes).hexdigest()
+        tgt_hash = hashlib.sha256(tgt_bytes).hexdigest()
 
         target_mode = stat.S_IMODE(os.stat(target).st_mode)
         source_mode = stat.S_IMODE(os.stat(source).st_mode)
         effective_mode = desired_mode if desired_mode is not None else source_mode
 
         if src_hash != tgt_hash:
-            changes.append(f"  ~ update {target}")
-            diff_text = format_file_diff(source, target)
-            if diff_text:
-                changes.append(diff_text)
+            is_secret = secrets or looks_like_secret(src_bytes)
+            if is_secret:
+                changes.append(f"  ~ update {target} (secret, diff suppressed)")
+            else:
+                changes.append(f"  ~ update {target}")
+                diff_text = format_file_diff(source, target)
+                if diff_text:
+                    changes.append(diff_text)
         elif effective_mode != target_mode:
             changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
