@@ -105,28 +105,34 @@ def _is_binary(data: bytes) -> bool:
     return b"\x00" in data[:8192]
 
 
-# PEM-armored private keys (RSA, EC, OpenSSH, generic) — the header is
-# stable across formats. Match anywhere in the file.
+# PEM-armored private keys (RSA, EC, OpenSSH, generic). Header is
+# stable across formats. Scanned anywhere in the file because cert
+# bundles routinely place certs (1.5–2 KiB each) before the key,
+# pushing the BEGIN marker past any short prefix window.
 _PEM_PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 
-# Project-wide secret-substitution placeholder (see substitute_secrets).
-# `files:` does not currently substitute, but the convention is shared
-# and a file whose source contains @VAR@ is a strong secret signal.
-_SECRET_PLACEHOLDER = re.compile(rb"@[A-Z_][A-Z0-9_]*@")
+# Project-wide secret-substitution template marker (see substitute_secrets).
+# A file whose source carries @VAR@ placeholders is a *template* signal:
+# the resolved file would contain a credential at that position. Require
+# at least three chars between the @ delimiters so single letters and
+# common doc usages (`@A@`, `@O@example.com`) do not trip it.
+_SECRET_PLACEHOLDER = re.compile(rb"@[A-Z_][A-Z0-9_]{2,}@")
 
 
 def looks_like_secret(data: bytes) -> bool:
     """Cheap heuristic: does this content likely contain a secret?
 
-    Catches PEM-armored private keys and @VAR@ placeholders. Used as a
-    safety net so deploy/diff output does not leak credentials when the
-    user forgot to mark an entry with ``secrets: true``. False negatives
-    are expected — this is opportunistic, not a security boundary.
+    Catches PEM-armored private keys and @VAR@ template placeholders.
+    Used as a safety net so deploy/diff output does not leak credentials
+    when the user forgot to mark an entry with ``secrets: true``. False
+    negatives are expected (AWS keys, tokens in JSON, .netrc, .env, etc.
+    are not detected) — this is opportunistic, not a security boundary.
+    Always set ``secrets: true`` explicitly on entries known to carry
+    credentials and treat this heuristic as a tripwire only.
     """
-    head = data[:8192]
-    if _PEM_PRIVATE_KEY.search(head):
+    if _PEM_PRIVATE_KEY.search(data):
         return True
-    if _SECRET_PLACEHOLDER.search(head):
+    if _SECRET_PLACEHOLDER.search(data):
         return True
     return False
 
@@ -216,23 +222,3 @@ def format_diff_bytes(
     if truncated:
         body += f"\n{indent}(... {omitted} more lines)"
     return body
-
-
-def format_file_diff(source_path: str, target_path: str, indent: str = "    ") -> Optional[str]:
-    """Build a printable diff between target (current) and source (desired).
-
-    Returns a string ready to print, or None when no readable diff is
-    available (binary content, missing files, decode failure). The
-    string is left-padded with `indent` so it nests under existing
-    section headers in `tools diff` output. Output is capped at
-    ``_DIFF_MAX_LINES`` lines with a truncation footer.
-    """
-    try:
-        with open(source_path, "rb") as f:
-            src_bytes = f.read()
-        with open(target_path, "rb") as f:
-            tgt_bytes = f.read()
-    except OSError:
-        return None
-
-    return format_diff_bytes(src_bytes, tgt_bytes, target_path, indent)
