@@ -12,6 +12,7 @@ from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.files import install_files
 from tools.user.git_repos import install_git_repos
+from tools.user.go import install_go_packages
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
@@ -63,6 +64,11 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
 
     if "uv" in active and config.get("uv", {}).get("packages"):
         success &= install_uv_packages(config["uv"]["packages"], paths, state)
+
+    if "go" in active:
+        go_packages = config.get("go", {}).get("packages", {})
+        if go_packages or state.get("go", {}).get("packages"):
+            success &= install_go_packages(go_packages, state)
 
     if "mcp" in active:
         success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
