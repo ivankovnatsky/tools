@@ -14,6 +14,8 @@ paths:
   bun: ~/.bun
   npm: ~/.npm-global
   uv: ~/.local/share/uv/tools
+  goBin: ~/go/bin
+  goPath: ~/go
   mcp: ~/.config/claude/claude_desktop_config.json
   curlShell: ~/.local/bin
   gitRepos: ~/src
@@ -28,9 +30,9 @@ uv:
   packages: {}
 
 # Go packages are installed with `go install <module>@<version>`.
-# The install dir is whatever `go env GOBIN` (or `go env GOPATH/bin`)
-# resolves to, e.g. `~/go/bin` on a default install — tools follows
-# Go's own resolution, so no path config is required here.
+# `paths.goBin`/`paths.goPath` above are propagated to `go install`
+# as $GOBIN / $GOPATH so binaries land where we tell them. If both
+# are omitted, tools falls back to `go env GOBIN`/`go env GOPATH/bin`.
 go:
   packages: {}
 
