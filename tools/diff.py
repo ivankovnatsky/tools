@@ -24,6 +24,7 @@ ALL_SECTIONS = (
     "bun",
     "npm",
     "uv",
+    "go",
     "mcp",
     "curlShell",
     "gitRepos",
@@ -121,6 +122,34 @@ def _diff_uv(packages: Dict, paths: Dict, state: Dict):
         all_tracked[pkg] = pkg_data.get("binary", pkg)
     for pkg, binary in all_tracked.items():
         if pkg not in desired and (Path(paths["uvBin"]) / binary).exists():
+            changes.append(f"  - remove {pkg}")
+
+    return changes
+
+
+def _diff_go(packages: Dict, state: Dict):
+    from tools.user.go import _default_binary, _resolve_go_bin
+
+    changes = []
+    desired = set(packages.keys())
+    go_bin_str = _resolve_go_bin()
+    if not go_bin_str:
+        return ["  ? cannot resolve Go install dir (go env GOPATH unavailable)"]
+    go_bin = Path(go_bin_str)
+
+    for pkg, pkg_info in packages.items():
+        binary = _default_binary(pkg, pkg_info)
+        if not (go_bin / binary).exists():
+            source = get_pkg_source(pkg_info) or pkg
+            changes.append(f"  + install {source}")
+        elif version_changed(pkg, pkg_info, state, "go"):
+            changes.append(f"  ~ update {pkg}")
+
+    all_tracked = {}
+    for pkg, pkg_data in state.get("go", {}).get("packages", {}).items():
+        all_tracked[pkg] = pkg_data.get("binary", pkg)
+    for pkg, binary in all_tracked.items():
+        if pkg not in desired and (go_bin / binary).exists():
             changes.append(f"  - remove {pkg}")
 
     return changes
@@ -356,6 +385,12 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
             changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("uv", changes))
+
+    if "go" in active:
+        if config.get("go", {}).get("packages") or state.get("go", {}).get("packages"):
+            changes = _diff_go(config.get("go", {}).get("packages", {}), state)
+            if changes:
+                sections.append(("go", changes))
 
     if "mcp" in active:
         changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)

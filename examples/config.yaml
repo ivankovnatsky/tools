@@ -27,6 +27,13 @@ npm:
 uv:
   packages: {}
 
+# Go packages are installed with `go install <module>@<version>`.
+# The install dir is whatever `go env GOBIN` (or `go env GOPATH/bin`)
+# resolves to, e.g. `~/go/bin` on a default install — tools follows
+# Go's own resolution, so no path config is required here.
+go:
+  packages: {}
+
 mcp:
   servers: {}
 
