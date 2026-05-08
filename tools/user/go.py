@@ -31,14 +31,20 @@ def _default_binary(pkg: str, pkg_info: Dict) -> str:
     return pkg
 
 
-def _resolve_go_bin() -> Optional[str]:
-    """Ask `go` where it installs binaries, mirroring its own resolution.
+def _resolve_go_bin(paths: Dict) -> Optional[str]:
+    """Resolve where Go binaries are installed.
 
-    `go install` writes to $GOBIN if set, otherwise $GOPATH/bin. We query
-    the toolchain rather than reimplementing that lookup so an explicit
-    user $GOBIN, a multi-entry $GOPATH, or `go env -w` overrides all
-    behave the same way they would on the command line.
+    Honors explicit `paths.goBin` first (matching the bunBin/uvBin/npmBin
+    pattern: nix-config controls install locations). Falls back to
+    `go env GOBIN` then `$GOPATH/bin` so standalone `tools` invocations
+    outside nix still work.
     """
+    explicit = paths.get("goBin")
+    if explicit:
+        return os.path.expanduser(explicit)
+    gopath = paths.get("goPath")
+    if gopath:
+        return os.path.join(os.path.expanduser(gopath), "bin")
     rc, stdout, _ = run_command(["go", "env", "GOBIN"])
     if rc == 0:
         gobin = stdout.strip()
@@ -53,6 +59,21 @@ def _resolve_go_bin() -> Optional[str]:
     return os.path.join(gopath, "bin")
 
 
+def _go_env(paths: Dict) -> Dict[str, str]:
+    """Build env for `go install` so it lands where we tell it.
+
+    Without this, `go install` honors `go env -w` defaults and writes
+    binaries somewhere we don't track. We pin GOBIN/GOPATH from config
+    when set so the install dir matches the dir we scan for state.
+    """
+    env = os.environ.copy()
+    if paths.get("goBin"):
+        env["GOBIN"] = os.path.expanduser(paths["goBin"])
+    if paths.get("goPath"):
+        env["GOPATH"] = os.path.expanduser(paths["goPath"])
+    return env
+
+
 def get_installed_go_packages(go_bin: str, packages: Dict[str, Dict]) -> Set[str]:
     installed = set()
     for pkg, info in packages.items():
@@ -62,14 +83,18 @@ def get_installed_go_packages(go_bin: str, packages: Dict[str, Dict]) -> Set[str
     return installed
 
 
-def install_go_packages(packages: Dict, state: Dict):
+def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     desired = set(packages.keys())
     state_packages = set(state.get("go", {}).get("packages", {}).keys())
 
-    go_bin = _resolve_go_bin()
+    go_bin = _resolve_go_bin(paths)
     if not go_bin:
-        log("Failed to resolve Go install dir (go env GOPATH unavailable)", Color.RED)
+        log("Failed to resolve Go install dir (no goBin, no go env GOPATH)", Color.RED)
         return False
+    go_env = _go_env(paths)
+    # When goBin isn't pinned in config, propagate the resolved value
+    # so `go install` agrees with our existence checks.
+    go_env.setdefault("GOBIN", go_bin)
 
     current = get_installed_go_packages(go_bin, packages)
 
@@ -127,7 +152,7 @@ def install_go_packages(packages: Dict, state: Dict):
         for pkg in to_install:
             spec = _install_spec(pkg, packages[pkg])
             cmd = ["go", "install", spec]
-            returncode, stdout, stderr = run_command(cmd)
+            returncode, stdout, stderr = run_command(cmd, env=go_env)
             if returncode != 0:
                 log(f"Failed to install Go package {spec}: {stderr}", Color.RED)
                 return False

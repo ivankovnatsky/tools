@@ -127,14 +127,14 @@ def _diff_uv(packages: Dict, paths: Dict, state: Dict):
     return changes
 
 
-def _diff_go(packages: Dict, state: Dict):
+def _diff_go(packages: Dict, paths: Dict, state: Dict):
     from tools.user.go import _default_binary, _resolve_go_bin
 
     changes = []
     desired = set(packages.keys())
-    go_bin_str = _resolve_go_bin()
+    go_bin_str = _resolve_go_bin(paths)
     if not go_bin_str:
-        return ["  ? cannot resolve Go install dir (go env GOPATH unavailable)"]
+        return ["  ? cannot resolve Go install dir (no goBin, no go env GOPATH)"]
     go_bin = Path(go_bin_str)
 
     for pkg, pkg_info in packages.items():
@@ -388,7 +388,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     if "go" in active:
         if config.get("go", {}).get("packages") or state.get("go", {}).get("packages"):
-            changes = _diff_go(config.get("go", {}).get("packages", {}), state)
+            changes = _diff_go(config.get("go", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("go", changes))
 
