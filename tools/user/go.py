@@ -92,15 +92,14 @@ def _cleanup_managed_gopath(paths: Dict, go_bin: str) -> bool:
 
     go_path = Path(os.path.expanduser(configured_go_path)).resolve()
     bin_path = Path(go_bin).resolve()
-    if bin_path != go_path / "bin":
-        return True
+    bin_inside_go_path = bin_path == go_path / "bin"
 
     try:
-        if bin_path.exists() and any(bin_path.iterdir()):
+        if bin_inside_go_path and bin_path.exists() and any(bin_path.iterdir()):
             log(f"Keeping Go dependencies because {bin_path} is not empty", Color.YELLOW)
             return True
 
-        if bin_path.exists():
+        if bin_inside_go_path and bin_path.exists():
             bin_path.rmdir()
 
         pkg_path = go_path / "pkg"
