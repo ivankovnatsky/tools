@@ -68,7 +68,7 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     if "go" in active:
         go_packages = config.get("go", {}).get("packages", {})
         go_state = state.get("go", {})
-        if go_packages or go_state.get("packages") or go_state.get("cleanupPending"):
+        if go_packages or go_state.get("packages"):
             success &= install_go_packages(go_packages, paths, state)
 
     if "mcp" in active:
