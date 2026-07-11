@@ -153,9 +153,6 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
         if pkg not in desired and (go_bin / binary).exists():
             changes.append(f"  - remove {pkg}")
 
-    if not desired and (all_tracked or go_state.get("cleanupPending")):
-        changes.append("  - clean managed GOPATH")
-
     return changes
 
 
@@ -392,11 +389,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     if "go" in active:
         go_state = state.get("go", {})
-        if (
-            config.get("go", {}).get("packages")
-            or go_state.get("packages")
-            or go_state.get("cleanupPending")
-        ):
+        if config.get("go", {}).get("packages") or go_state.get("packages"):
             changes = _diff_go(config.get("go", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("go", changes))
