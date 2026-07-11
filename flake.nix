@@ -40,11 +40,9 @@
 
           dependencies = pythonPackages pkgs.python3Packages;
 
-          checkPhase = ''
-            runHook preCheck
-            python -m unittest discover -s tests -v
-            runHook postCheck
-          '';
+          # Tests run in `checks`, not here: this derivation is rebuilt on
+          # every nix-config switch and must not pay for them.
+          doCheck = false;
 
           meta = with pkgs.lib; {
             description = "Declarative configuration manager";
@@ -60,7 +58,14 @@
           default = toolsPackage;
         };
 
-        checks.default = toolsPackage;
+        checks.default = toolsPackage.overridePythonAttrs (_: {
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            python -m unittest discover -s tests -v
+            runHook postCheck
+          '';
+        });
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
