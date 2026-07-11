@@ -1,5 +1,4 @@
 import os
-import shutil
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -84,74 +83,14 @@ def get_installed_go_packages(go_bin: str, packages: Dict[str, Dict]) -> Set[str
     return installed
 
 
-# Cleanup either finishes, is deferred until unmanaged binaries are gone, or
-# fails. Deferred and failed both have to persist `cleanupPending`, but only a
-# failure is an error worth failing the run over.
-CLEANUP_DONE = "done"
-CLEANUP_DEFERRED = "deferred"
-CLEANUP_FAILED = "failed"
-
-
-def _force_writable(root: Path) -> None:
-    """Make a tree removable.
-
-    Go writes `$GOPATH/pkg/mod` read-only (dirs `0555`), so unlinking their
-    contents fails with EACCES until the directory bit is restored.
-    """
-    for parent, dirs, _ in os.walk(root):
-        for entry in [Path(parent), *(Path(parent) / d for d in dirs)]:
-            if not entry.is_symlink():
-                entry.chmod(0o700)
-
-
-def _cleanup_managed_gopath(paths: Dict) -> str:
-    """Remove caches after the final managed Go binary is removed."""
-    configured_go_path = paths.get("goPath")
-    if not configured_go_path:
-        return CLEANUP_DONE
-
-    go_path = Path(os.path.expanduser(configured_go_path)).resolve()
-    # Only $GOPATH/bin gates the cache: binaries installed to an explicit
-    # `goBin` elsewhere are managed here and already removed by now.
-    go_path_bin = go_path / "bin"
-
-    try:
-        if go_path_bin.exists() and any(go_path_bin.iterdir()):
-            log(
-                f"Keeping Go dependencies because {go_path_bin} is not empty",
-                Color.YELLOW,
-            )
-            return CLEANUP_DEFERRED
-
-        if go_path_bin.exists():
-            go_path_bin.rmdir()
-
-        pkg_path = go_path / "pkg"
-        if pkg_path.is_symlink():
-            log(f"Refusing to remove symlinked Go package cache: {pkg_path}", Color.RED)
-            return CLEANUP_FAILED
-        if pkg_path.exists():
-            _force_writable(pkg_path)
-            shutil.rmtree(pkg_path)
-            log(f"Removed Go package cache: {pkg_path}", Color.RED)
-
-        if go_path.exists() and not any(go_path.iterdir()):
-            go_path.rmdir()
-            log(f"Removed empty GOPATH: {go_path}", Color.RED)
-    except OSError as e:
-        log(f"Failed to clean managed GOPATH {go_path}: {e}", Color.RED)
-        return CLEANUP_FAILED
-
-    return CLEANUP_DONE
-
-
 def install_go_packages(packages: Dict, paths: Dict, state: Dict):
+    # Removing a package removes its binary, never the module cache: $GOPATH is
+    # shared with the user's own Go work and Go records no per-package
+    # ownership of modules, so the only cache removal available is all-or-
+    # nothing. Reclaiming it is `go clean -modcache`, and that is the user's
+    # call to make.
     desired = set(packages.keys())
-    go_state_before = state.get("go", {})
-    state_packages = set(go_state_before.get("packages", {}).keys())
-    cleanup_requested = not desired and (
-        bool(state_packages) or go_state_before.get("cleanupPending", False)
-    )
+    state_packages = set(state.get("go", {}).get("packages", {}).keys())
 
     go_bin = _resolve_go_bin(paths)
     if not go_bin:
@@ -208,11 +147,6 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
             log(f"Removed: {pkg}", Color.GREEN)
             state_changed = True
 
-    cleanup_result = CLEANUP_DONE
-    if cleanup_requested and not failed_removals:
-        cleanup_result = _cleanup_managed_gopath(paths)
-        success &= cleanup_result != CLEANUP_FAILED
-
     to_install = []
     for pkg, pkg_info in packages.items():
         if pkg not in current or version_changed(pkg, pkg_info, state, "go"):
@@ -232,7 +166,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     elif not to_remove:
         debug("All Go packages already installed", Color.BLUE)
 
-    if state_changed or state_packages != desired or cleanup_requested:
+    if state_changed or state_packages != desired:
         go_state = dict(failed_removals)
         for pkg, pkg_info in packages.items():
             entry = {
@@ -246,8 +180,6 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
                 entry["commit"] = commit
             go_state[pkg] = entry
         state["go"] = {"packages": go_state}
-        if cleanup_requested and (failed_removals or cleanup_result != CLEANUP_DONE):
-            state["go"]["cleanupPending"] = True
 
     return success
 
