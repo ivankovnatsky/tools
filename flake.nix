@@ -21,10 +21,11 @@
         };
 
         # Keep in sync with pyproject.toml
-        pythonPackages = ps: with ps; [
-          click
-          pyyaml
-        ];
+        pythonPackages =
+          ps: with ps; [
+            click
+            pyyaml
+          ];
 
         toolsPackage = pkgs.python3Packages.buildPythonApplication {
           pname = "tools";
@@ -39,6 +40,12 @@
 
           dependencies = pythonPackages pkgs.python3Packages;
 
+          checkPhase = ''
+            runHook preCheck
+            python -m unittest discover -s tests -v
+            runHook postCheck
+          '';
+
           meta = with pkgs.lib; {
             description = "Declarative configuration manager";
             homepage = "https://github.com/ivankovnatsky/tools";
@@ -52,6 +59,8 @@
           tools = toolsPackage;
           default = toolsPackage;
         };
+
+        checks.default = toolsPackage;
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
