@@ -84,29 +84,46 @@ def get_installed_go_packages(go_bin: str, packages: Dict[str, Dict]) -> Set[str
     return installed
 
 
-def _cleanup_managed_gopath(paths: Dict, go_bin: str) -> bool:
+def _force_writable(root: Path) -> None:
+    """Make a tree removable.
+
+    Go writes `$GOPATH/pkg/mod` read-only (dirs `0555`), so unlinking their
+    contents fails with EACCES until the directory bit is restored.
+    """
+    for parent, dirs, _ in os.walk(root):
+        for entry in [Path(parent), *(Path(parent) / d for d in dirs)]:
+            if not entry.is_symlink():
+                entry.chmod(0o700)
+
+
+def _cleanup_managed_gopath(paths: Dict) -> bool:
     """Remove caches after the final managed Go binary is removed."""
     configured_go_path = paths.get("goPath")
     if not configured_go_path:
         return True
 
     go_path = Path(os.path.expanduser(configured_go_path)).resolve()
-    bin_path = Path(go_bin).resolve()
-    bin_inside_go_path = bin_path == go_path / "bin"
+    # Only $GOPATH/bin gates the cache: binaries installed to an explicit
+    # `goBin` elsewhere are managed here and already removed by now.
+    go_path_bin = go_path / "bin"
 
     try:
-        if bin_inside_go_path and bin_path.exists() and any(bin_path.iterdir()):
-            log(f"Keeping Go dependencies because {bin_path} is not empty", Color.YELLOW)
+        if go_path_bin.exists() and any(go_path_bin.iterdir()):
+            log(
+                f"Keeping Go dependencies because {go_path_bin} is not empty",
+                Color.YELLOW,
+            )
             return True
 
-        if bin_inside_go_path and bin_path.exists():
-            bin_path.rmdir()
+        if go_path_bin.exists():
+            go_path_bin.rmdir()
 
         pkg_path = go_path / "pkg"
         if pkg_path.is_symlink():
             log(f"Refusing to remove symlinked Go package cache: {pkg_path}", Color.RED)
             return False
         if pkg_path.exists():
+            _force_writable(pkg_path)
             shutil.rmtree(pkg_path)
             log(f"Removed Go package cache: {pkg_path}", Color.RED)
 
@@ -185,7 +202,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
 
     cleanup_succeeded = True
     if cleanup_requested and not failed_removals:
-        cleanup_succeeded = _cleanup_managed_gopath(paths, go_bin)
+        cleanup_succeeded = _cleanup_managed_gopath(paths)
         success &= cleanup_succeeded
 
     to_install = []
