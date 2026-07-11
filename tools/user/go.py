@@ -84,6 +84,14 @@ def get_installed_go_packages(go_bin: str, packages: Dict[str, Dict]) -> Set[str
     return installed
 
 
+# Cleanup either finishes, is deferred until unmanaged binaries are gone, or
+# fails. Deferred and failed both have to persist `cleanupPending`, but only a
+# failure is an error worth failing the run over.
+CLEANUP_DONE = "done"
+CLEANUP_DEFERRED = "deferred"
+CLEANUP_FAILED = "failed"
+
+
 def _force_writable(root: Path) -> None:
     """Make a tree removable.
 
@@ -96,11 +104,11 @@ def _force_writable(root: Path) -> None:
                 entry.chmod(0o700)
 
 
-def _cleanup_managed_gopath(paths: Dict) -> bool:
+def _cleanup_managed_gopath(paths: Dict) -> str:
     """Remove caches after the final managed Go binary is removed."""
     configured_go_path = paths.get("goPath")
     if not configured_go_path:
-        return True
+        return CLEANUP_DONE
 
     go_path = Path(os.path.expanduser(configured_go_path)).resolve()
     # Only $GOPATH/bin gates the cache: binaries installed to an explicit
@@ -113,7 +121,7 @@ def _cleanup_managed_gopath(paths: Dict) -> bool:
                 f"Keeping Go dependencies because {go_path_bin} is not empty",
                 Color.YELLOW,
             )
-            return True
+            return CLEANUP_DEFERRED
 
         if go_path_bin.exists():
             go_path_bin.rmdir()
@@ -121,7 +129,7 @@ def _cleanup_managed_gopath(paths: Dict) -> bool:
         pkg_path = go_path / "pkg"
         if pkg_path.is_symlink():
             log(f"Refusing to remove symlinked Go package cache: {pkg_path}", Color.RED)
-            return False
+            return CLEANUP_FAILED
         if pkg_path.exists():
             _force_writable(pkg_path)
             shutil.rmtree(pkg_path)
@@ -132,9 +140,9 @@ def _cleanup_managed_gopath(paths: Dict) -> bool:
             log(f"Removed empty GOPATH: {go_path}", Color.RED)
     except OSError as e:
         log(f"Failed to clean managed GOPATH {go_path}: {e}", Color.RED)
-        return False
+        return CLEANUP_FAILED
 
-    return True
+    return CLEANUP_DONE
 
 
 def install_go_packages(packages: Dict, paths: Dict, state: Dict):
@@ -200,10 +208,10 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
             log(f"Removed: {pkg}", Color.GREEN)
             state_changed = True
 
-    cleanup_succeeded = True
+    cleanup_result = CLEANUP_DONE
     if cleanup_requested and not failed_removals:
-        cleanup_succeeded = _cleanup_managed_gopath(paths)
-        success &= cleanup_succeeded
+        cleanup_result = _cleanup_managed_gopath(paths)
+        success &= cleanup_result != CLEANUP_FAILED
 
     to_install = []
     for pkg, pkg_info in packages.items():
@@ -238,7 +246,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
                 entry["commit"] = commit
             go_state[pkg] = entry
         state["go"] = {"packages": go_state}
-        if cleanup_requested and (failed_removals or not cleanup_succeeded):
+        if cleanup_requested and (failed_removals or cleanup_result != CLEANUP_DONE):
             state["go"]["cleanupPending"] = True
 
     return success
