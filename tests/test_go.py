@@ -40,6 +40,23 @@ class GoCleanupTest(unittest.TestCase):
             self.assertTrue((go_path / "bin" / "other").exists())
             self.assertTrue((go_path / "pkg").exists())
 
+    def test_separate_go_bin_still_cleans_package_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            go_path = Path(temp_dir) / ".go"
+            go_bin = Path(temp_dir) / ".local" / "bin"
+            go_bin.mkdir(parents=True)
+            (go_bin / "rclone").touch()
+            (go_path / "pkg" / "mod" / "example").mkdir(parents=True)
+            state = {"go": {"packages": {"rclone": {"binary": "rclone", "installed": True}}}}
+
+            success = install_go_packages({}, {"goPath": str(go_path), "goBin": str(go_bin)}, state)
+
+            self.assertTrue(success)
+            self.assertFalse((go_bin / "rclone").exists())
+            self.assertTrue(go_bin.exists())
+            self.assertFalse(go_path.exists())
+            self.assertEqual(state["go"], {"packages": {}})
+
 
 if __name__ == "__main__":
     unittest.main()
