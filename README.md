@@ -2,7 +2,7 @@
 
 Declarative configuration manager.
 
-## Bootstrap log
+## Bootstrap
 
 Remote repo created:
 
