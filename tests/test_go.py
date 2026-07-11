@@ -57,6 +57,41 @@ class GoCleanupTest(unittest.TestCase):
             self.assertFalse(go_path.exists())
             self.assertEqual(state["go"], {"packages": {}})
 
+    def test_read_only_module_cache_is_removed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            go_path = Path(temp_dir) / ".go"
+            go_bin = Path(temp_dir) / ".local" / "bin"
+            go_bin.mkdir(parents=True)
+            (go_bin / "rclone").touch()
+            module = go_path / "pkg" / "mod" / "example"
+            module.mkdir(parents=True)
+            (module / "go.mod").touch()
+            # Mirror how `go install` writes the module cache.
+            (module / "go.mod").chmod(0o444)
+            module.chmod(0o555)
+            module.parent.chmod(0o555)
+            state = {"go": {"packages": {"rclone": {"binary": "rclone", "installed": True}}}}
+
+            success = install_go_packages({}, {"goPath": str(go_path), "goBin": str(go_bin)}, state)
+
+            self.assertTrue(success)
+            self.assertFalse(go_path.exists())
+
+    def test_empty_gopath_bin_does_not_block_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            go_path = Path(temp_dir) / ".go"
+            go_bin = Path(temp_dir) / ".local" / "bin"
+            go_bin.mkdir(parents=True)
+            (go_bin / "rclone").touch()
+            (go_path / "bin").mkdir(parents=True)
+            (go_path / "pkg" / "mod" / "example").mkdir(parents=True)
+            state = {"go": {"packages": {"rclone": {"binary": "rclone", "installed": True}}}}
+
+            success = install_go_packages({}, {"goPath": str(go_path), "goBin": str(go_bin)}, state)
+
+            self.assertTrue(success)
+            self.assertFalse(go_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
