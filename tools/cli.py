@@ -11,6 +11,7 @@ from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.files import install_files
+from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
 from tools.user.go import install_go_packages
 from tools.user.mcp import install_mcp_servers
@@ -88,6 +89,9 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
 
     if "ollamaModels" in active:
         success &= install_ollama_models(config.get("ollamaModels", {}) or {}, state)
+
+    if "flatpak" in active:
+        success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state)
 
     save_json(state_file, state)
     return success
