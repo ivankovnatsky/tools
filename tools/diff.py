@@ -10,6 +10,7 @@ from typing import Dict, List
 
 from tools.log import Color, log
 from tools.user.brew import _normalize_tap
+from tools.user.flatpak import diff_flatpak
 from tools.user.ollama_models import diff_ollama_models
 from tools.util import (
     format_diff_bytes,
@@ -31,6 +32,7 @@ ALL_SECTIONS = (
     "files",
     "brew",
     "ollamaModels",
+    "flatpak",
 )
 
 
@@ -423,6 +425,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = diff_ollama_models(config.get("ollamaModels", {}) or {}, state)
         if changes:
             sections.append(("ollamaModels", changes))
+
+    if "flatpak" in active:
+        changes = diff_flatpak(config.get("flatpak", {}) or {}, state)
+        if changes:
+            sections.append(("flatpak", changes))
 
     if sections:
         has_changes = True
