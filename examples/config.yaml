@@ -42,3 +42,9 @@ mcp:
 curlShell: {}
 
 gitRepos: {}
+
+# `packages` may also be a dict of {app_id: {remote: ...}} to pin an
+# app to one remote when several carry the same ID.
+flatpak:
+  remotes: {}
+  packages: []
