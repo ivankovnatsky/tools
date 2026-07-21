@@ -4,7 +4,6 @@ from typing import Dict
 
 from tools.log import Color, debug, log
 from tools.util import (
-    get_pkg_binary,
     get_pkg_post_install,
     get_pkg_subpackages,
     get_pkg_version,
@@ -32,7 +31,6 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
             log(".npmrc already exists, skipping creation", Color.BLUE)
             state.setdefault("npm", {})["npmrc_created"] = True
 
-    npm_bin = Path(paths["npmBin"])
     desired = set(packages.keys())
     state_packages = set(state.get("npm", {}).get("packages", {}).keys())
 
@@ -40,32 +38,30 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
     env["PATH"] = f"{paths['nodejs']}:{env.get('PATH', '')}"
 
     state_changed = False
+    success = True
 
-    # Build binary mapping for tracked packages
-    all_tracked = {}
-    for pkg, pkg_data in state.get("npm", {}).get("packages", {}).items():
-        all_tracked[pkg] = pkg_data.get("binary", pkg.split("/")[-1])
-    for pkg, pkg_info in packages.items():
-        all_tracked[pkg] = get_pkg_binary(pkg_info)
-
-    # 1. CLEANUP: Remove packages no longer in config
-    to_remove = {
-        pkg: binary
-        for pkg, binary in all_tracked.items()
-        if pkg not in desired and (npm_bin / binary).exists()
-    }
+    # 1. CLEANUP: Remove packages no longer in config (state is the source of
+    # truth; npm uninstall is keyed by package name, not a binary path).
+    # Keep failed removals in state so the next run retries them instead of
+    # forgetting a package that is still installed.
+    state_pkgs = state.get("npm", {}).get("packages", {})
+    to_remove = sorted(pkg for pkg in state_packages if pkg not in desired)
+    failed_removals: Dict[str, Dict] = {}
 
     if to_remove:
-        log(f"Removing npm packages: {', '.join(to_remove.keys())}", Color.RED)
-        cmd = [f"{paths['nodejs']}/npm", "uninstall", "-g"] + list(to_remove.keys())
-        run_command(cmd, env)
+        log(f"Removing npm packages: {', '.join(to_remove)}", Color.RED)
+        cmd = [f"{paths['nodejs']}/npm", "uninstall", "-g"] + to_remove
+        returncode, _, stderr = run_command(cmd, env)
+        if returncode != 0:
+            log(f"Failed to remove npm packages: {stderr}", Color.RED)
+            failed_removals = {pkg: state_pkgs[pkg] for pkg in to_remove}
+            success = False
         state_changed = True
 
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
     for pkg, pkg_info in packages.items():
-        binary = get_pkg_binary(pkg_info)
-        if not (npm_bin / binary).exists() or version_changed(pkg, pkg_info, state, "npm"):
+        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "npm"):
             to_install.append(pkg_install_spec(pkg, get_pkg_version(pkg_info)))
     if to_install:
         log(f"Installing npm packages: {', '.join(to_install)}", Color.GREEN)
@@ -146,17 +142,17 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
             log(f"Installed subpackages for {pkg}", Color.GREEN)
             state_changed = True
 
-    # Update state (always save progress, even on partial failure)
+    # Update state (always save progress, even on partial failure). Packages
+    # whose uninstall failed are kept so cleanup is retried next run.
     if state_changed or state_packages != desired:
-        state.setdefault("npm", {})["packages"] = {
-            pkg: {
+        npm_state = dict(failed_removals)
+        for pkg, pkg_info in packages.items():
+            npm_state[pkg] = {
                 "installed": True,
-                "binary": get_pkg_binary(pkg_info),
                 "version": get_pkg_version(pkg_info),
                 "subpackages": get_pkg_subpackages(pkg_info),
                 "postInstall": get_pkg_post_install(pkg_info),
             }
-            for pkg, pkg_info in packages.items()
-        }
+        state.setdefault("npm", {})["packages"] = npm_state
 
-    return not subpkg_failed
+    return success and not subpkg_failed

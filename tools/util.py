@@ -20,11 +20,6 @@ def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int,
     return result.returncode, result.stdout, result.stderr
 
 
-def get_pkg_binary(pkg_info: Dict) -> str:
-    """Extract binary name from package info dict."""
-    return pkg_info.get("binary", "")
-
-
 def get_pkg_version(pkg_info: Dict) -> str:
     """Extract version from package info dict."""
     return pkg_info.get("version", "latest")

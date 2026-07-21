@@ -63,8 +63,10 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
         npm_only_config = {"configFile": npm_config.get("configFile")}
         success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
 
-    if "uv" in active and config.get("uv", {}).get("packages"):
-        success &= install_uv_packages(config["uv"]["packages"], paths, state)
+    if "uv" in active:
+        uv_packages = config.get("uv", {}).get("packages", {})
+        if uv_packages or state.get("uv", {}).get("packages"):
+            success &= install_uv_packages(uv_packages, paths, state)
 
     if "go" in active:
         go_packages = config.get("go", {}).get("packages", {})

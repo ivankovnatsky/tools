@@ -5,7 +5,6 @@ import os
 import shutil
 import stat
 import sys
-from pathlib import Path
 from typing import Dict, List
 
 from tools.log import Color, log
@@ -14,7 +13,6 @@ from tools.user.flatpak import diff_flatpak
 from tools.user.ollama_models import diff_ollama_models
 from tools.util import (
     format_diff_bytes,
-    get_pkg_binary,
     get_pkg_source,
     looks_like_secret,
     run_command,
@@ -53,22 +51,14 @@ def _emit_change(item: str) -> None:
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     changes = []
-    bun_bin = Path(paths["bunBin"])
     desired = set(packages.keys())
+    state_packages = set(state.get("bun", {}).get("packages", {}).keys())
 
-    all_tracked = {}
-    for pkg, pkg_data in state.get("bun", {}).get("packages", {}).items():
-        all_tracked[pkg] = pkg_data.get("binary", pkg.split("/")[-1])
-    for pkg, pkg_info in packages.items():
-        all_tracked[pkg] = get_pkg_binary(pkg_info)
-
-    for pkg, binary in all_tracked.items():
-        if pkg not in desired and (bun_bin / binary).exists():
-            changes.append(f"  - remove {pkg}")
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - remove {pkg}")
 
     for pkg, pkg_info in packages.items():
-        binary = get_pkg_binary(pkg_info)
-        if not (bun_bin / binary).exists():
+        if pkg not in state_packages:
             changes.append(f"  + install {pkg}")
         elif version_changed(pkg, pkg_info, state, "bun"):
             changes.append(f"  ~ update {pkg}")
@@ -83,22 +73,14 @@ def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
 
 def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
     changes = []
-    npm_bin = Path(paths["npmBin"])
     desired = set(packages.keys())
+    state_packages = set(state.get("npm", {}).get("packages", {}).keys())
 
-    all_tracked = {}
-    for pkg, pkg_data in state.get("npm", {}).get("packages", {}).items():
-        all_tracked[pkg] = pkg_data.get("binary", pkg)
-    for pkg, pkg_info in packages.items():
-        all_tracked[pkg] = get_pkg_binary(pkg_info)
-
-    for pkg, binary in all_tracked.items():
-        if pkg not in desired and (npm_bin / binary).exists():
-            changes.append(f"  - remove {pkg}")
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - remove {pkg}")
 
     for pkg, pkg_info in packages.items():
-        binary = get_pkg_binary(pkg_info)
-        if not (npm_bin / binary).exists():
+        if pkg not in state_packages:
             changes.append(f"  + install {pkg}")
         elif version_changed(pkg, pkg_info, state, "npm"):
             changes.append(f"  ~ update {pkg}")
@@ -109,51 +91,37 @@ def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
 def _diff_uv(packages: Dict, paths: Dict, state: Dict):
     changes = []
     desired = set(packages.keys())
+    state_packages = set(state.get("uv", {}).get("packages", {}).keys())
 
-    binary_map = {pkg: get_pkg_binary(info) for pkg, info in packages.items()}
-    for pkg, binary in binary_map.items():
-        if not (Path(paths["uvBin"]) / binary).exists():
-            source = get_pkg_source(packages[pkg])
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            source = get_pkg_source(pkg_info)
             spec = source if source else pkg
             changes.append(f"  + install {spec}")
-        elif version_changed(pkg, packages[pkg], state, "uv"):
+        elif version_changed(pkg, pkg_info, state, "uv"):
             changes.append(f"  ~ update {pkg}")
 
-    all_tracked = {}
-    for pkg, pkg_data in state.get("uv", {}).get("packages", {}).items():
-        all_tracked[pkg] = pkg_data.get("binary", pkg)
-    for pkg, binary in all_tracked.items():
-        if pkg not in desired and (Path(paths["uvBin"]) / binary).exists():
-            changes.append(f"  - remove {pkg}")
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - remove {pkg}")
 
     return changes
 
 
 def _diff_go(packages: Dict, paths: Dict, state: Dict):
-    from tools.user.go import _default_binary, _resolve_go_bin
-
     changes = []
     desired = set(packages.keys())
-    go_bin_str = _resolve_go_bin(paths)
-    if not go_bin_str:
-        return ["  ? cannot resolve Go install dir (no goBin, no go env GOPATH)"]
-    go_bin = Path(go_bin_str)
+    state_packages = set(state.get("go", {}).get("packages", {}).keys())
 
     for pkg, pkg_info in packages.items():
-        binary = _default_binary(pkg, pkg_info)
-        if not (go_bin / binary).exists():
+        if pkg not in state_packages:
             source = get_pkg_source(pkg_info) or pkg
             changes.append(f"  + install {source}")
         elif version_changed(pkg, pkg_info, state, "go"):
             changes.append(f"  ~ update {pkg}")
 
-    go_state = state.get("go", {})
-    all_tracked = {}
-    for pkg, pkg_data in go_state.get("packages", {}).items():
-        all_tracked[pkg] = pkg_data.get("binary", pkg)
-    for pkg, binary in all_tracked.items():
-        if pkg not in desired and (go_bin / binary).exists():
-            changes.append(f"  - remove {pkg}")
+    # Go has no uninstall; dropping a package leaves its binary in $GOBIN.
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - drop {pkg} (binary remains in $GOBIN)")
 
     return changes
 
@@ -270,70 +238,30 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
     return changes
 
 
-def _diff_brew(brew_config: Dict):
-    changes = []
+def _diff_brew(brew_config: Dict, state: Dict):
     if sys.platform != "darwin":
-        return changes
-
-    brew = shutil.which("brew")
-    if not brew:
-        return ["  ? brew not found"]
-
-    env = os.environ.copy()
-    env["PATH"] = f"{os.path.dirname(brew)}:{env.get('PATH', '')}"
-    for key, value in brew_config.get("environment", {}).items():
-        env[key] = str(value)
+        return []
 
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
     desired_taps = {_normalize_tap(t) for t in brew_config.get("taps", [])}
-
-    rc, stdout, _ = run_command([brew, "list", "--formula", "-1"], env)
-    installed_formulas = (
-        {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
-    )
-
-    rc, stdout, _ = run_command([brew, "list", "--cask", "-1"], env)
-    installed_casks = (
-        {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
-    )
-
-    rc, stdout, _ = run_command([brew, "tap"], env)
-    installed_taps = (
-        {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
-    )
-
-    tap_changes = []
-    for tap in sorted(desired_taps - installed_taps):
-        tap_changes.append(f"    + tap {tap}")
-
-    formula_changes = []
-    for formula in sorted(desired_brews - installed_formulas):
-        formula_changes.append(f"    + install {formula}")
-
-    cask_changes = []
-    for cask in sorted(desired_casks - installed_casks):
-        cask_changes.append(f"    + install {cask}")
-
     cleanup = brew_config.get("onActivation", {}).get("cleanup") == "zap"
-    if cleanup:
-        rc, stdout, _ = run_command([brew, "leaves"], env)
-        leaves = (
-            {line.strip() for line in stdout.splitlines() if line.strip()} if rc == 0 else set()
-        )
-        for formula in sorted(leaves - desired_brews):
-            formula_changes.append(f"    - remove {formula}")
-        for cask in sorted(installed_casks - desired_casks):
-            cask_changes.append(f"    - remove {cask}")
-        for tap in sorted(installed_taps - desired_taps):
-            tap_changes.append(f"    - untap {tap}")
 
-        rc, stdout, _ = run_command([brew, "autoremove", "--dry-run"], env)
-        if rc == 0:
-            for line in stdout.splitlines():
-                line = line.strip()
-                if line and not line.startswith("="):
-                    formula_changes.append(f"    - autoremove {line}")
+    # State-only, matching install_brew_packages: reconcile desired against what
+    # we recorded installing, never live `brew list`.
+    prev = state.get("brew", {})
+    prev_brews = set(prev.get("brews", []))
+    prev_casks = set(prev.get("casks", []))
+    prev_taps = {_normalize_tap(t) for t in prev.get("taps", [])}
+
+    tap_changes = [f"    + tap {t}" for t in sorted(desired_taps - prev_taps)]
+    formula_changes = [f"    + install {f}" for f in sorted(desired_brews - prev_brews)]
+    cask_changes = [f"    + install {c}" for c in sorted(desired_casks - prev_casks)]
+
+    if cleanup:
+        formula_changes += [f"    - remove {f}" for f in sorted(prev_brews - desired_brews)]
+        cask_changes += [f"    - remove {c}" for c in sorted(prev_casks - desired_casks)]
+        tap_changes += [f"    - untap {t}" for t in sorted(prev_taps - desired_taps)]
 
     subsections = []
     if tap_changes:
@@ -417,7 +345,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
             sections.append(("files", changes))
 
     if "brew" in active:
-        brew_subsections = _diff_brew(config.get("brew", {}))
+        brew_subsections = _diff_brew(config.get("brew", {}), state)
         if brew_subsections:
             sections.append(("brew", brew_subsections))
 
