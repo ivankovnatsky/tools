@@ -63,7 +63,9 @@ def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
     stored_source = pkg_state.get("source", "")
     declared_commit = get_pkg_commit(pkg_info)
     stored_commit = pkg_state.get("commit", "")
-    if declared_commit and declared_commit != stored_commit:
+    # Compare unconditionally: removing a commit pin (declared "" vs stored
+    # "abc") must reinstall at the plain version, not be treated as unchanged.
+    if declared_commit != stored_commit:
         return True
     return declared_version != stored_version or declared_source != stored_source
 
