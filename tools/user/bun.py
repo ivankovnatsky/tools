@@ -72,13 +72,15 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
         debug("All bun packages in sync", Color.BLUE)
 
     # Update state. Packages whose removal failed are kept so cleanup retries.
-    if state_changed or state_packages != desired:
-        bun_state = dict(failed_removals)
-        for pkg, pkg_info in packages.items():
-            bun_state[pkg] = {
-                "installed": True,
-                "version": get_pkg_version(pkg_info),
-            }
+    # Compare rebuilt entries against what is stored so a pure metadata change
+    # (e.g. shedding a legacy "binary" field) is persisted even on a no-op sync.
+    bun_state = dict(failed_removals)
+    for pkg, pkg_info in packages.items():
+        bun_state[pkg] = {
+            "installed": True,
+            "version": get_pkg_version(pkg_info),
+        }
+    if state_changed or bun_state != state.get("bun", {}).get("packages", {}):
         state.setdefault("bun", {})["packages"] = bun_state
 
     return success
