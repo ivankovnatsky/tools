@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.user.go import install_go_packages
 
@@ -71,6 +72,15 @@ class GoRemovalTest(unittest.TestCase):
             self.assertTrue((go_bin / "rclone").exists())
             self.assertTrue((go_bin / "other").exists())
             self.assertEqual(state["go"], {"packages": {}})
+
+    def test_state_drop_succeeds_when_gobin_unresolvable(self):
+        # Dropping a package never needs $GOBIN (Go has no uninstall), so an
+        # unresolvable install dir must not turn a pure state-drop into failure.
+        state = {"go": {"packages": {"rclone": {"installed": True}}}}
+        with mock.patch("tools.user.go._resolve_go_bin", return_value=None):
+            success = install_go_packages({}, {}, state)
+        self.assertTrue(success)
+        self.assertEqual(state["go"], {"packages": {}})
 
 
 if __name__ == "__main__":
