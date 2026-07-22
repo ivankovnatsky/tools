@@ -75,22 +75,15 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     tracked = dict(state_pkgs)
     success = True
 
-    go_bin = _resolve_go_bin(paths)
-    if not go_bin:
-        log("Failed to resolve Go install dir (no goBin, no go env GOPATH)", Color.RED)
-        return False
-    go_env = _go_env(paths)
-    # When goBin isn't pinned in config, propagate the resolved value
-    # so `go install` lands where we expect.
-    go_env.setdefault("GOBIN", go_bin)
-
     # Go has no `go uninstall`; the only way to remove a tool is to delete its
     # binary from $GOBIN by hand. We deliberately don't do that, so dropping a
     # package from config just forgets it here and leaves the binary in place.
+    # This path never needs $GOBIN resolved, so don't fail on it here.
     orphaned = sorted(state_packages - desired)
     if orphaned:
+        go_bin_hint = _resolve_go_bin(paths) or "$GOBIN"
         log(
-            f"Dropping Go packages from state (binaries remain in {go_bin}, "
+            f"Dropping Go packages from state (binaries remain in {go_bin_hint}, "
             f"remove manually if unwanted): {', '.join(orphaned)}",
             Color.YELLOW,
         )
@@ -104,6 +97,16 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     ]
 
     if to_install:
+        # Only now do we need the install dir; resolving lazily means a pure
+        # state-drop (nothing to install) doesn't fail when $GOBIN is unknown.
+        go_bin = _resolve_go_bin(paths)
+        if not go_bin:
+            log("Failed to resolve Go install dir (no goBin, no go env GOPATH)", Color.RED)
+            return False
+        go_env = _go_env(paths)
+        # When goBin isn't pinned in config, propagate the resolved value
+        # so `go install` lands where we expect.
+        go_env.setdefault("GOBIN", go_bin)
         log(f"Installing Go packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
             spec = _install_spec(pkg, packages[pkg])
