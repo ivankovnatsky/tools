@@ -108,9 +108,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     )
     mas_to_remove = (
         sorted(
-            (name, app_id)
-            for name, app_id in prev_mas.items()
-            if str(app_id) not in desired_ids
+            (name, app_id) for name, app_id in prev_mas.items() if str(app_id) not in desired_ids
         )
         if cleanup
         else []
@@ -216,14 +214,10 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     if (mas_to_install or mas_to_remove) and not (mas := _mas_bin_from_env(env)):
         log("mas not found, skipping Mac App Store apps", Color.YELLOW)
     elif mas_to_install or mas_to_remove:
-        for name, app_id in mas_to_install:
-            log(f"Installing Mac App Store app: {name} ({app_id})", Color.GREEN)
-            rc, _, stderr = run_command([mas, "install", str(app_id)], env)
-            if rc != 0:
-                log(f"Failed to install {name}: {stderr}", Color.RED)
-                success = False
-            else:
-                inst_mas[name] = app_id
+        # Removals run first: a same-name app_id swap ({"App": 1} -> {"App": 2})
+        # queues both a remove (old id) and an install (new id) under one name.
+        # Installing first then popping the name would drop the fresh entry from
+        # state, so reconcile removals before installs.
         for name, app_id in mas_to_remove:
             log(f"Removing Mac App Store app: {name} ({app_id})", Color.RED)
             rc, _, stderr = run_command([mas, "uninstall", str(app_id)], env)
@@ -232,6 +226,14 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
                 success = False
             else:
                 inst_mas.pop(name, None)
+        for name, app_id in mas_to_install:
+            log(f"Installing Mac App Store app: {name} ({app_id})", Color.GREEN)
+            rc, _, stderr = run_command([mas, "install", str(app_id)], env)
+            if rc != 0:
+                log(f"Failed to install {name}: {stderr}", Color.RED)
+                success = False
+            else:
+                inst_mas[name] = app_id
 
     # --- Autoremove orphaned deps (only after actual removals) ---
     if cleanup and (brews_to_remove or casks_to_remove):
