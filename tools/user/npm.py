@@ -143,16 +143,18 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
             state_changed = True
 
     # Update state (always save progress, even on partial failure). Packages
-    # whose uninstall failed are kept so cleanup is retried next run.
-    if state_changed or state_packages != desired:
-        npm_state = dict(failed_removals)
-        for pkg, pkg_info in packages.items():
-            npm_state[pkg] = {
-                "installed": True,
-                "version": get_pkg_version(pkg_info),
-                "subpackages": get_pkg_subpackages(pkg_info),
-                "postInstall": get_pkg_post_install(pkg_info),
-            }
+    # whose uninstall failed are kept so cleanup is retried next run. Compare
+    # the rebuilt entries against what is stored so a pure metadata change
+    # (e.g. shedding a legacy "binary" field) is persisted even on a no-op sync.
+    npm_state = dict(failed_removals)
+    for pkg, pkg_info in packages.items():
+        npm_state[pkg] = {
+            "installed": True,
+            "version": get_pkg_version(pkg_info),
+            "subpackages": get_pkg_subpackages(pkg_info),
+            "postInstall": get_pkg_post_install(pkg_info),
+        }
+    if state_changed or npm_state != state.get("npm", {}).get("packages", {}):
         state.setdefault("npm", {})["packages"] = npm_state
 
     return success and not subpkg_failed
