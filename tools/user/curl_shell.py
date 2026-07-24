@@ -8,10 +8,10 @@ from tools.system_paths import system_bin, system_dir, system_dir_optional
 
 def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     """Install scripts via curl piped to shell interpreter."""
-    if not scripts:
+    installed = set(state.get("curlShell", {}).get("installed", []))
+    if not scripts and not installed:
         return True
 
-    installed = set(state.get("curlShell", {}).get("installed", []))
     desired = set(scripts.keys())
     to_install = desired - installed
 

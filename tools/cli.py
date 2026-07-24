@@ -90,7 +90,11 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
             success &= install_go_packages(go_packages, paths, state)
 
     if "mcp" in active:
-        success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
+        mcp_servers = config.get("mcp", {}).get("servers", {})
+        # Skip the `claude mcp list` shell-out when there is nothing to
+        # reconcile, matching _diff_mcp.
+        if mcp_servers or state.get("mcp", {}).get("servers"):
+            success &= install_mcp_servers(mcp_servers, paths, state)
 
     # Gate on state as well as config, or dropping the last entry means the
     # reconciler never runs again and its state is orphaned forever.
