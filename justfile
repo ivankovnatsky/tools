@@ -24,7 +24,10 @@ clean:
 # Increment patch version
 bump:
     #!/usr/bin/env bash
-    current=$(grep 'version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    set -euo pipefail
+    # Anchored: unanchored 'version' also matches target-version, and head -1
+    # then depends on key ordering in the file.
+    current=$(grep '^version = ' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     major=$(echo $current | cut -d. -f1)
     minor=$(echo $current | cut -d. -f2)
     patch=$(echo $current | cut -d. -f3)
@@ -40,9 +43,11 @@ bump:
 # Bump version and create GitHub release
 release: bump
     #!/usr/bin/env bash
-    version=$(grep 'version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    set -euo pipefail
+    version=$(grep '^version = ' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     git add pyproject.toml
     git commit -m "Bump version to ${version}"
     git tag "v${version}"
-    git push origin main --tags
+    # Push this tag only: --tags would publish every unrelated local tag.
+    git push origin main "v${version}"
     gh release create "v${version}" --generate-notes
