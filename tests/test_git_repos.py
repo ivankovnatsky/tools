@@ -10,10 +10,11 @@ from tools.user import git_repos
 class FakeGit:
     """Stand-in for git, with per-repo dirty/unpushed state."""
 
-    def __init__(self, dirty=(), unpushed=(), failing_status=()):
+    def __init__(self, dirty=(), unpushed=(), failing_status=(), stashed=()):
         self.dirty = set(dirty)
         self.unpushed = set(unpushed)
         self.failing_status = set(failing_status)
+        self.stashed = set(stashed)
         self.commands = []
 
     def run(self, cmd, env=None, cwd=None):
@@ -25,6 +26,8 @@ class FakeGit:
             if path in self.failing_status:
                 return 1, "", "not a repo"
             return 0, (" M file.txt" if path in self.dirty else ""), ""
+        if verb == "stash":
+            return 0, ("stash@{0}: WIP" if path in self.stashed else ""), ""
         if verb == "log":
             return 0, ("abc1234 local commit" if path in self.unpushed else ""), ""
         return 0, "", ""
@@ -68,6 +71,51 @@ class GitReposRemovalTest(unittest.TestCase):
             self._reconcile({}, state, FakeGit(unpushed=[d]), removed)
 
             self.assertEqual(removed, [])
+
+    def test_repo_with_stashed_work_is_kept(self):
+        # Stash entries are neither status output nor branch commits; rmtree
+        # would delete them silently.
+        with tempfile.TemporaryDirectory() as d:
+            state = {"gitRepos": {"installed": [d]}}
+            removed = []
+
+            self._reconcile({}, state, FakeGit(stashed=[d]), removed)
+
+            self.assertEqual(removed, [])
+
+    def test_local_work_check_covers_all_refs(self):
+        # --all (all local refs plus HEAD), not --branches: a detached-HEAD
+        # or local-tag-only commit is local work too.
+        with tempfile.TemporaryDirectory() as d:
+            state = {"gitRepos": {"installed": [d]}}
+            fake = FakeGit()
+
+            self._reconcile({}, state, fake, [])
+
+            log_cmds = [c for c in fake.commands if len(c) > 3 and c[3] == "log"]
+            self.assertTrue(log_cmds)
+            self.assertIn("--all", log_cmds[0])
+            self.assertNotIn("--branches", log_cmds[0])
+
+    def test_failed_rmtree_keeps_repo_tracked(self):
+        # A stubborn checkout must not abort the deploy, and must stay in
+        # state so the next run retries.
+        with tempfile.TemporaryDirectory() as d:
+            state = {"gitRepos": {"installed": [d]}}
+
+            def boom(path):
+                raise OSError("permission denied")
+
+            with (
+                mock.patch.object(git_repos, "system_bin", return_value="git"),
+                mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+                mock.patch.object(git_repos, "run_command", FakeGit().run),
+                mock.patch.object(git_repos.shutil, "rmtree", side_effect=boom),
+            ):
+                result = git_repos.install_git_repos({}, state)
+
+            self.assertFalse(result)
+            self.assertIn(d, state["gitRepos"]["installed"])
 
     def test_unreadable_repo_is_kept(self):
         # A path git cannot interrogate counts as having work: refusing to
@@ -135,6 +183,23 @@ class GitReposUpdateTest(unittest.TestCase):
 
 
 class GitReposDiffTest(unittest.TestCase):
+    def test_dropped_section_is_previewed_at_top_level(self):
+        # show_diff must gate gitRepos on config OR state, exactly like
+        # _deploy: deleting the whole gitRepos block previously previewed
+        # "clean" while deploy --approve rmtree'd every tracked checkout.
+        import json
+
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "state.json")
+            repo = os.path.join(d, "repo")
+            os.makedirs(repo)
+            with open(state_file, "w") as f:
+                json.dump({"version": 2, "gitRepos": {"installed": [repo]}}, f)
+
+            clean = diff_mod.show_diff({"stateFile": state_file}, d)
+
+        self.assertFalse(clean)
+
     def test_removal_is_previewed(self):
         # rmtree with no preview line is the one missing diff entry that
         # costs data rather than clarity.

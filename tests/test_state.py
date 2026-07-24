@@ -3,7 +3,13 @@ import os
 import tempfile
 import unittest
 
-from tools.state import STATE_VERSION, load_json, migrate_state_schema, save_json
+from tools.state import (
+    STATE_VERSION,
+    find_state_file,
+    load_json,
+    migrate_state_schema,
+    save_json,
+)
 
 
 class StateSchemaTest(unittest.TestCase):
@@ -82,6 +88,48 @@ class StateWriteTest(unittest.TestCase):
 
             with open(path) as f:
                 self.assertEqual(json.load(f)["flatpak"]["packages"], ["a"])
+
+    def test_save_json_accepts_bare_relative_path(self):
+        # `stateFile: state.json` has an empty dirname; makedirs("") raised
+        # FileNotFoundError.
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                save_json("state.json", {"version": STATE_VERSION})
+                self.assertTrue(os.path.isfile("state.json"))
+            finally:
+                os.chdir(cwd)
+
+    def test_load_json_is_read_only_for_dir_squatter(self):
+        # diff reads state; it must not repair (rmdir) anything on disk.
+        with tempfile.TemporaryDirectory() as d:
+            squatter = os.path.join(d, "state.json")
+            os.makedirs(squatter)
+
+            self.assertEqual(load_json(squatter), {})
+            self.assertTrue(os.path.isdir(squatter))
+
+    def test_find_state_file_prefers_existing_current_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            current = os.path.join(d, "tools", "state.json")
+            os.makedirs(os.path.dirname(current))
+            with open(current, "w") as f:
+                json.dump({}, f)
+
+            self.assertEqual(find_state_file(current), current)
+
+    def test_find_state_file_locates_legacy_sibling_without_copying(self):
+        with tempfile.TemporaryDirectory() as d:
+            legacy = os.path.join(d, "manual-packages", "state.json")
+            os.makedirs(os.path.dirname(legacy))
+            with open(legacy, "w") as f:
+                json.dump({}, f)
+            current = os.path.join(d, "tools", "state.json")
+
+            self.assertEqual(find_state_file(current), legacy)
+            # Read-only: nothing was migrated.
+            self.assertFalse(os.path.exists(current))
 
 
 if __name__ == "__main__":

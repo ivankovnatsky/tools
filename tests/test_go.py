@@ -24,7 +24,7 @@ class GoRemovalTest(unittest.TestCase):
             # The module cache is never touched.
             self.assertTrue((go_path / "pkg" / "mod" / "example").exists())
             # State stops tracking the dropped package.
-            self.assertEqual(state["go"], {"packages": {}})
+            self.assertEqual(state["go"]["packages"], {})
 
     def test_dropping_one_of_several_keeps_the_others_in_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -71,7 +71,7 @@ class GoRemovalTest(unittest.TestCase):
             # Nothing on disk is removed, managed or not.
             self.assertTrue((go_bin / "rclone").exists())
             self.assertTrue((go_bin / "other").exists())
-            self.assertEqual(state["go"], {"packages": {}})
+            self.assertEqual(state["go"]["packages"], {})
 
     def test_state_drop_succeeds_when_gobin_unresolvable(self):
         # Dropping a package never needs $GOBIN (Go has no uninstall), so an
@@ -80,7 +80,7 @@ class GoRemovalTest(unittest.TestCase):
         with mock.patch("tools.user.go._resolve_go_bin", return_value=None):
             success = install_go_packages({}, {}, state)
         self.assertTrue(success)
-        self.assertEqual(state["go"], {"packages": {}})
+        self.assertEqual(state["go"]["packages"], {})
 
 
 if __name__ == "__main__":

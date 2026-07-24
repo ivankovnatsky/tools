@@ -7,6 +7,21 @@ from unittest import mock
 from tools.user import files
 
 
+class ParseModeTest(unittest.TestCase):
+    def test_quoted_octal_string_accepted(self):
+        self.assertEqual(files._parse_mode("0644"), 0o644)
+        self.assertEqual(files._parse_mode("600"), 0o600)
+        self.assertIsNone(files._parse_mode(None))
+
+    def test_bare_int_rejected_as_ambiguous(self):
+        # YAML 1.1 parses `0644` as octal into 420, indistinguishable from a
+        # literal 420 — either way one of them silently gets the wrong bits.
+        with self.assertRaises(TypeError):
+            files._parse_mode(644)
+        with self.assertRaises(TypeError):
+            files._parse_mode(True)
+
+
 def _write(path, content, mode=0o644):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:

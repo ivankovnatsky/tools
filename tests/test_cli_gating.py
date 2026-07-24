@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+from click.testing import CliRunner
+
 from tools import cli
 
 
@@ -60,6 +62,37 @@ class DeployGatingTest(unittest.TestCase):
         state = {"gitRepos": {"installed": ["~/repo"]}}
         with mock.patch.object(cli, "install_git_repos", return_value=False):
             self.assertFalse(self._deploy({}, state))
+
+
+class DeployCleanDiffTest(unittest.TestCase):
+    """A clean diff means nothing approval-worthy — not nothing to do.
+    Non-destructive maintenance (git pulls) must run on every deploy, not
+    only under --approve."""
+
+    def test_clean_diff_still_deploys_without_prompting(self):
+        with (
+            mock.patch.object(cli, "_load_merged_config", return_value={}),
+            mock.patch.object(cli, "show_diff", return_value=True),
+            mock.patch.object(cli, "_deploy", return_value=True) as deploy,
+            mock.patch.object(cli.click, "prompt") as prompt,
+        ):
+            result = CliRunner().invoke(cli.main, ["deploy"])
+
+        self.assertEqual(result.exit_code, 0)
+        deploy.assert_called_once()
+        prompt.assert_not_called()
+
+    def test_dirty_diff_still_requires_approval(self):
+        with (
+            mock.patch.object(cli, "_load_merged_config", return_value={}),
+            mock.patch.object(cli, "show_diff", return_value=False),
+            mock.patch.object(cli, "_deploy", return_value=True) as deploy,
+            mock.patch.object(cli.click, "prompt", return_value="no"),
+        ):
+            result = CliRunner().invoke(cli.main, ["deploy"])
+
+        self.assertEqual(result.exit_code, 1)
+        deploy.assert_not_called()
 
 
 if __name__ == "__main__":
