@@ -56,6 +56,26 @@ def _remote_urls(flatpak: str) -> dict:
     return urls
 
 
+def _repo_base(url: str) -> str:
+    """Normalize a remote location to its repo base for comparison.
+
+    `remote-add` accepts a .flatpakrepo descriptor whose embedded Url= becomes
+    the remote's URL (…/repo/flathub.flatpakrepo -> …/repo/), so comparing the
+    declared string against the live URL verbatim flags every
+    descriptor-declared remote as a mismatch and fails every deploy. The
+    descriptor sits in the repo directory, so strip its filename — and
+    trailing slashes — from both sides before comparing.
+    """
+    if url.endswith(".flatpakrepo"):
+        url = url.rsplit("/", 1)[0]
+    return url.rstrip("/")
+
+
+def _urls_match(declared: str, live: str) -> bool:
+    """Whether a live remote URL satisfies the declared location."""
+    return _repo_base(declared) == _repo_base(live)
+
+
 def _list_installed(flatpak: str) -> Optional[Set[str]]:
     rc, stdout, _ = run_command([flatpak, SCOPE, "list", "--app", "--columns=application"])
     if rc != 0:
@@ -98,7 +118,7 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     live_urls = _remote_urls(flatpak)
     for name in sorted(set(desired_remotes) & remotes):
         live = live_urls.get(name)
-        if live and live != desired_remotes[name]:
+        if live and not _urls_match(desired_remotes[name], live):
             changes.append(f"  ! remote {name} points at {live}, config declares its own URL")
 
     for app in sorted(set(desired_apps) - installed):
@@ -159,7 +179,7 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
     mismatched_remotes: Set[str] = set()
     for name in sorted(set(desired_remotes) & remotes):
         live = live_urls.get(name)
-        if live and live != desired_remotes[name]:
+        if live and not _urls_match(desired_remotes[name], live):
             log(
                 f"Remote {name} points at {live}, not the URL in config. "
                 "Delete the remote by hand if this is unexpected.",
