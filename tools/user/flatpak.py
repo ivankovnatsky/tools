@@ -76,7 +76,10 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     desired_remotes = config.get("remotes", {}) or {}
     desired_apps = _desired_packages(config)
     tracked = state.get("flatpak", {})
-    if not desired_remotes and not desired_apps and not tracked:
+    # Empty tracked lists must read as "nothing tracked", or an emptied
+    # section keeps shelling out to flatpak (and erroring) forever.
+    tracked_any = tracked.get("packages") or tracked.get("remotes")
+    if not desired_remotes and not desired_apps and not tracked_any:
         return []
 
     flatpak = _find_flatpak()
@@ -127,7 +130,8 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
     desired_remotes = config.get("remotes", {}) or {}
     desired_apps = _desired_packages(config)
     tracked = state.get("flatpak", {})
-    if not desired_remotes and not desired_apps and not tracked:
+    tracked_any = tracked.get("packages") or tracked.get("remotes")
+    if not desired_remotes and not desired_apps and not tracked_any:
         return True
 
     flatpak = _find_flatpak()
@@ -152,6 +156,7 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
     # at, so a mismatch against the declared URL decides where packages come
     # from. Surface it instead of installing from an unexpected source.
     live_urls = _remote_urls(flatpak)
+    mismatched_remotes: Set[str] = set()
     for name in sorted(set(desired_remotes) & remotes):
         live = live_urls.get(name)
         if live and live != desired_remotes[name]:
@@ -160,6 +165,7 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
                 "Delete the remote by hand if this is unexpected.",
                 Color.RED,
             )
+            mismatched_remotes.add(name)
             success = False
 
     for name in sorted(set(desired_remotes) - remotes):
@@ -176,6 +182,16 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
 
     for app in sorted(set(desired_apps) - installed):
         remote = desired_apps[app]
+        # Fail closed: a remote whose URL does not match the config would be
+        # the source of this install — do not fetch software from a repository
+        # the config never declared.
+        if mismatched_remotes and (not remote or remote in mismatched_remotes):
+            log(
+                f"Skipping install of {app}: remote URL mismatch unresolved",
+                Color.RED,
+            )
+            success = False
+            continue
         log(f"Installing {app} ...", Color.GREEN)
         cmd = [flatpak, SCOPE, "install", "--noninteractive"]
         if remote:
