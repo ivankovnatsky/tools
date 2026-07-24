@@ -147,6 +147,8 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     # Same resolver and parser as deploy, or the two disagree about what is
     # installed and the diff never matches what gets applied.
     current = get_installed_mcp_servers(claude, build_mcp_env(paths))
+    if current is None:
+        return ["  ? failed to list MCP servers, cannot diff"]
     tracked_cfg = state.get("mcp", {}).get("servers", {})
     for name in sorted(desired - current):
         changes.append(f"  + install {name}")
@@ -167,12 +169,19 @@ def _diff_curl_shell(curl_shell: Dict, state: Dict):
     desired = set(curl_shell.keys())
     for name in sorted(desired - installed):
         changes.append(f"  + install {name}")
+    # Deploy releases dropped URLs from state (there is no uninstall); the
+    # preview must show that or the interactive path never reconciles it.
+    for name in sorted(installed - desired):
+        changes.append(f"  ~ forget {name} (no uninstall; releases tracking)")
     return changes
 
 
 def _diff_git_repos(git_repos: Dict, state: Dict):
     changes = []
     installed = set(state.get("gitRepos", {}).get("installed", []))
+    # Pulls of already-tracked checkouts are deliberately not previewed:
+    # they are non-destructive and would make every diff report changes.
+    # They run on every deploy (the clean-diff path included).
     for dest, _url in git_repos.items():
         expanded = os.path.expanduser(dest)
         if not os.path.isdir(expanded):
@@ -194,7 +203,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
     (target, source, mode, secrets) against the live filesystem, and
     accounts for cleanup against state.
     """
-    from tools.user.files import _resolve_entries
+    from tools.user.files import _file_hash, _resolve_entries
 
     state_files = state.get("files", {})
     changes: List[str] = []
@@ -246,6 +255,12 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
     for target in state_files:
         if target not in managed_targets:
             if os.path.exists(target):
+                # Deploy declines to delete files modified since we wrote
+                # them; claiming "remove" here would overstate what an
+                # approval actually does.
+                stored_hash = (state_files.get(target) or {}).get("hash")
+                if stored_hash and _file_hash(target) != stored_hash:
+                    continue
                 changes.append(f"  - remove {target}")
 
     return changes
@@ -307,16 +322,15 @@ def _diff_brew(brew_config: Dict, state: Dict):
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
-    from tools.state import load_json, migrate_state_file, migrate_state_schema
+    from tools.state import find_state_file, load_json, migrate_state_schema
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
-    # deploy relocates legacy state before reading it; without the same step
-    # here a not-yet-migrated machine previews everything as a fresh install.
-    migrate_state_file(state_file)
+    # Read the same state deploy would act on — including a not-yet-migrated
+    # legacy location — but without copying anything: diff is a dry run and
+    # must not modify the filesystem.
+    state_file = find_state_file(state_file)
     if os.path.exists(state_file):
-        # Preview against the same view deploy will act on, or the two disagree
-        # on every legacy entry.
         state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
@@ -325,10 +339,13 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     sections = []
 
+    # Section gates must mirror _deploy exactly: any extra condition here
+    # (e.g. requiring a paths key) makes diff report "clean" for work deploy
+    # would still attempt.
     if "bun" in active:
         bun_config = config.get("bun", {})
         bun_packages = bun_config.get("packages", {})
-        if (bun_packages or state.get("bun", {}).get("packages")) and paths.get("bunBin"):
+        if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
             changes = _diff_bun(
                 bun_packages, paths, state, {"configFile": bun_config.get("configFile")}
             )
@@ -338,7 +355,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
     if "npm" in active:
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
-        if (npm_packages or state.get("npm", {}).get("packages")) and paths.get("npmBin"):
+        if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
             changes = _diff_npm(
                 npm_packages, paths, state, {"configFile": npm_config.get("configFile")}
             )
@@ -346,9 +363,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
                 sections.append(("npm", changes))
 
     if "uv" in active:
-        if (
-            config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages")
-        ) and paths.get("uvBin"):
+        if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
             changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("uv", changes))
@@ -365,13 +380,20 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if changes:
             sections.append(("mcp", changes))
 
-    if "curlShell" in active and config.get("curlShell"):
-        changes = _diff_curl_shell(config["curlShell"], state)
+    if "curlShell" in active and (
+        config.get("curlShell") or state.get("curlShell", {}).get("installed")
+    ):
+        changes = _diff_curl_shell(config.get("curlShell") or {}, state)
         if changes:
             sections.append(("curlShell", changes))
 
-    if "gitRepos" in active and config.get("gitRepos"):
-        changes = _diff_git_repos(config["gitRepos"], state)
+    # Gate on state too: dropping the whole gitRepos block is exactly the
+    # case where deploy rmtrees every tracked checkout — that must never be
+    # invisible in the preview.
+    if "gitRepos" in active and (
+        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
+    ):
+        changes = _diff_git_repos(config.get("gitRepos") or {}, state)
         if changes:
             sections.append(("gitRepos", changes))
 
