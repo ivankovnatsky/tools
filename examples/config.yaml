@@ -10,15 +10,32 @@
 
 stateFile: ~/.local/state/tools/state.json
 
+# The keys the reconcilers actually read. bun and npm index theirs directly,
+# so a section is only safe to enable once its keys are present.
+#
+#   bun       directory containing the `bun` binary       (bun)
+#   bunBin    where `bun install -g` puts binaries        (bun)
+#   nodejs    directory containing `node` and `npm`       (bun, npm, mcp)
+#   npmBin    where `npm install -g` puts binaries        (npm, mcp)
+#   uv        directory containing the `uv` binary        (uv)
+#   uvBin     where `uv tool install` puts binaries       (uv)
+#   uvToolDir uv's tool root                              (uv)
+#   goBin     $GOBIN for `go install`                     (go)
+#   goPath    $GOPATH for `go install`                    (go)
+#   python    directory containing `python`               (mcp)
+#   claudeCli full path to the `claude` binary            (mcp)
 paths:
-  bun: ~/.bun
-  npm: ~/.npm-global
-  uv: ~/.local/share/uv/tools
-  goBin: ~/go/bin
-  goPath: ~/go
-  mcp: ~/.config/claude/claude_desktop_config.json
-  curlShell: ~/.local/bin
-  gitRepos: ~/src
+  bun: ~/.bun/bin
+  bunBin: ~/.bun/bin
+  nodejs: /usr/bin
+  npmBin: ~/.npm/bin
+  uv: /usr/bin
+  uvBin: ~/.local/bin
+  uvToolDir: ~/.local/share/uv/tools
+  goBin: ~/.go/bin
+  goPath: ~/.go
+  python: /usr/bin
+  claudeCli: ~/.local/bin/claude
 
 bun:
   packages: {}
