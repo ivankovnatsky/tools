@@ -40,7 +40,10 @@ def _remove_if_dir(path: str):
 
 
 def load_json(path: str) -> Dict:
-    _remove_if_dir(path)
+    # Read-only: a directory squatting where the file should be is repaired
+    # by save_json/migrate_state_file, never by a read (diff must not write).
+    if os.path.isdir(path):
+        return {}
     if not os.path.exists(path):
         return {}
     with open(path, "r") as f:
@@ -51,7 +54,10 @@ def save_json(path: str, data: Dict):
     # Written atomically: this file is the only record of what we installed, and
     # a crash mid-dump would truncate it into a partial ownership set.
     _remove_if_dir(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirname = os.path.dirname(path)
+    if dirname:
+        # A bare relative filename has no parent to create.
+        os.makedirs(dirname, exist_ok=True)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -98,6 +104,37 @@ def migrate_state_schema(state: Dict) -> Dict:
         )
     state["version"] = STATE_VERSION
     return state
+
+
+def find_state_file(new_state_file: str) -> str:
+    """Return the path deploy would read after migration, without copying.
+
+    Read-only counterpart to `migrate_state_file` for `tools diff`: a
+    dry run must preview against the same state deploy will act on, but
+    must not relocate anything on disk.
+    """
+    if os.path.isfile(new_state_file):
+        return new_state_file
+
+    state_dir = os.path.dirname(new_state_file)
+    parent_dir = os.path.dirname(state_dir)
+    state_filename = os.path.basename(new_state_file)
+
+    for legacy_dir in LEGACY_STATE_DIRS:
+        candidate = os.path.join(parent_dir, legacy_dir, state_filename)
+        if os.path.isfile(candidate) and os.path.abspath(candidate) != os.path.abspath(
+            new_state_file
+        ):
+            return candidate
+
+    for legacy_template in LEGACY_STATE_FILES:
+        candidate = os.path.expanduser(legacy_template)
+        if os.path.isfile(candidate) and os.path.abspath(candidate) != os.path.abspath(
+            new_state_file
+        ):
+            return candidate
+
+    return new_state_file
 
 
 def migrate_state_file(new_state_file: str):
