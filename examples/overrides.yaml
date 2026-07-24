@@ -8,9 +8,13 @@
 # `config.yaml` lexicographically: `config.yaml` loads first, then
 # `overrides.yaml` replaces any overlapping scalar keys while leaving
 # untouched keys alone.
+#
+# Only keys the reconcilers actually read are shown (see the `paths`
+# comment block in config.yaml for the full list).
 
 paths:
-  bun: /Volumes/Storage/Data/bun
-  npm: /Volumes/Storage/Data/npm
-  uv: /Volumes/Storage/Data/uv/tools
-  gitRepos: /Volumes/Storage/Data/Sources
+  bun: /Volumes/Storage/Data/bun/bin
+  bunBin: /Volumes/Storage/Data/bun/bin
+  npmBin: /Volumes/Storage/Data/npm/bin
+  uvBin: /Volumes/Storage/Data/uv/bin
+  uvToolDir: /Volumes/Storage/Data/uv/tools
