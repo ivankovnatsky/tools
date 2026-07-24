@@ -11,27 +11,28 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # macos included deliberately: the brew reconciler is darwin-only and
+    # its platform-gated paths never execute on ubuntu.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - run: nix flake check
 
   lint:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
-        os: [ubuntu-latest, macos-latest]
-
+    # ruff's result depends on neither the OS nor the interpreter version,
+    # so one job is enough.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+          python-version: "3.12"
 
       - name: Install ruff
         run: pip install ruff
