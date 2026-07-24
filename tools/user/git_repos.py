@@ -19,8 +19,15 @@ def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
         return True
     if stdout.strip():
         return True
+    # Stash entries are neither status output nor branch commits; rmtree
+    # would delete them silently.
+    rc, stdout, _ = run_command([git_bin, "-C", path, "stash", "list"], env)
+    if rc != 0 or stdout.strip():
+        return True
+    # --all (all local refs plus HEAD) rather than --branches: a clean
+    # detached-HEAD commit or a local-tag-only commit is local work too.
     rc, stdout, _ = run_command(
-        [git_bin, "-C", path, "log", "--branches", "--not", "--remotes", "--oneline"], env
+        [git_bin, "-C", path, "log", "--all", "--not", "--remotes", "--oneline"], env
     )
     if rc != 0:
         return True
@@ -42,7 +49,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     if not to_install and not to_remove and not to_update:
         debug("All git repos already installed", Color.BLUE)
         if installed != desired:
-            state.setdefault("gitRepos", {})["installed"] = list(installed)
+            state.setdefault("gitRepos", {})["installed"] = sorted(installed)
         return True
 
     git_bin = system_bin("git")
@@ -64,7 +71,14 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
                 )
                 continue
             log(f"Removing git repo: {dest_path}", Color.RED)
-            shutil.rmtree(expanded_path)
+            try:
+                shutil.rmtree(expanded_path)
+            except OSError as e:
+                # Keep it tracked so the next run retries, and don't let one
+                # stubborn checkout abort the whole deploy (unsaved state).
+                log(f"Failed to remove {dest_path}: {e}", Color.RED)
+                success = False
+                continue
             state_changed = True
         installed.discard(dest_path)
 
@@ -101,6 +115,6 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
         state_changed = True
 
     if state_changed or installed != desired:
-        state.setdefault("gitRepos", {})["installed"] = list(installed)
+        state.setdefault("gitRepos", {})["installed"] = sorted(installed)
 
     return success
