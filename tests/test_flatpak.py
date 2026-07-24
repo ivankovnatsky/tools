@@ -223,6 +223,19 @@ class FlatpakTest(unittest.TestCase):
 
         self.assertTrue(self._reconcile({"remotes": {"flathub": url}}, {}, fake))
 
+    def test_descriptor_declaration_matches_resolved_repo_url(self):
+        # remote-add stores the descriptor's embedded Url=, so the live remote
+        # reports https://dl.flathub.org/repo/ while config declares the
+        # .flatpakrepo file. That is the standard setup, not a mismatch —
+        # comparing verbatim failed every home-manager activation.
+        fake = FakeFlatpak(
+            remotes=["flathub"], remote_urls={"flathub": "https://dl.flathub.org/repo/"}
+        )
+        config = {"remotes": {"flathub": "https://dl.flathub.org/repo/flathub.flatpakrepo"}}
+
+        self.assertTrue(self._reconcile(config, {}, fake))
+        self.assertEqual(self._diff(config, {}, fake), [])
+
     def test_diff_flags_remote_url_mismatch(self):
         fake = FakeFlatpak(remotes=["flathub"], remote_urls={"flathub": "https://evil/repo"})
         config = {"remotes": {"flathub": "https://dl.flathub.org/repo/flathub.flatpakrepo"}}
