@@ -1,8 +1,8 @@
 """Manage Ollama models declaratively.
 
 Pulls desired models via `ollama pull` and tracks them in state.
-When `removeUntracked` is enabled, previously-managed models that
-fall out of the desired list are removed via `ollama rm`. The
+Previously-managed models that fall out of the desired list are removed
+via `ollama rm`; models pulled out-of-band are never touched. The
 reconciler degrades gracefully when the Ollama CLI is missing or the
 daemon is not reachable, matching the prior shell-snippet behavior.
 """
@@ -84,15 +84,15 @@ def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
     for model in sorted(desired - installed):
         changes.append(f"  + pull {model}")
 
-    # Force deploy to run when a desired model already exists on disk
-    # but isn't in state — otherwise show_diff returns "no changes",
-    # deploy short-circuits, and the model is never adopted into state.
-    for model in sorted((desired & installed) - managed):
-        changes.append(f"  ~ adopt {model}")
+    for model in sorted((managed & installed) - desired):
+        changes.append(f"  - remove {model}")
 
-    if config.get("removeUntracked"):
-        for model in sorted((managed & installed) - desired):
-            changes.append(f"  - remove {model}")
+    # Tracked models that vanished out-of-band produce no pull/remove work,
+    # so without their own diff line deploy short-circuits and state keeps
+    # claiming them — a later manual pull would then be mistaken for ours
+    # and deleted.
+    for model in sorted(managed - installed - desired):
+        changes.append(f"  ~ forget {model}")
 
     return changes
 
@@ -129,26 +129,19 @@ def install_ollama_models(config: Dict, state: Dict) -> bool:
         tracked.add(model)
         newly_pulled.add(model)
 
-    # Adopt models that already exist on disk but were missing from
-    # state — otherwise removeUntracked-driven cleanup later would
-    # treat them as never-managed and silently keep them around.
-    for model in desired & installed:
-        tracked.add(model)
-
-    if config.get("removeUntracked"):
-        for model in sorted((tracked & installed) - desired):
-            log(f"Removing {model} ...", Color.GREEN)
-            rc, _, stderr = run_command([ollama, "rm", model], env=env)
-            if rc != 0:
-                log(f"Failed to remove {model}: {stderr.strip()}", Color.RED)
-                success = False
-                continue
-            tracked.discard(model)
-        # Drop entries that vanished from ollama out-of-band so state
-        # converges. Union in `newly_pulled` because `installed` is the
-        # pre-pull snapshot and would otherwise discard models pulled
-        # in this same run.
-        tracked &= installed | newly_pulled
+    for model in sorted((tracked & installed) - desired):
+        log(f"Removing {model} ...", Color.GREEN)
+        rc, _, stderr = run_command([ollama, "rm", model], env=env)
+        if rc != 0:
+            log(f"Failed to remove {model}: {stderr.strip()}", Color.RED)
+            success = False
+            continue
+        tracked.discard(model)
+    # Drop entries that vanished from ollama out-of-band so state
+    # converges. Union in `newly_pulled` because `installed` is the
+    # pre-pull snapshot and would otherwise discard models pulled
+    # in this same run.
+    tracked &= installed | newly_pulled
 
     state.setdefault("ollamaModels", {})["installed"] = sorted(tracked)
     return success

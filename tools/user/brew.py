@@ -60,6 +60,19 @@ def _mas_bin_from_env(env: dict) -> str | None:
     return shutil.which("mas", path=env.get("PATH", ""))
 
 
+def _installed_subset(brew: str, env: dict, candidates: list[str], kind: str) -> set[str]:
+    """Which of `candidates` brew currently reports as installed.
+
+    Only used to repair bookkeeping after a batch command failed partway;
+    the happy path never queries brew.
+    """
+    rc, stdout, _ = run_command([brew, "list", kind, "-1"], env)
+    if rc != 0:
+        return set()
+    present = {line.strip() for line in stdout.splitlines() if line.strip()}
+    return present & set(candidates)
+
+
 def install_brew_packages(brew_config: dict, state: dict) -> bool:
     """Declarative Homebrew package management.
 
@@ -70,7 +83,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     drift (a hand `brew uninstall`) is not detected — remove the entry from
     state and re-deploy to force a reinstall.
 
-    Config keys: brews, casks, taps, masApps, onActivation.cleanup
+    Config keys: brews, casks, taps, masApps
     """
     if sys.platform != "darwin":
         return True
@@ -78,8 +91,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
     desired_taps = {_normalize_tap(t) for t in brew_config.get("taps", [])}
-    desired_mas = brew_config.get("masApps", {})  # {name: app_id}
-    cleanup = brew_config.get("onActivation", {}).get("cleanup") == "zap"
+    desired_mas = brew_config.get("masApps", {}) or {}  # {name: app_id}
 
     prev = state.get("brew", {})
     prev_brews = set(prev.get("brews", []))
@@ -95,23 +107,19 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
 
     # Compute the diff purely from state before deciding whether to touch brew.
     taps_to_add = sorted(desired_taps - prev_taps)
-    taps_to_remove = sorted(prev_taps - desired_taps) if cleanup else []
+    taps_to_remove = sorted(prev_taps - desired_taps)
     brews_to_install = sorted(desired_brews - prev_brews)
-    brews_to_remove = sorted(prev_brews - desired_brews) if cleanup else []
+    brews_to_remove = sorted(prev_brews - desired_brews)
     casks_to_install = sorted(desired_casks - prev_casks)
-    casks_to_remove = sorted(prev_casks - desired_casks) if cleanup else []
+    casks_to_remove = sorted(prev_casks - desired_casks)
 
     prev_ids = {str(v) for v in prev_mas.values()}
     desired_ids = {str(v) for v in desired_mas.values()}
     mas_to_install = sorted(
         (name, app_id) for name, app_id in desired_mas.items() if str(app_id) not in prev_ids
     )
-    mas_to_remove = (
-        sorted(
-            (name, app_id) for name, app_id in prev_mas.items() if str(app_id) not in desired_ids
-        )
-        if cleanup
-        else []
+    mas_to_remove = sorted(
+        (name, app_id) for name, app_id in prev_mas.items() if str(app_id) not in desired_ids
     )
 
     any_changes = (
@@ -176,6 +184,10 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to install formulas: {stderr}", Color.RED)
             success = False
+            # brew installs targets in order, so an earlier one can land before
+            # a later failure. Recording none of them would leave a package we
+            # installed permanently unowned and never cleaned up.
+            inst_brews |= _installed_subset(brew, env, brews_to_install, "--formula")
         else:
             inst_brews |= set(brews_to_install)
     if brews_to_remove:
@@ -184,6 +196,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to remove formulas: {stderr}", Color.RED)
             success = False
+            inst_brews &= _installed_subset(brew, env, brews_to_remove, "--formula") | (
+                inst_brews - set(brews_to_remove)
+            )
         else:
             inst_brews -= set(brews_to_remove)
 
@@ -199,6 +214,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to install casks: {stderr}", Color.RED)
             success = False
+            inst_casks |= _installed_subset(brew, env, casks_to_install, "--cask")
         else:
             inst_casks |= set(casks_to_install)
     if casks_to_remove:
@@ -207,6 +223,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to remove casks: {stderr}", Color.RED)
             success = False
+            inst_casks &= _installed_subset(brew, env, casks_to_remove, "--cask") | (
+                inst_casks - set(casks_to_remove)
+            )
         else:
             inst_casks -= set(casks_to_remove)
 
@@ -236,7 +255,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
                 inst_mas[name] = app_id
 
     # --- Autoremove orphaned deps (only after actual removals) ---
-    if cleanup and (brews_to_remove or casks_to_remove):
+    if brews_to_remove or casks_to_remove:
         rc, stdout, stderr = run_command([brew, "autoremove"], env)
         if rc == 0 and stdout.strip():
             log("Autoremoved orphaned deps", Color.RED)

@@ -3,10 +3,10 @@ import sys
 
 import click
 
-from tools.config import deep_merge, load_config, load_config_dir
+from tools.config import ConfigError, deep_merge, load_config, load_config_dir
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
-from tools.state import load_json, migrate_state_file, save_json
+from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
@@ -32,10 +32,20 @@ def _load_merged_config(config_paths: list[str]) -> dict:
     """Load and merge config from one or more paths."""
     config: dict = {}
     for config_path in config_paths:
-        if os.path.isdir(config_path):
-            loaded = load_config_dir(config_path)
-        else:
-            loaded = load_config(config_path)
+        try:
+            if os.path.isdir(config_path):
+                loaded = load_config_dir(config_path)
+            else:
+                loaded = load_config(config_path)
+        except (
+            ConfigError,
+            FileNotFoundError,
+            NotADirectoryError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            log(f"Config error in {config_path}: {exc}", Color.RED)
+            sys.exit(1)
         config = deep_merge(config, loaded)
     return config
 
@@ -44,7 +54,7 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Apply config to bring system to desired state. Returns True on success."""
     state_file = os.path.expanduser(config.get("stateFile", "~/.local/state/tools/state.json"))
     migrate_state_file(state_file)
-    state = load_json(state_file)
+    state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
 

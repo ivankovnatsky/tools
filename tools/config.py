@@ -3,9 +3,11 @@ import os
 import socket
 from typing import Any, Dict, Optional, Set
 
-from tools.log import Color, log
-
 SUPPORTED_SUFFIXES = (".json", ".yaml", ".yml", ".toml")
+
+
+class ConfigError(Exception):
+    """Raised when the config cannot be resolved into a usable desired state."""
 
 
 def deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -157,10 +159,9 @@ def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
             break
 
     if not host_file:
-        log(
-            f"No machine config found for hostname {hostname!r} in {machines_dir}",
-            Color.YELLOW,
-        )
+        # Continuing would hand the reconcilers an empty desired state, which
+        # now reads as "remove everything we track" rather than "nothing to do".
+        raise ConfigError(f"No machine config found for hostname {hostname!r} in {machines_dir}")
 
     # Load top-level files first (e.g. nix-generated paths JSON)
     merged: Dict[str, Any] = {}

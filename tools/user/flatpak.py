@@ -1,8 +1,8 @@
 """Manage Flatpak remotes and applications declaratively.
 
 Adds desired remotes, installs desired apps, and tracks both in state.
-When `removeUntracked` is enabled, previously-managed remotes and apps
-that fall out of the desired config are removed.
+Previously-managed remotes and apps that fall out of the desired config
+are removed; anything installed out-of-band is never touched.
 """
 
 import shutil
@@ -45,6 +45,14 @@ def _list_installed(flatpak: str) -> Optional[Set[str]]:
     return {line.strip() for line in stdout.splitlines() if line.strip()}
 
 
+def _remotes_in_use(flatpak: str) -> Set[str]:
+    """Remotes that still have refs installed from them."""
+    rc, stdout, _ = run_command([flatpak, SCOPE, "list", "--columns=origin"])
+    if rc != 0:
+        return set()
+    return {line.strip() for line in stdout.splitlines() if line.strip()}
+
+
 def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     """Return human-readable changes the reconciler would apply."""
     desired_remotes = config.get("remotes", {}) or {}
@@ -69,19 +77,23 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     for app in sorted(set(desired_apps) - installed):
         changes.append(f"  + install {app}")
 
-    # Force deploy to run when a desired app is already present but
-    # missing from state — otherwise show_diff reports "no changes",
-    # deploy short-circuits, and it is never adopted.
     managed_apps = set(tracked.get("packages", []))
-    for app in sorted((set(desired_apps) & installed) - managed_apps):
-        changes.append(f"  ~ adopt {app}")
+    managed_remotes = set(tracked.get("remotes", []))
 
-    if config.get("removeUntracked"):
-        for app in sorted((managed_apps & installed) - set(desired_apps)):
-            changes.append(f"  - remove {app}")
-        managed_remotes = set(tracked.get("remotes", []))
-        for name in sorted((managed_remotes & remotes) - set(desired_remotes)):
-            changes.append(f"  - remote-delete {name}")
+    for app in sorted((managed_apps & installed) - set(desired_apps)):
+        changes.append(f"  - remove {app}")
+    remotes_in_use = _remotes_in_use(flatpak)
+    for name in sorted((managed_remotes & remotes) - set(desired_remotes) - remotes_in_use):
+        changes.append(f"  - remote-delete {name}")
+
+    # Tracked entries that vanished out-of-band produce no install/remove
+    # work, so without their own diff line deploy short-circuits and state
+    # keeps claiming them as managed — a later manual reinstall would then
+    # be mistaken for ours and deleted.
+    for app in sorted(managed_apps - installed - set(desired_apps)):
+        changes.append(f"  ~ forget {app}")
+    for name in sorted(managed_remotes - remotes - set(desired_remotes)):
+        changes.append(f"  ~ forget remote {name}")
 
     return changes
 
@@ -107,6 +119,10 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
 
     success = True
     changed = False
+    # Only what this run actually installs joins the tracked set — anything
+    # already present was put there by hand and is never ours to remove.
+    newly_installed: Set[str] = set()
+    newly_added_remotes: Set[str] = set()
 
     for name in sorted(set(desired_remotes) - remotes):
         url = desired_remotes[name]
@@ -117,6 +133,7 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
             success = False
             continue
         remotes.add(name)
+        newly_added_remotes.add(name)
         changed = True
 
     for app in sorted(set(desired_apps) - installed):
@@ -132,36 +149,43 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
             success = False
             continue
         installed.add(app)
+        newly_installed.add(app)
         changed = True
 
-    managed_apps = set(desired_apps) | (set(tracked.get("packages", [])) & installed)
-    managed_remotes = set(desired_remotes) | (set(tracked.get("remotes", [])) & remotes)
+    managed_apps = (set(tracked.get("packages", [])) | newly_installed) & installed
+    managed_remotes = (set(tracked.get("remotes", [])) | newly_added_remotes) & remotes
 
-    if config.get("removeUntracked"):
-        for app in sorted((managed_apps & installed) - set(desired_apps)):
-            log(f"Removing {app} ...", Color.RED)
-            rc, _, stderr = run_command([flatpak, SCOPE, "uninstall", "--noninteractive", app])
-            if rc != 0:
-                log(f"Failed to remove {app}: {stderr.strip()}", Color.RED)
-                success = False
-                continue
-            managed_apps.discard(app)
-            installed.discard(app)
-            changed = True
+    for app in sorted((managed_apps & installed) - set(desired_apps)):
+        log(f"Removing {app} ...", Color.RED)
+        rc, _, stderr = run_command([flatpak, SCOPE, "uninstall", "--noninteractive", app])
+        if rc != 0:
+            log(f"Failed to remove {app}: {stderr.strip()}", Color.RED)
+            success = False
+            continue
+        managed_apps.discard(app)
+        installed.discard(app)
+        changed = True
 
-        for name in sorted((managed_remotes & remotes) - set(desired_remotes)):
-            log(f"Removing flatpak remote {name}", Color.RED)
-            rc, _, stderr = run_command([flatpak, SCOPE, "remote-delete", name])
-            if rc != 0:
-                log(f"Failed to remove remote {name}: {stderr.strip()}", Color.RED)
-                success = False
-                continue
-            managed_remotes.discard(name)
-            changed = True
+    remotes_in_use = _remotes_in_use(flatpak)
+    for name in sorted((managed_remotes & remotes) - set(desired_remotes)):
+        # flatpak refuses to delete a remote that still has refs installed,
+        # and those refs can be hand-installed apps we must not touch. Leave
+        # it tracked and retry on a later run instead of failing forever.
+        if name in remotes_in_use:
+            debug(f"Remote {name} still has installed refs, leaving it", Color.YELLOW)
+            continue
+        log(f"Removing flatpak remote {name}", Color.RED)
+        rc, _, stderr = run_command([flatpak, SCOPE, "remote-delete", name])
+        if rc != 0:
+            log(f"Failed to remove remote {name}: {stderr.strip()}", Color.RED)
+            success = False
+            continue
+        managed_remotes.discard(name)
+        changed = True
 
-        # Drop entries that vanished out-of-band so state converges.
-        managed_apps &= installed
-        managed_remotes &= remotes
+    # Drop entries that vanished out-of-band so state converges.
+    managed_apps &= installed
+    managed_remotes &= remotes
 
     if not changed:
         debug("All flatpak packages in sync", Color.BLUE)

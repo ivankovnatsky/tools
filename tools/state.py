@@ -5,6 +5,19 @@ from typing import Dict, List
 
 from tools.log import Color, log
 
+STATE_VERSION = 2
+
+# Sections whose entries are deletion authority under the ownership model.
+# Before v2 they recorded the *desired config* (brew, flatpak) or adopted
+# preinstalled items (ollamaModels), so a legacy entry says nothing about
+# who installed the package. Carrying it forward would let the first deploy
+# after the upgrade uninstall something installed by hand.
+_OWNERSHIP_SECTIONS = {
+    "brew": ("brews", "casks", "taps", "masApps"),
+    "flatpak": ("packages", "remotes"),
+    "ollamaModels": ("installed",),
+}
+
 LEGACY_STATE_DIRS = [
     "manual-packages",  # Original name, renamed to "tools" in 2026-01
 ]
@@ -39,6 +52,39 @@ def save_json(path: str, data: Dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def migrate_state_schema(state: Dict) -> Dict:
+    """Bring an on-disk state dict up to STATE_VERSION.
+
+    v1 -> v2: ownership sections are cleared rather than reinterpreted.
+    Packages stay installed; they are simply no longer removal candidates
+    until this tool installs them itself.
+    """
+    if state.get("version", 1) >= STATE_VERSION:
+        state["version"] = STATE_VERSION
+        return state
+
+    dropped = []
+    for section_name, keys in _OWNERSHIP_SECTIONS.items():
+        section = state.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            value = section.get(key)
+            if not value:
+                continue
+            dropped.append(f"{section_name}.{key}")
+            section[key] = {} if isinstance(value, dict) else []
+
+    if dropped:
+        log(
+            "State upgraded to ownership tracking; releasing prior entries so "
+            f"nothing is removed on the strength of legacy data: {', '.join(sorted(dropped))}",
+            Color.YELLOW,
+        )
+    state["version"] = STATE_VERSION
+    return state
 
 
 def migrate_state_file(new_state_file: str):
