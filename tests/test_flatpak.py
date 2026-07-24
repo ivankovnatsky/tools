@@ -7,17 +7,29 @@ from tools.user import flatpak
 class FakeFlatpak:
     """Stand-in for the flatpak CLI, recording the commands it is given."""
 
-    def __init__(self, remotes=(), installed=(), origins=()):
+    def __init__(self, remotes=(), installed=(), origins=(), remote_urls=None):
         self.remotes = set(remotes)
         self.installed = set(installed)
         # Remotes that still have refs installed from them (apps or runtimes).
         self.origins = set(origins)
+        # What each remote name actually resolves to, which is where installs
+        # come from regardless of what config declares.
+        self.remote_urls = dict(remote_urls or {})
         self.commands = []
 
     def run(self, cmd, env=None, cwd=None):
         self.commands.append(cmd)
         verb = cmd[2]
         if verb == "remotes":
+            if "--columns=name,url" in cmd:
+                # Only remotes given an explicit URL report one; the rest look
+                # like a flatpak that did not surface a URL column.
+                rows = "\n".join(
+                    f"{n}\t{self.remote_urls[n]}"
+                    for n in sorted(self.remotes)
+                    if n in self.remote_urls
+                )
+                return 0, rows, ""
             return 0, "\n".join(sorted(self.remotes)), ""
         if verb == "list":
             if "--columns=origin" in cmd:
@@ -194,6 +206,30 @@ class FlatpakTest(unittest.TestCase):
                 )
                 state_moved = mutable.get("flatpak") != state.get("flatpak")
                 self.assertEqual(bool(changes), acted or state_moved)
+
+    def test_remote_url_mismatch_is_reported_not_silently_used(self):
+        # Installs resolve through whatever the name points at, so a remote
+        # whose URL was swapped decides where packages come from.
+        fake = FakeFlatpak(
+            remotes=["flathub"], remote_urls={"flathub": "https://evil/repo.flatpakrepo"}
+        )
+        config = {"remotes": {"flathub": "https://dl.flathub.org/repo/flathub.flatpakrepo"}}
+
+        self.assertFalse(self._reconcile(config, {}, fake))
+
+    def test_matching_remote_url_is_accepted(self):
+        url = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+        fake = FakeFlatpak(remotes=["flathub"], remote_urls={"flathub": url})
+
+        self.assertTrue(self._reconcile({"remotes": {"flathub": url}}, {}, fake))
+
+    def test_diff_flags_remote_url_mismatch(self):
+        fake = FakeFlatpak(remotes=["flathub"], remote_urls={"flathub": "https://evil/repo"})
+        config = {"remotes": {"flathub": "https://dl.flathub.org/repo/flathub.flatpakrepo"}}
+
+        changes = self._diff(config, {}, fake)
+
+        self.assertTrue(any("points at https://evil/repo" in c for c in changes), changes)
 
     def test_missing_cli_is_not_a_failure(self):
         state = {}

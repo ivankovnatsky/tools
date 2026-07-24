@@ -116,6 +116,64 @@ class McpOwnershipTest(unittest.TestCase):
 
         self.assertFalse(self._reconcile({}, state, fake))
 
+    def test_changed_url_is_re_registered(self):
+        # Identity is the name, so `claude mcp list` cannot reveal a changed
+        # url/transport — without a fingerprint, editing config does nothing.
+        fake = FakeClaude(installed=["srv"])
+        state = {
+            "mcp": {
+                "servers": {
+                    "srv": {
+                        "installed": True,
+                        "scope": "user",
+                        "transport": "http",
+                        "url": "https://old/srv",
+                        "command": None,
+                    }
+                }
+            }
+        }
+
+        self._reconcile(_server("srv"), state, fake)
+
+        self.assertEqual(fake.removed(), ["srv"])
+        self.assertTrue(any(c[2] == "add" for c in fake.commands))
+
+    def test_unchanged_server_is_left_alone(self):
+        fake = FakeClaude(installed=["srv"])
+        cfg = _server("srv")
+        state = {
+            "mcp": {
+                "servers": {
+                    "srv": dict(installed=True, **cfg["srv"]),
+                }
+            }
+        }
+
+        self._reconcile(cfg, state, fake)
+
+        self.assertEqual(fake.removed(), [])
+
+    def test_diff_previews_re_registration(self):
+        fake = FakeClaude(installed=["srv"])
+        state = {
+            "mcp": {
+                "servers": {
+                    "srv": {
+                        "installed": True,
+                        "scope": "user",
+                        "transport": "http",
+                        "url": "https://old/srv",
+                        "command": None,
+                    }
+                }
+            }
+        }
+
+        changes = self._diff(_server("srv"), state, fake)
+
+        self.assertIn("  ~ re-register srv", changes)
+
     def test_successful_run_reports_success(self):
         fake = FakeClaude()
         state = {}
