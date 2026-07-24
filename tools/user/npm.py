@@ -24,7 +24,10 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
         npmrc_path = os.path.expanduser("~/.npmrc")
         if not os.path.exists(npmrc_path):
             log("Creating .npmrc file", Color.GREEN)
-            with open(npmrc_path, "w") as f:
+            # .npmrc routinely holds registry auth tokens, so it must not
+            # inherit a world-readable umask.
+            fd = os.open(npmrc_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(npmrc_content)
             state.setdefault("npm", {})["npmrc_created"] = True
         else:
@@ -77,6 +80,7 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
 
     # 3. POST-INSTALL: Run postInstall commands for packages that need them
     # npm global prefix layout: <prefix>/lib/node_modules/<pkg>
+    post_install_failed: set = set()
     npm_lib = Path(paths["npmBin"]).parent / "lib" / "node_modules"
     for pkg, pkg_info in packages.items():
         post_install = get_pkg_post_install(pkg_info)
@@ -98,6 +102,9 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
             )
             if returncode != 0:
                 log(f"postInstall failed for {pkg}: {stderr}", Color.RED)
+                # Nothing on disk reveals that the hook did not run, so if the
+                # command is still recorded as current it is never retried.
+                post_install_failed.add(pkg)
             else:
                 log(f"postInstall completed for {pkg}", Color.GREEN)
                 state_changed = True
@@ -146,15 +153,22 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
     # whose uninstall failed are kept so cleanup is retried next run. Compare
     # the rebuilt entries against what is stored so a pure metadata change
     # (e.g. shedding a legacy "binary" field) is persisted even on a no-op sync.
+    stored_pkgs = state.get("npm", {}).get("packages", {})
     npm_state = dict(failed_removals)
     for pkg, pkg_info in packages.items():
         npm_state[pkg] = {
             "installed": True,
             "version": get_pkg_version(pkg_info),
             "subpackages": get_pkg_subpackages(pkg_info),
-            "postInstall": get_pkg_post_install(pkg_info),
+            # A failed hook keeps its previously recorded command, so the next
+            # run still sees a mismatch and retries it.
+            "postInstall": (
+                stored_pkgs.get(pkg, {}).get("postInstall", "")
+                if pkg in post_install_failed
+                else get_pkg_post_install(pkg_info)
+            ),
         }
-    if state_changed or npm_state != state.get("npm", {}).get("packages", {}):
+    if state_changed or npm_state != stored_pkgs:
         state.setdefault("npm", {})["packages"] = npm_state
 
-    return success and not subpkg_failed
+    return success and not subpkg_failed and not post_install_failed

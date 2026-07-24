@@ -61,17 +61,22 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     success = True
     paths = config.get("paths", {})
 
+    # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
+    # with nothing configured raises KeyError on a machine show_diff calls
+    # clean. Gate them like uv/go: run only when there is work or state.
     if "bun" in active:
         bun_config = config.get("bun", {})
         bun_packages = bun_config.get("packages", {})
         bun_only_config = {"configFile": bun_config.get("configFile")}
-        success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
+        if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
+            success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
 
     if "npm" in active:
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
         npm_only_config = {"configFile": npm_config.get("configFile")}
-        success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
+        if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
+            success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
 
     if "uv" in active:
         uv_packages = config.get("uv", {}).get("packages", {})
@@ -87,11 +92,17 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     if "mcp" in active:
         success &= install_mcp_servers(config.get("mcp", {}).get("servers", {}), paths, state)
 
-    if "curlShell" in active and config.get("curlShell"):
-        success &= install_curl_shell_scripts(config["curlShell"], state)
+    # Gate on state as well as config, or dropping the last entry means the
+    # reconciler never runs again and its state is orphaned forever.
+    if "curlShell" in active and (
+        config.get("curlShell") or state.get("curlShell", {}).get("installed")
+    ):
+        success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
 
-    if "gitRepos" in active and config.get("gitRepos"):
-        success &= install_git_repos(config["gitRepos"], state)
+    if "gitRepos" in active and (
+        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
+    ):
+        success &= install_git_repos(config.get("gitRepos") or {}, state)
 
     if "files" in active:
         success &= install_files(config.get("files", []) or [], config_dir, state)

@@ -2,7 +2,6 @@
 
 import hashlib
 import os
-import shutil
 import stat
 import sys
 from typing import Dict, List
@@ -15,7 +14,6 @@ from tools.util import (
     format_diff_bytes,
     get_pkg_source,
     looks_like_secret,
-    run_command,
     version_changed,
 )
 
@@ -127,28 +125,29 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
 
 
 def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
+    from tools.user.mcp import build_mcp_env, get_installed_mcp_servers, resolve_claude_cli
+
     changes = []
-    claude = shutil.which("claude")
+    desired = set(servers.keys())
+    managed = set(state.get("mcp", {}).get("servers", {}).keys())
+    # Nothing desired and nothing tracked: skip the `claude mcp list` shell-out
+    # entirely, so machines without claude do not fail every diff.
+    if not desired and not managed:
+        return changes
+
+    claude = resolve_claude_cli(paths)
     if not claude:
         return ["  ? claude CLI not found, cannot diff MCP servers"]
 
-    rc, stdout, _ = run_command([claude, "mcp", "list"], cwd=os.path.expanduser("~"))
-    current = set()
-    if rc == 0:
-        for line in stdout.splitlines():
-            line = line.strip()
-            if ": " in line and ("http" in line or "stdio" in line or "npx" in line):
-                name = line.split(":")[0].strip()
-                if name:
-                    current.add(name)
-
-    desired = set(servers.keys())
-    managed = set(state.get("mcp", {}).get("servers", {}).keys())
+    # Same resolver and parser as deploy, or the two disagree about what is
+    # installed and the diff never matches what gets applied.
+    current = get_installed_mcp_servers(claude, build_mcp_env(paths))
     for name in sorted(desired - current):
         changes.append(f"  + install {name}")
-    for name in sorted(managed - desired):
-        if name in current:
-            changes.append(f"  - remove {name}")
+    for name in sorted((managed & current) - desired):
+        changes.append(f"  - remove {name}")
+    for name in sorted(managed - current - desired):
+        changes.append(f"  ~ forget {name}")
 
     return changes
 
@@ -171,6 +170,11 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
             changes.append(f"  + clone {dest}")
         elif dest not in installed:
             changes.append(f"  + track {dest}")
+    # Removal is an rmtree of the whole checkout, so it must never reach the
+    # user as a surprise — this is the one section where a missing preview
+    # line costs data rather than a confusing diff.
+    for dest in sorted(installed - set(git_repos)):
+        changes.append(f"  - remove {dest} (deletes the checkout)")
     return changes
 
 
@@ -294,10 +298,13 @@ def _diff_brew(brew_config: Dict, state: Dict):
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
-    from tools.state import load_json, migrate_state_schema
+    from tools.state import load_json, migrate_state_file, migrate_state_schema
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
+    # deploy relocates legacy state before reading it; without the same step
+    # here a not-yet-migrated machine previews everything as a fresh install.
+    migrate_state_file(state_file)
     if os.path.exists(state_file):
         # Preview against the same view deploy will act on, or the two disagree
         # on every legacy entry.

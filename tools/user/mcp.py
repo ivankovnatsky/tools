@@ -30,13 +30,16 @@ def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Set[str]:
     return servers
 
 
-def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
+def resolve_claude_cli(paths: Dict) -> str | None:
+    """Locate the claude CLI the same way for diff and deploy."""
     claude_cli = paths.get("claudeCli") or shutil.which("claude")
-
     if not claude_cli or not os.path.exists(claude_cli):
-        log("Claude CLI not found, skipping MCP server configuration", Color.YELLOW)
-        return True
+        return None
+    return claude_cli
 
+
+def build_mcp_env(paths: Dict) -> Dict[str, str]:
+    """PATH augmentation shared by diff and deploy."""
     env = os.environ.copy()
     extra_paths = [
         paths.get("nodejs", ""),
@@ -46,13 +49,29 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     extra = ":".join(p for p in extra_paths if p)
     if extra:
         env["PATH"] = f"{extra}:{env.get('PATH', '')}"
+    return env
+
+
+def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
+    claude_cli = resolve_claude_cli(paths)
+
+    if not claude_cli:
+        log("Claude CLI not found, skipping MCP server configuration", Color.YELLOW)
+        return True
+
+    env = build_mcp_env(paths)
 
     desired = set(servers.keys())
     current = get_installed_mcp_servers(claude_cli, env)
+    tracked = set(state.get("mcp", {}).get("servers", {}).keys())
     to_install = desired - current
-    to_remove = current - desired
+    # Only servers we installed are ours to remove. `current - desired` would
+    # take anything registered by hand or by another tool.
+    to_remove = (tracked & current) - desired
 
     state_changed = False
+    success = True
+    failed: set = set()
 
     if to_remove:
         log(f"Removing MCP servers: {', '.join(to_remove)}", Color.RED)
@@ -62,6 +81,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
             )
             if returncode != 0:
                 log(f"Failed to remove {server_name}: {stderr}", Color.RED)
+                success = False
             else:
                 log(f"Removed {server_name}", Color.GREEN)
                 state_changed = True
@@ -115,6 +135,8 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                     )
                 else:
                     log(f"Failed to install {server_name}: {stderr}", Color.RED)
+                    success = False
+                    failed.add(server_name)
                     continue
             else:
                 log(f"Installed {server_name}", Color.GREEN)
@@ -124,6 +146,8 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
         debug("All MCP servers already installed", Color.BLUE)
 
     if state_changed or set(state.get("mcp", {}).get("servers", {}).keys()) != desired:
+        # A server whose `mcp add` failed is not installed; recording it as
+        # such would hide the failure from the next run's diff.
         state.setdefault("mcp", {})["servers"] = {
             name: {
                 "installed": True,
@@ -133,6 +157,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                 "command": config.get("command"),
             }
             for name, config in servers.items()
+            if name not in failed
         }
 
-    return True
+    return success
