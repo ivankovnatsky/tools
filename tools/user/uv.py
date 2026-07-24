@@ -26,6 +26,27 @@ def _uv_entry(pkg_info: Dict) -> Dict:
 
 def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
     desired = set(packages.keys())
+
+    # Fail with a clear message instead of a KeyError traceback when the
+    # paths a reconcile would need are not configured.
+    missing = [k for k in ("uv", "uvBin", "uvToolDir") if not paths.get(k)]
+    if missing:
+        log(
+            "uv: required paths missing "
+            f"({', '.join('paths.' + k for k in missing)}), cannot reconcile",
+            Color.RED,
+        )
+        return False
+
+    # Ownership is only meaningful against the tool dir it was recorded for
+    # (see bun/npm prefix): after a relocation, uninstalling by name would hit
+    # whatever occupies the new location, and "already installed" entries
+    # would never materialize there.
+    context = f"{paths['uvBin']}|{paths['uvToolDir']}"
+    if state.get("uv", {}).get("context", context) != context:
+        log("uv tool dir changed, releasing previously tracked packages", Color.YELLOW)
+        state.setdefault("uv", {})["packages"] = {}
+
     state_pkgs = state.get("uv", {}).get("packages", {})
     state_packages = set(state_pkgs.keys())
     # tracked mirrors what is actually installed; we mutate it as removes and
@@ -95,5 +116,6 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
 
     if tracked != state_pkgs:
         state.setdefault("uv", {})["packages"] = tracked
+    state.setdefault("uv", {})["context"] = context
 
     return success
