@@ -245,7 +245,7 @@ def _diff_brew(brew_config: Dict, state: Dict):
     desired_brews = set(brew_config.get("brews", []))
     desired_casks = set(brew_config.get("casks", []))
     desired_taps = {_normalize_tap(t) for t in brew_config.get("taps", [])}
-    cleanup = brew_config.get("onActivation", {}).get("cleanup") == "zap"
+    desired_mas = brew_config.get("masApps", {}) or {}
 
     # State-only, matching install_brew_packages: reconcile desired against what
     # we recorded installing, never live `brew list`.
@@ -253,15 +253,31 @@ def _diff_brew(brew_config: Dict, state: Dict):
     prev_brews = set(prev.get("brews", []))
     prev_casks = set(prev.get("casks", []))
     prev_taps = {_normalize_tap(t) for t in prev.get("taps", [])}
+    prev_mas = prev.get("masApps", {}) or {}
 
     tap_changes = [f"    + tap {t}" for t in sorted(desired_taps - prev_taps)]
     formula_changes = [f"    + install {f}" for f in sorted(desired_brews - prev_brews)]
     cask_changes = [f"    + install {c}" for c in sorted(desired_casks - prev_casks)]
 
-    if cleanup:
-        formula_changes += [f"    - remove {f}" for f in sorted(prev_brews - desired_brews)]
-        cask_changes += [f"    - remove {c}" for c in sorted(prev_casks - desired_casks)]
-        tap_changes += [f"    - untap {t}" for t in sorted(prev_taps - desired_taps)]
+    formula_changes += [f"    - remove {f}" for f in sorted(prev_brews - desired_brews)]
+    cask_changes += [f"    - remove {c}" for c in sorted(prev_casks - desired_casks)]
+    tap_changes += [f"    - untap {t}" for t in sorted(prev_taps - desired_taps)]
+
+    # Mac App Store apps are reconciled by deploy, so they have to appear here
+    # too — otherwise a MAS-only difference short-circuits and its uninstalls
+    # never show up in the approval preview.
+    prev_ids = {str(v) for v in prev_mas.values()}
+    desired_ids = {str(v) for v in desired_mas.values()}
+    mas_changes = [
+        f"    + install {name} ({app_id})"
+        for name, app_id in sorted(desired_mas.items())
+        if str(app_id) not in prev_ids
+    ]
+    mas_changes += [
+        f"    - remove {name} ({app_id})"
+        for name, app_id in sorted(prev_mas.items())
+        if str(app_id) not in desired_ids
+    ]
 
     subsections = []
     if tap_changes:
@@ -270,18 +286,22 @@ def _diff_brew(brew_config: Dict, state: Dict):
         subsections.append(("brews", formula_changes))
     if cask_changes:
         subsections.append(("casks", cask_changes))
+    if mas_changes:
+        subsections.append(("masApps", mas_changes))
 
     return subsections
 
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Show what deploy would change. Returns True if no changes needed."""
-    from tools.state import load_json
+    from tools.state import load_json, migrate_state_schema
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
     if os.path.exists(state_file):
-        state = load_json(state_file)
+        # Preview against the same view deploy will act on, or the two disagree
+        # on every legacy entry.
+        state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
     has_changes = False
