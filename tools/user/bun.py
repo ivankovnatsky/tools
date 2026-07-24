@@ -31,6 +31,12 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
             state.setdefault("bun", {})["bunfig_created"] = True
 
     desired = set(packages.keys())
+    # See npm: ownership is only meaningful against the prefix it was recorded
+    # for, so a changed prefix releases the old entries rather than acting on
+    # whatever now sits there under the same names.
+    if state.get("bun", {}).get("prefix", paths.get("bunBin")) != paths.get("bunBin"):
+        log("bun prefix changed, releasing previously tracked packages", Color.YELLOW)
+        state.setdefault("bun", {})["packages"] = {}
     state_packages = set(state.get("bun", {}).get("packages", {}).keys())
 
     env = os.environ.copy()
@@ -84,5 +90,6 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
         }
     if state_changed or bun_state != state.get("bun", {}).get("packages", {}):
         state.setdefault("bun", {})["packages"] = bun_state
+    state.setdefault("bun", {})["prefix"] = paths.get("bunBin")
 
     return success

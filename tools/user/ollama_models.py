@@ -62,10 +62,30 @@ def _list_installed(ollama: str, env: Dict[str, str]) -> Optional[Set[str]]:
     return installed
 
 
+def _context(config: Dict) -> str:
+    """Where a tracked model lives: models on another host or path aren't ours."""
+    host = config.get("host") or ""
+    models_path = os.path.expanduser(config.get("modelsPath") or "")
+    return f"{host}|{models_path}"
+
+
+def _tracked_for_context(config: Dict, state: Dict) -> List[str]:
+    """Tracked models, but only if state was written against this context.
+
+    Pointing `host` at a different server makes the recorded names refer to
+    models we never pulled there — treating them as ours would delete
+    someone else's identically-named model.
+    """
+    section = state.get("ollamaModels", {})
+    if section.get("context", _context(config)) != _context(config):
+        return []
+    return [_canonical(m) for m in section.get("installed", [])]
+
+
 def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
     """Return human-readable changes the reconciler would apply."""
     desired_models = [_canonical(m) for m in (config.get("models", []) or [])]
-    tracked = [_canonical(m) for m in state.get("ollamaModels", {}).get("installed", [])]
+    tracked = _tracked_for_context(config, state)
     if not desired_models and not tracked:
         return []
 
@@ -100,7 +120,7 @@ def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
 def install_ollama_models(config: Dict, state: Dict) -> bool:
     """Reconcile installed Ollama models toward the desired list."""
     desired_models = [_canonical(m) for m in (config.get("models", []) or [])]
-    tracked = {_canonical(m) for m in state.get("ollamaModels", {}).get("installed", [])}
+    tracked = set(_tracked_for_context(config, state))
     if not desired_models and not tracked:
         return True
 
@@ -143,5 +163,7 @@ def install_ollama_models(config: Dict, state: Dict) -> bool:
     # in this same run.
     tracked &= installed | newly_pulled
 
-    state.setdefault("ollamaModels", {})["installed"] = sorted(tracked)
+    section = state.setdefault("ollamaModels", {})
+    section["installed"] = sorted(tracked)
+    section["context"] = _context(config)
     return success

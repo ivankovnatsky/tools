@@ -38,6 +38,24 @@ def _list_remotes(flatpak: str) -> Optional[Set[str]]:
     return {line.strip() for line in stdout.splitlines() if line.strip()}
 
 
+def _remote_urls(flatpak: str) -> dict:
+    """{name: url} for configured remotes.
+
+    A remote is trusted by name alone everywhere else, so a name pointing at
+    a different URL than the config declares is where installs would come
+    from — worth surfacing rather than silently accepting.
+    """
+    rc, stdout, _ = run_command([flatpak, SCOPE, "remotes", "--columns=name,url"])
+    if rc != 0:
+        return {}
+    urls = {}
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            urls[parts[0].strip()] = parts[1].strip()
+    return urls
+
+
 def _list_installed(flatpak: str) -> Optional[Set[str]]:
     rc, stdout, _ = run_command([flatpak, SCOPE, "list", "--app", "--columns=application"])
     if rc != 0:
@@ -73,6 +91,12 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     changes: List[str] = []
     for name in sorted(set(desired_remotes) - remotes):
         changes.append(f"  + remote-add {name}")
+
+    live_urls = _remote_urls(flatpak)
+    for name in sorted(set(desired_remotes) & remotes):
+        live = live_urls.get(name)
+        if live and live != desired_remotes[name]:
+            changes.append(f"  ! remote {name} points at {live}, config declares its own URL")
 
     for app in sorted(set(desired_apps) - installed):
         changes.append(f"  + install {app}")
@@ -123,6 +147,20 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
     # already present was put there by hand and is never ours to remove.
     newly_installed: Set[str] = set()
     newly_added_remotes: Set[str] = set()
+
+    # Installs resolve through whatever URL the remote name currently points
+    # at, so a mismatch against the declared URL decides where packages come
+    # from. Surface it instead of installing from an unexpected source.
+    live_urls = _remote_urls(flatpak)
+    for name in sorted(set(desired_remotes) & remotes):
+        live = live_urls.get(name)
+        if live and live != desired_remotes[name]:
+            log(
+                f"Remote {name} points at {live}, not the URL in config. "
+                "Delete the remote by hand if this is unexpected.",
+                Color.RED,
+            )
+            success = False
 
     for name in sorted(set(desired_remotes) - remotes):
         url = desired_remotes[name]

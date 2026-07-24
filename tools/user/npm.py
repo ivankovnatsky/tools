@@ -35,6 +35,12 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
             state.setdefault("npm", {})["npmrc_created"] = True
 
     desired = set(packages.keys())
+    # Packages recorded against a different global prefix live somewhere we no
+    # longer manage; uninstalling by name would hit whatever occupies the new
+    # prefix under the same name.
+    if state.get("npm", {}).get("prefix", paths.get("npmBin")) != paths.get("npmBin"):
+        log("npm prefix changed, releasing previously tracked packages", Color.YELLOW)
+        state.setdefault("npm", {})["packages"] = {}
     state_packages = set(state.get("npm", {}).get("packages", {}).keys())
 
     env = os.environ.copy()
@@ -170,5 +176,6 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
         }
     if state_changed or npm_state != stored_pkgs:
         state.setdefault("npm", {})["packages"] = npm_state
+    state.setdefault("npm", {})["prefix"] = paths.get("npmBin")
 
     return success and not subpkg_failed and not post_install_failed

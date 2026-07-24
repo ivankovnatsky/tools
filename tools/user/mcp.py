@@ -30,6 +30,16 @@ def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Set[str]:
     return servers
 
 
+def server_fingerprint(config: Dict) -> tuple:
+    """The parts of a server definition that a re-register would change."""
+    return (
+        config.get("scope"),
+        config.get("transport"),
+        config.get("url"),
+        config.get("command"),
+    )
+
+
 def resolve_claude_cli(paths: Dict) -> str | None:
     """Locate the claude CLI the same way for diff and deploy."""
     claude_cli = paths.get("claudeCli") or shutil.which("claude")
@@ -63,11 +73,20 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
 
     desired = set(servers.keys())
     current = get_installed_mcp_servers(claude_cli, env)
-    tracked = set(state.get("mcp", {}).get("servers", {}).keys())
-    to_install = desired - current
+    tracked_cfg = state.get("mcp", {}).get("servers", {})
+    tracked = set(tracked_cfg.keys())
+    # A server is identified by name, so a changed url/transport/scope/command
+    # is invisible to `claude mcp list`. Re-register those, or editing config
+    # silently does nothing.
+    changed_cfg = {
+        name
+        for name in desired & tracked & current
+        if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name])
+    }
+    to_install = (desired - current) | changed_cfg
     # Only servers we installed are ours to remove. `current - desired` would
     # take anything registered by hand or by another tool.
-    to_remove = (tracked & current) - desired
+    to_remove = ((tracked & current) - desired) | changed_cfg
 
     state_changed = False
     success = True
