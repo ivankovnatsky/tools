@@ -21,7 +21,12 @@ from tools.user.uv import install_uv_packages
 
 
 def _resolve_config_dir(config_paths: list[str]) -> str:
-    """Resolve the config directory from the first --config path."""
+    """Resolve the config directory from the first --config path.
+
+    Relative `files:` sources in *every* merged config resolve against this
+    one directory, even entries contributed by a second --config argument.
+    Keep file-carrying sections in the first config path.
+    """
     first = config_paths[0]
     if os.path.isdir(first):
         return os.path.abspath(first)
@@ -46,13 +51,19 @@ def _load_merged_config(config_paths: list[str]) -> dict:
         ) as exc:
             log(f"Config error in {config_path}: {exc}", Color.RED)
             sys.exit(1)
+        if not isinstance(loaded, dict):
+            # deep_merge on a list/str would die with a raw AttributeError.
+            log(f"Config error in {config_path}: top level must be a mapping", Color.RED)
+            sys.exit(1)
         config = deep_merge(config, loaded)
     return config
 
 
 def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     """Apply config to bring system to desired state. Returns True on success."""
-    state_file = os.path.expanduser(config.get("stateFile", "~/.local/state/tools/state.json"))
+    # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
+    # crash expanduser — and it must resolve identically to show_diff.
+    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
     migrate_state_file(state_file)
     state = migrate_state_schema(load_json(state_file))
 
@@ -60,6 +71,20 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
 
     success = True
     paths = config.get("paths", {})
+
+    # The reconcilers mutate `state` in memory as they install/remove; the
+    # try/finally guarantees those mutations reach disk even when a later
+    # section crashes. Without it, packages installed earlier in the same run
+    # become permanently unowned.
+    try:
+        success = _run_sections(config, config_dir, state, paths, active)
+    finally:
+        save_json(state_file, state)
+    return success
+
+
+def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, active: set) -> bool:
+    success = True
 
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
     # with nothing configured raises KeyError on a machine show_diff calls
@@ -120,7 +145,6 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     if "flatpak" in active:
         success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state)
 
-    save_json(state_file, state)
     return success
 
 
@@ -145,13 +169,16 @@ def deploy(config, scope, approve):
 
     if not approve:
         has_changes = not show_diff(merged, config_dir, scope)
-        if not has_changes:
-            return
-        answer = click.prompt("\nType 'yes' to deploy", default="no")
-        if answer != "yes":
-            log("Aborted.", Color.YELLOW)
-            sys.exit(1)
+        if has_changes:
+            answer = click.prompt("\nType 'yes' to deploy", default="no")
+            if answer != "yes":
+                log("Aborted.", Color.YELLOW)
+                sys.exit(1)
 
+    # Deploy runs even when the preview was clean: non-destructive
+    # maintenance (pulling tracked git checkouts) has no diff line of its
+    # own, and skipping it here would make it exclusive to --approve.
+    # A clean diff means there is nothing approval-worthy, not nothing to do.
     if not _deploy(merged, config_dir, scope):
         sys.exit(1)
 
