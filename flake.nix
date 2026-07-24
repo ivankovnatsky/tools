@@ -85,9 +85,8 @@
             echo "  just format           - format code"
             echo "  just lint             - lint without modifying"
             echo "  just clean            - remove build artifacts"
-            echo "  just build            - nix build"
-            echo "  just update           - update flake inputs"
-            echo "  just update-nix-config - push and bump tools in nix-config"
+            echo "  just diff             - show pending changes"
+            echo "  just deploy           - apply config"
             echo "  just bump             - increment patch version"
             echo "  just release          - bump and create GitHub release"
           '';
