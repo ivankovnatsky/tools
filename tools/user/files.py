@@ -24,24 +24,23 @@ SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
 def _parse_mode(value) -> Optional[int]:
     """Parse a mode value from config.
 
-    Always interpreted as octal — both ``"0644"`` strings and unquoted
-    YAML ``644`` ints map to ``0o644``. This avoids the trap where
-    PyYAML loads ``mode: 644`` as decimal 644 (= ``0o1204``) and
-    silently sets the wrong permission bits.
+    Only quoted octal strings are accepted (``mode: "0644"``). Bare YAML
+    ints are rejected because they are ambiguous: PyYAML (YAML 1.1)
+    parses ``0644`` as octal into int 420, which is indistinguishable
+    from a literal ``420`` — re-interpreting either as octal silently
+    yields the wrong permission bits for one of them.
 
     Returns None when no mode was specified. Raises ValueError on a
     bad string and TypeError on any other type.
     """
     if value is None:
         return None
-    if isinstance(value, bool):
-        # Guard: bool is a subclass of int in Python.
-        raise TypeError("files: mode must be an octal string or int, got bool")
-    if isinstance(value, int):
-        return int(str(value), 8)
     if isinstance(value, str):
         return int(value, 8)
-    raise TypeError(f"files: mode must be an octal string or int, got {type(value).__name__}")
+    raise TypeError(
+        f'files: mode must be a quoted octal string (e.g. "0644"), got {value!r} '
+        f"({type(value).__name__}); unquoted YAML ints are ambiguous"
+    )
 
 
 def _copy_file(
