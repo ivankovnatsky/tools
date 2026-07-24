@@ -3,8 +3,8 @@ from typing import Dict
 
 from tools.log import Color, debug, log
 from tools.util import (
-    get_pkg_version,
-    pkg_install_spec,
+    pkg_spec_full,
+    pkg_state_entry,
     run_command,
     version_changed,
 )
@@ -39,8 +39,20 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
         state.setdefault("bun", {})["packages"] = {}
     state_packages = set(state.get("bun", {}).get("packages", {}).keys())
 
+    # Fail with a clear message instead of a KeyError traceback when the
+    # paths a reconcile would need are not configured.
+    if desired or state_packages:
+        missing = [k for k in ("bun", "nodejs") if not paths.get(k)]
+        if missing:
+            log(
+                "bun: required paths missing "
+                f"({', '.join('paths.' + k for k in missing)}), cannot reconcile",
+                Color.RED,
+            )
+            return False
+
     env = os.environ.copy()
-    env["PATH"] = f"{paths['bun']}:{paths['nodejs']}:{env.get('PATH', '')}"
+    env["PATH"] = f"{paths.get('bun', '')}:{paths.get('nodejs', '')}:{env.get('PATH', '')}"
 
     state_changed = False
     success = True
@@ -64,16 +76,23 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
 
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
+    to_install_names = []
     for pkg, pkg_info in packages.items():
         if pkg not in state_packages or version_changed(pkg, pkg_info, state, "bun"):
-            to_install.append(pkg_install_spec(pkg, get_pkg_version(pkg_info)))
+            to_install.append(pkg_spec_full(pkg, pkg_info))
+            to_install_names.append(pkg)
+    install_failed: set = set()
     if to_install:
         log(f"Installing bun packages: {', '.join(to_install)}", Color.GREEN)
         cmd = [f"{paths['bun']}/bun", "install", "-g"] + to_install
         returncode, stdout, stderr = run_command(cmd, env)
         if returncode != 0:
             log(f"Failed to install bun packages: {stderr}", Color.RED)
-            return False
+            # No early return: the removals above already mutated the system,
+            # so state must still be rewritten below or the next run retries
+            # `bun remove -g` on packages that are already gone — forever.
+            success = False
+            install_failed = set(to_install_names)
         state_changed = True
 
     if not to_remove and not to_install:
@@ -84,10 +103,13 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
     # (e.g. shedding a legacy "binary" field) is persisted even on a no-op sync.
     bun_state = dict(failed_removals)
     for pkg, pkg_info in packages.items():
-        bun_state[pkg] = {
-            "installed": True,
-            "version": get_pkg_version(pkg_info),
-        }
+        if pkg in install_failed:
+            # Not (re)installed: keep the old entry (or none) so the next run
+            # still sees the mismatch and retries.
+            if pkg in state_pkgs:
+                bun_state[pkg] = state_pkgs[pkg]
+            continue
+        bun_state[pkg] = pkg_state_entry(pkg_info)
     if state_changed or bun_state != state.get("bun", {}).get("packages", {}):
         state.setdefault("bun", {})["packages"] = bun_state
     state.setdefault("bun", {})["prefix"] = paths.get("bunBin")
