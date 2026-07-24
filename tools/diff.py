@@ -125,7 +125,12 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
 
 
 def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
-    from tools.user.mcp import build_mcp_env, get_installed_mcp_servers, resolve_claude_cli
+    from tools.user.mcp import (
+        build_mcp_env,
+        get_installed_mcp_servers,
+        resolve_claude_cli,
+        server_fingerprint,
+    )
 
     changes = []
     desired = set(servers.keys())
@@ -142,8 +147,12 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     # Same resolver and parser as deploy, or the two disagree about what is
     # installed and the diff never matches what gets applied.
     current = get_installed_mcp_servers(claude, build_mcp_env(paths))
+    tracked_cfg = state.get("mcp", {}).get("servers", {})
     for name in sorted(desired - current):
         changes.append(f"  + install {name}")
+    for name in sorted(desired & managed & current):
+        if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name]):
+            changes.append(f"  ~ re-register {name}")
     for name in sorted((managed & current) - desired):
         changes.append(f"  - remove {name}")
     for name in sorted(managed - current - desired):

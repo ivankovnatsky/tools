@@ -35,8 +35,11 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     desired = set(repos.keys())
     to_install = desired - installed
     to_remove = installed - desired
+    # A tracked checkout still needs pulling — "installed once" is not the same
+    # as "up to date", and nothing else ever revisits these.
+    to_update = {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}
 
-    if not to_install and not to_remove:
+    if not to_install and not to_remove and not to_update:
         debug("All git repos already installed", Color.BLUE)
         if installed != desired:
             state.setdefault("gitRepos", {})["installed"] = list(installed)
@@ -48,6 +51,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     env["PATH"] = f"{system_dir('git')}:{env.get('PATH', '')}"
 
     state_changed = False
+    success = True
 
     for dest_path in to_remove:
         expanded_path = os.path.expanduser(dest_path)
@@ -64,16 +68,24 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
             state_changed = True
         installed.discard(dest_path)
 
-    for dest_path in to_install:
+    for dest_path in sorted(to_install | to_update):
         repo_url = repos[dest_path]
         expanded_path = os.path.expanduser(dest_path)
 
         if os.path.exists(expanded_path):
+            # Only a real checkout gets pulled and recorded. An arbitrary
+            # directory at that path is not a repo we manage, and marking it
+            # installed would make it an rmtree candidate later.
+            if not os.path.isdir(os.path.join(expanded_path, ".git")):
+                log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
+                success = False
+                continue
             log(f"Updating git repo: {dest_path}", Color.BLUE)
             cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
             returncode, stdout, stderr = run_command(cmd, env)
             if returncode != 0:
                 log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
+                success = False
         else:
             log(f"Cloning git repo: {repo_url} -> {dest_path}", Color.GREEN)
             parent_dir = os.path.dirname(expanded_path)
@@ -82,6 +94,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
             returncode, stdout, stderr = run_command(cmd, env)
             if returncode != 0:
                 log(f"Failed to clone {repo_url}: {stderr}", Color.RED)
+                success = False
                 continue
 
         installed.add(dest_path)
@@ -90,4 +103,4 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     if state_changed or installed != desired:
         state.setdefault("gitRepos", {})["installed"] = list(installed)
 
-    return True
+    return success
