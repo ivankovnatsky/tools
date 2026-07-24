@@ -103,6 +103,37 @@ class GitReposRemovalTest(unittest.TestCase):
             self.assertEqual(removed, [d])
 
 
+class GitReposUpdateTest(unittest.TestCase):
+    def _reconcile(self, repos, state, fake):
+        with (
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "run_command", fake.run),
+        ):
+            return git_repos.install_git_repos(repos, state)
+
+    def test_already_tracked_repo_is_pulled(self):
+        # "Installed once" is not "up to date"; nothing else revisits these.
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".git"))
+            state = {"gitRepos": {"installed": [d]}}
+            fake = FakeGit()
+
+            self._reconcile({d: "https://example/r.git"}, state, fake)
+
+            self.assertTrue(any(c[3:4] == ["pull"] for c in fake.commands), fake.commands)
+
+    def test_non_repo_directory_is_not_marked_installed(self):
+        # Marking it installed would make it an rmtree candidate later.
+        with tempfile.TemporaryDirectory() as d:
+            state = {}
+            fake = FakeGit()
+
+            self.assertFalse(self._reconcile({d: "https://example/r.git"}, state, fake))
+
+            self.assertNotIn(d, state.get("gitRepos", {}).get("installed", []))
+
+
 class GitReposDiffTest(unittest.TestCase):
     def test_removal_is_previewed(self):
         # rmtree with no preview line is the one missing diff entry that
