@@ -1,4 +1,5 @@
 import os
+import shutil
 from typing import Dict, Optional
 
 from tools.log import Color, debug, log
@@ -25,6 +26,10 @@ def _resolve_go_bin(paths: Dict) -> Optional[str]:
     gopath = paths.get("goPath")
     if gopath:
         return os.path.join(os.path.expanduser(gopath), "bin")
+    # Shelling out to a missing binary raises FileNotFoundError; a machine
+    # without go must degrade gracefully (this is also called for log hints).
+    if not shutil.which("go"):
+        return None
     rc, stdout, _ = run_command(["go", "env", "GOBIN"])
     if rc == 0:
         gobin = stdout.strip()
@@ -68,6 +73,19 @@ def _go_entry(pkg_info: Dict) -> Dict:
 
 def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     desired = set(packages.keys())
+
+    # Go has no uninstall, so a changed install dir cannot "release" anything
+    # — but unchanged packages still need reinstalling into the new location,
+    # or they are simply absent there while state claims them installed.
+    context = f"{paths.get('goBin') or ''}|{paths.get('goPath') or ''}"
+    context_changed = state.get("go", {}).get("context", context) != context
+    if context_changed:
+        log(
+            "go install dir changed; reinstalling desired packages there "
+            "(old binaries remain in the previous dir, remove manually if unwanted)",
+            Color.YELLOW,
+        )
+
     state_pkgs = state.get("go", {}).get("packages", {})
     state_packages = set(state_pkgs.keys())
     # tracked mirrors what is installed; persist each success so a later
@@ -93,7 +111,9 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
     to_install = [
         pkg
         for pkg, pkg_info in packages.items()
-        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "go")
+        if pkg not in state_packages
+        or context_changed
+        or version_changed(pkg, pkg_info, state, "go")
     ]
 
     if to_install:
@@ -103,6 +123,10 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
         if not go_bin:
             log("Failed to resolve Go install dir (no goBin, no go env GOPATH)", Color.RED)
             return False
+        go_cmd = shutil.which("go")
+        if not go_cmd:
+            log("go binary not found on PATH, cannot install Go packages", Color.RED)
+            return False
         go_env = _go_env(paths)
         # When goBin isn't pinned in config, propagate the resolved value
         # so `go install` lands where we expect.
@@ -110,7 +134,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
         log(f"Installing Go packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
             spec = _install_spec(pkg, packages[pkg])
-            cmd = ["go", "install", spec]
+            cmd = [go_cmd, "install", spec]
             returncode, _, stderr = run_command(cmd, env=go_env)
             if returncode != 0:
                 log(f"Failed to install Go package {spec}: {stderr}", Color.RED)
@@ -129,6 +153,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
 
     if tracked != state_pkgs:
         state.setdefault("go", {})["packages"] = tracked
+    state.setdefault("go", {})["context"] = context
 
     return success
 
