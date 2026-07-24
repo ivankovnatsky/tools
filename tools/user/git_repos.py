@@ -7,12 +7,31 @@ from tools.system_paths import system_bin, system_dir
 from tools.util import run_command
 
 
+def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
+    """True if the worktree has uncommitted changes or unpushed commits.
+
+    Removal is an rmtree, so anything not on a remote is gone for good.
+    A repo we cannot interrogate counts as having work — refusing to
+    delete costs a stale directory, deleting costs the work itself.
+    """
+    rc, stdout, _ = run_command([git_bin, "-C", path, "status", "--porcelain"], env)
+    if rc != 0:
+        return True
+    if stdout.strip():
+        return True
+    rc, stdout, _ = run_command(
+        [git_bin, "-C", path, "log", "--branches", "--not", "--remotes", "--oneline"], env
+    )
+    if rc != 0:
+        return True
+    return bool(stdout.strip())
+
+
 def install_git_repos(repos: Dict[str, str], state: Dict):
     """Clone or update git repositories to specified paths."""
-    if not repos:
-        return True
-
     installed = set(state.get("gitRepos", {}).get("installed", []))
+    if not repos and not installed:
+        return True
     desired = set(repos.keys())
     to_install = desired - installed
     to_remove = installed - desired
@@ -33,6 +52,13 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
     for dest_path in to_remove:
         expanded_path = os.path.expanduser(dest_path)
         if os.path.exists(expanded_path):
+            if _has_local_work(git_bin, expanded_path, env):
+                log(
+                    f"Keeping {dest_path}: uncommitted or unpushed work. "
+                    "Remove it by hand once the work is safe.",
+                    Color.YELLOW,
+                )
+                continue
             log(f"Removing git repo: {dest_path}", Color.RED)
             shutil.rmtree(expanded_path)
             state_changed = True

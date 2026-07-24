@@ -7,6 +7,16 @@ from typing import Dict, List, Optional, Tuple
 from tools.log import Color, debug, log
 from tools.util import format_diff_bytes, looks_like_secret
 
+
+def _file_hash(path: str) -> Optional[str]:
+    """sha256 of a file on disk, or None if it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
 SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
 
@@ -216,9 +226,21 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
             managed_targets[target] = source_hash
 
     if success:
+        kept = {}
         for target in list(state_files.keys()):
             if target not in managed_targets:
                 if os.path.exists(target):
+                    # Only delete what still matches what we wrote. A file
+                    # edited since then holds work this tool never authored.
+                    stored_hash = (state_files.get(target) or {}).get("hash")
+                    if stored_hash and _file_hash(target) != stored_hash:
+                        log(
+                            f"Keeping {target}: modified since we wrote it. "
+                            "Delete it by hand if it is no longer wanted.",
+                            Color.YELLOW,
+                        )
+                        kept[target] = state_files[target]
+                        continue
                     try:
                         os.remove(target)
                         log(f"Removed: {target}", Color.RED)
@@ -226,10 +248,13 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
                     except OSError as e:
                         log(f"Failed to remove {target}: {e}", Color.RED)
                         success = False
+                        # Keep tracking it so the next run retries the cleanup.
+                        kept[target] = state_files[target]
 
         state["files"] = {
             target: {"hash": file_hash} for target, file_hash in managed_targets.items()
         }
+        state["files"].update(kept)
     else:
         merged = dict(state_files)
         merged.update(

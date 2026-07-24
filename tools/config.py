@@ -195,6 +195,11 @@ def _load_flat_dir(path: str) -> Dict[str, Any]:
         and os.path.isfile(os.path.join(path, name))
     )
 
+    if not entries:
+        # An empty desired state is now "remove everything tracked", so a
+        # mistyped --config path must not be read as a valid instruction.
+        raise ConfigError(f"No config files found in {path}")
+
     merged: Dict[str, Any] = {}
     for name in entries:
         loaded = load_config(os.path.join(path, name))

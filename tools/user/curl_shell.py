@@ -15,9 +15,18 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     desired = set(scripts.keys())
     to_install = desired - installed
 
+    # There is no uninstall for a curl|sh script, so a dropped URL can only be
+    # released from state — otherwise re-adding it later would never re-run.
+    stale = installed - desired
+    if stale:
+        installed -= stale
+        state.setdefault("curlShell", {})["installed"] = list(installed)
+
     if not to_install:
         debug("All curl shell scripts already installed", Color.BLUE)
         return True
+
+    success = True
 
     curl_bin = system_bin("curl")
     bash_dir = system_dir("bash")
@@ -62,10 +71,12 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
                 f"Failed to fetch {url} (curl exit {curl_proc.returncode}): {curl_stderr}",
                 Color.RED,
             )
+            success = False
             continue
 
         if shell_proc.returncode != 0:
             log(f"Failed to run script from {url}: {stderr.decode()}", Color.RED)
+            success = False
             continue
 
         log(f"Successfully installed from {url}", Color.GREEN)
@@ -75,4 +86,4 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     if state_changed:
         state.setdefault("curlShell", {})["installed"] = list(installed)
 
-    return True
+    return success

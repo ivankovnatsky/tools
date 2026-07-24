@@ -48,10 +48,16 @@ def load_json(path: str) -> Dict:
 
 
 def save_json(path: str, data: Dict):
+    # Written atomically: this file is the only record of what we installed, and
+    # a crash mid-dump would truncate it into a partial ownership set.
     _remove_if_dir(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 def migrate_state_schema(state: Dict) -> Dict:
@@ -61,8 +67,15 @@ def migrate_state_schema(state: Dict) -> Dict:
     Packages stay installed; they are simply no longer removal candidates
     until this tool installs them itself.
     """
-    if state.get("version", 1) >= STATE_VERSION:
-        state["version"] = STATE_VERSION
+    found = state.get("version", 1)
+    if found > STATE_VERSION:
+        # Written by a newer tools; its sections may mean something else.
+        # Silently downgrading would hand stale semantics deletion authority.
+        raise RuntimeError(
+            f"State file is version {found} but this tools understands {STATE_VERSION}. "
+            "Upgrade tools, or remove the state file to start fresh."
+        )
+    if found == STATE_VERSION:
         return state
 
     dropped = []

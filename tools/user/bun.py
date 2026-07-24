@@ -21,7 +21,9 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
         bunfig_path = os.path.expanduser("~/.bunfig.toml")
         if not os.path.exists(bunfig_path):
             log("Creating .bunfig.toml file", Color.GREEN)
-            with open(bunfig_path, "w") as f:
+            # May carry registry auth, same as .npmrc — do not inherit umask.
+            fd = os.open(bunfig_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(bunfig_content)
             state.setdefault("bun", {})["bunfig_created"] = True
         else:
