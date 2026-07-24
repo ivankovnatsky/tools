@@ -40,8 +40,17 @@ def _bootstrap_brew() -> str | None:
     curl = system_bin("curl")
     bash = system_bin("bash")
 
+    # Fetch the installer first, then hand its body to bash. Passing the
+    # literal `$(curl ...)` as the -c script would make *bash* substitute
+    # and word-split the downloaded script, then try to execute its first
+    # token ("#!/bin/bash") as a command name — rc 127, every time.
+    rc, script, stderr = run_command([curl, "-fsSL", _BREW_INSTALL_URL])
+    if rc != 0 or not script.strip():
+        log(f"Failed to download Homebrew installer: {stderr}", Color.RED)
+        return None
+
     rc, stdout, stderr = run_command(
-        [bash, "-c", f"$({curl} -fsSL {_BREW_INSTALL_URL})"],
+        [bash, "-c", script],
         {**os.environ.copy(), "NONINTERACTIVE": "1"},
     )
     if rc != 0:
@@ -60,15 +69,18 @@ def _mas_bin_from_env(env: dict) -> str | None:
     return shutil.which("mas", path=env.get("PATH", ""))
 
 
-def _installed_subset(brew: str, env: dict, candidates: list[str], kind: str) -> set[str]:
+def _installed_subset(brew: str, env: dict, candidates: list[str], kind: str) -> set[str] | None:
     """Which of `candidates` brew currently reports as installed.
 
     Only used to repair bookkeeping after a batch command failed partway;
-    the happy path never queries brew.
+    the happy path never queries brew. Returns None when brew itself cannot
+    be queried — "unknown" must not be conflated with "none installed", or
+    a failed uninstall would silently drop ownership of packages that are
+    still on disk.
     """
     rc, stdout, _ = run_command([brew, "list", kind, "-1"], env)
     if rc != 0:
-        return set()
+        return None
     present = {line.strip() for line in stdout.splitlines() if line.strip()}
     return present & set(candidates)
 
@@ -141,6 +153,11 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
                 "taps": sorted(inst_taps),
                 "masApps": inst_mas,
             }
+        elif prev_mas != desired_mas:
+            # No install/remove work means the app-id sets already match, so
+            # any dict difference is a pure rename ({"Old": 1} -> {"New": 1}).
+            # Adopt the new names or state carries the stale key forever.
+            state["brew"]["masApps"] = dict(desired_mas)
         return True
 
     # Only resolve/bootstrap brew when there is real work to do.
@@ -187,7 +204,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
             # brew installs targets in order, so an earlier one can land before
             # a later failure. Recording none of them would leave a package we
             # installed permanently unowned and never cleaned up.
-            inst_brews |= _installed_subset(brew, env, brews_to_install, "--formula")
+            subset = _installed_subset(brew, env, brews_to_install, "--formula")
+            if subset is not None:
+                inst_brews |= subset
         else:
             inst_brews |= set(brews_to_install)
     if brews_to_remove:
@@ -196,9 +215,10 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to remove formulas: {stderr}", Color.RED)
             success = False
-            inst_brews &= _installed_subset(brew, env, brews_to_remove, "--formula") | (
-                inst_brews - set(brews_to_remove)
-            )
+            subset = _installed_subset(brew, env, brews_to_remove, "--formula")
+            if subset is not None:
+                # Unknown (None) keeps everything owned so removal is retried.
+                inst_brews &= subset | (inst_brews - set(brews_to_remove))
         else:
             inst_brews -= set(brews_to_remove)
 
@@ -214,7 +234,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to install casks: {stderr}", Color.RED)
             success = False
-            inst_casks |= _installed_subset(brew, env, casks_to_install, "--cask")
+            subset = _installed_subset(brew, env, casks_to_install, "--cask")
+            if subset is not None:
+                inst_casks |= subset
         else:
             inst_casks |= set(casks_to_install)
     if casks_to_remove:
@@ -223,9 +245,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         if rc != 0:
             log(f"Failed to remove casks: {stderr}", Color.RED)
             success = False
-            inst_casks &= _installed_subset(brew, env, casks_to_remove, "--cask") | (
-                inst_casks - set(casks_to_remove)
-            )
+            subset = _installed_subset(brew, env, casks_to_remove, "--cask")
+            if subset is not None:
+                inst_casks &= subset | (inst_casks - set(casks_to_remove))
         else:
             inst_casks -= set(casks_to_remove)
 
