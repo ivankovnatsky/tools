@@ -20,7 +20,7 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
     stale = installed - desired
     if stale:
         installed -= stale
-        state.setdefault("curlShell", {})["installed"] = list(installed)
+        state.setdefault("curlShell", {})["installed"] = sorted(installed)
 
     if not to_install:
         debug("All curl shell scripts already installed", Color.BLUE)
@@ -84,6 +84,6 @@ def install_curl_shell_scripts(scripts: Dict[str, str], state: Dict):
         state_changed = True
 
     if state_changed:
-        state.setdefault("curlShell", {})["installed"] = list(installed)
+        state.setdefault("curlShell", {})["installed"] = sorted(installed)
 
     return success
