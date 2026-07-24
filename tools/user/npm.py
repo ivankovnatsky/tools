@@ -6,8 +6,9 @@ from tools.log import Color, debug, log
 from tools.util import (
     get_pkg_post_install,
     get_pkg_subpackages,
-    get_pkg_version,
     pkg_install_spec,
+    pkg_spec_full,
+    pkg_state_entry,
     run_command,
     version_changed,
 )
@@ -43,8 +44,20 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
         state.setdefault("npm", {})["packages"] = {}
     state_packages = set(state.get("npm", {}).get("packages", {}).keys())
 
+    # Fail with a clear message instead of a KeyError traceback when the
+    # paths a reconcile would need are not configured.
+    if desired or state_packages:
+        missing = [k for k in ("nodejs", "npmBin") if not paths.get(k)]
+        if missing:
+            log(
+                "npm: required paths missing "
+                f"({', '.join('paths.' + k for k in missing)}), cannot reconcile",
+                Color.RED,
+            )
+            return False
+
     env = os.environ.copy()
-    env["PATH"] = f"{paths['nodejs']}:{env.get('PATH', '')}"
+    env["PATH"] = f"{paths.get('nodejs', '')}:{env.get('PATH', '')}"
 
     state_changed = False
     success = True
@@ -69,16 +82,23 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
 
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
+    to_install_names = []
     for pkg, pkg_info in packages.items():
         if pkg not in state_packages or version_changed(pkg, pkg_info, state, "npm"):
-            to_install.append(pkg_install_spec(pkg, get_pkg_version(pkg_info)))
+            to_install.append(pkg_spec_full(pkg, pkg_info))
+            to_install_names.append(pkg)
+    install_failed: set = set()
     if to_install:
         log(f"Installing npm packages: {', '.join(to_install)}", Color.GREEN)
         cmd = [f"{paths['nodejs']}/npm", "install", "-g"] + to_install
         returncode, stdout, stderr = run_command(cmd, env)
         if returncode != 0:
             log(f"Failed to install npm packages: {stderr}", Color.RED)
-            return False
+            # No early return: the removals above already mutated the system,
+            # so state must still be rewritten below or the next run retries
+            # `npm uninstall -g` on packages that are already gone — forever.
+            success = False
+            install_failed = set(to_install_names)
         state_changed = True
 
     if not to_remove and not to_install:
@@ -100,7 +120,7 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
         )
         # Run if: package was just installed, or postInstall command changed,
         # or never ran before
-        just_installed = pkg_install_spec(pkg, get_pkg_version(pkg_info)) in to_install
+        just_installed = pkg in to_install_names and pkg not in install_failed
         if just_installed or post_install != stored_post_install:
             log(f"Running postInstall for {pkg}: {post_install}", Color.GREEN)
             returncode, stdout, stderr = run_command(
@@ -135,7 +155,10 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
         to_install_sub = []
         for sp_name, sp_info in subpkgs.items():
             sp_version = sp_info.get("version", "latest")
-            stored_version = stored_subpkgs.get(sp_name, {}).get("version")
+            # Normalize both sides to "latest": a stored entry without an
+            # explicit version must not read as None and reinstall forever.
+            stored = stored_subpkgs.get(sp_name)
+            stored_version = stored.get("version", "latest") if stored is not None else None
             missing = not (pkg_dir / "node_modules" / sp_name).exists()
             version_diff = sp_version != stored_version
             if missing or version_diff:
@@ -162,17 +185,20 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
     stored_pkgs = state.get("npm", {}).get("packages", {})
     npm_state = dict(failed_removals)
     for pkg, pkg_info in packages.items():
+        if pkg in install_failed:
+            # Not (re)installed: keep the old entry (or none) so the next run
+            # still sees the mismatch and retries.
+            if pkg in stored_pkgs:
+                npm_state[pkg] = stored_pkgs[pkg]
+            continue
         npm_state[pkg] = {
-            "installed": True,
-            "version": get_pkg_version(pkg_info),
+            **pkg_state_entry(pkg_info),
             "subpackages": get_pkg_subpackages(pkg_info),
-            # A failed hook keeps its previously recorded command, so the next
-            # run still sees a mismatch and retries it.
-            "postInstall": (
-                stored_pkgs.get(pkg, {}).get("postInstall", "")
-                if pkg in post_install_failed
-                else get_pkg_post_install(pkg_info)
-            ),
+            # A failed hook records the empty "never ran" marker, so the next
+            # run still sees a mismatch and retries it — keeping the old
+            # command would mask a failure of an *unchanged* hook after a
+            # version update.
+            "postInstall": ("" if pkg in post_install_failed else get_pkg_post_install(pkg_info)),
         }
     if state_changed or npm_state != stored_pkgs:
         state.setdefault("npm", {})["packages"] = npm_state
