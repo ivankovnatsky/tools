@@ -1,7 +1,7 @@
 import json
 import os
 import socket
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 SUPPORTED_SUFFIXES = (".json", ".yaml", ".yml", ".toml")
 
@@ -56,7 +56,7 @@ def _load_raw(path: str) -> Dict[str, Any]:
     raise ValueError(f"Unsupported config file suffix {suffix!r}: {path}")
 
 
-def load_config(path: str, _seen: Optional[Set[str]] = None) -> Dict[str, Any]:
+def load_config(path: str, _seen: Optional[Dict[str, None]] = None) -> Dict[str, Any]:
     """Load a config file and resolve include directives.
 
     If the file contains an ``include:`` key with a list of relative
@@ -69,14 +69,16 @@ def load_config(path: str, _seen: Optional[Set[str]] = None) -> Dict[str, Any]:
     """
     abs_path = os.path.abspath(path)
 
+    # Insertion-ordered dict-as-set: the error message renders the actual
+    # include chain, not an arbitrary set ordering.
     if _seen is None:
-        _seen = set()
+        _seen = {}
     if abs_path in _seen:
         raise ValueError(
             f"Circular include detected: {path} was already included "
             f"(chain: {' -> '.join(_seen)} -> {abs_path})"
         )
-    _seen = _seen | {abs_path}  # copy to avoid cross-branch pollution
+    _seen = {**_seen, abs_path: None}  # copy to avoid cross-branch pollution
 
     data = _load_raw(path)
     if not isinstance(data, dict):
@@ -174,13 +176,15 @@ def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
     )
     for name in top_level:
         loaded = load_config(os.path.join(config_dir, name))
-        if isinstance(loaded, dict):
-            merged = deep_merge(merged, loaded)
+        # Same input, same outcome as the flat layout: reject rather than
+        # silently skip.
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Config file {name} did not produce a mapping at top level")
+        merged = deep_merge(merged, loaded)
 
     # Host config (with includes) merged on top — host values win
-    if host_file:
-        host_config = load_config(host_file)
-        merged = deep_merge(merged, host_config)
+    host_config = load_config(host_file)
+    merged = deep_merge(merged, host_config)
 
     return merged
 
