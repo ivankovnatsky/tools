@@ -54,6 +54,37 @@ def get_pkg_commit(pkg_info: Dict) -> str:
     return pkg_info.get("commit", "")
 
 
+def pkg_spec_full(name: str, pkg_info: Dict) -> str:
+    """Install spec honoring source and commit (npm/bun style `source#commit`).
+
+    `version_changed` compares source and commit, so the install spec must
+    honor them too — otherwise a declared source is silently ignored and the
+    package reinstalls from the registry on every run, never converging.
+    """
+    source = get_pkg_source(pkg_info)
+    commit = get_pkg_commit(pkg_info)
+    if source and commit:
+        return f"{source}#{commit}"
+    return pkg_install_spec(name, get_pkg_version(pkg_info), source)
+
+
+def pkg_state_entry(pkg_info: Dict) -> Dict:
+    """Canonical installed-state entry: version/source(/commit) as declared.
+
+    Everything `version_changed` compares must be persisted, or the
+    comparison sees a permanent mismatch and reinstalls forever.
+    """
+    entry = {
+        "installed": True,
+        "version": get_pkg_version(pkg_info),
+        "source": get_pkg_source(pkg_info),
+    }
+    commit = get_pkg_commit(pkg_info)
+    if commit:
+        entry["commit"] = commit
+    return entry
+
+
 def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
     """Check if declared version, source, or commit differs from state."""
     pkg_state = state.get(manager, {}).get("packages", {}).get(pkg, {})
