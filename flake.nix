@@ -29,7 +29,8 @@
 
         toolsPackage = pkgs.python3Packages.buildPythonApplication {
           pname = "tools";
-          version = "0.1.0";
+          # Read from pyproject.toml so `just bump` has one place to edit.
+          version = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project.version;
           pyproject = true;
 
           src = ./.;
