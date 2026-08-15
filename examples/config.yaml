@@ -53,6 +53,11 @@ uv:
 go:
   packages: {}
 
+# Pi packages are installed with `pi install <source>`.
+# Reconciled via the `pi` CLI.
+pi:
+  packages: {}
+
 mcp:
   servers: {}
 
