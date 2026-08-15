@@ -42,6 +42,19 @@ class DeployGatingTest(unittest.TestCase):
 
         npm.assert_not_called()
 
+    def test_pi_runs_when_state_has_packages(self):
+        state = {"pi": {"packages": {"x": {"installed": True}}}}
+        with mock.patch.object(cli, "install_pi_packages", return_value=True) as pi_mock:
+            self._deploy({}, state)
+
+        pi_mock.assert_called_once()
+
+    def test_pi_skipped_when_nothing_configured_or_tracked(self):
+        with mock.patch.object(cli, "install_pi_packages", return_value=True) as pi_mock:
+            self._deploy({}, {})
+
+        pi_mock.assert_not_called()
+
     def test_git_repos_runs_when_only_state_remains(self):
         # Dropping the last entry from config must still reconcile, or the
         # state is orphaned and cleanup never happens.
