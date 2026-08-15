@@ -22,6 +22,7 @@ ALL_SECTIONS = (
     "npm",
     "uv",
     "go",
+    "pi",
     "mcp",
     "curlShell",
     "gitRepos",
@@ -120,6 +121,25 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
     # Go has no uninstall; dropping a package leaves its binary in $GOBIN.
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - drop {pkg} (binary remains in $GOBIN)")
+
+    return changes
+
+
+def _diff_pi(packages: Dict, paths: Dict, state: Dict):
+    changes = []
+    desired = set(packages.keys())
+    state_packages = set(state.get("pi", {}).get("packages", {}).keys())
+
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - remove {pkg}")
+
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            source = get_pkg_source(pkg_info)
+            spec = source if source else pkg
+            changes.append(f"  + install {spec}")
+        elif version_changed(pkg, pkg_info, state, "pi"):
+            changes.append(f"  ~ update {pkg}")
 
     return changes
 
@@ -374,6 +394,12 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
             changes = _diff_go(config.get("go", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("go", changes))
+
+    if "pi" in active:
+        if config.get("pi", {}).get("packages") or state.get("pi", {}).get("packages"):
+            changes = _diff_pi(config.get("pi", {}).get("packages", {}), paths, state)
+            if changes:
+                sections.append(("pi", changes))
 
     if "mcp" in active:
         changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)
