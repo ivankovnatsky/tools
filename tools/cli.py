@@ -17,6 +17,7 @@ from tools.user.go import install_go_packages
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
+from tools.user.pi import install_pi_packages
 from tools.user.uv import install_uv_packages
 
 
@@ -113,6 +114,11 @@ def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, activ
         go_state = state.get("go", {})
         if go_packages or go_state.get("packages"):
             success &= install_go_packages(go_packages, paths, state)
+
+    if "pi" in active:
+        pi_packages = config.get("pi", {}).get("packages", {})
+        if pi_packages or state.get("pi", {}).get("packages"):
+            success &= install_pi_packages(pi_packages, paths, state)
 
     if "mcp" in active:
         mcp_servers = config.get("mcp", {}).get("servers", {})
