@@ -10,6 +10,8 @@ from tools.log import Color, log
 from tools.user.brew import _normalize_tap
 from tools.user.flatpak import diff_flatpak
 from tools.user.ollama_models import diff_ollama_models
+from tools.user.skills import diff_skills
+from tools.user.skills import has_work as skills_has_work
 from tools.util import (
     format_diff_bytes,
     get_pkg_source,
@@ -27,6 +29,7 @@ ALL_SECTIONS = (
     "curlShell",
     "gitRepos",
     "files",
+    "skills",
     "brew",
     "ollamaModels",
     "flatpak",
@@ -427,6 +430,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = _diff_files(config.get("files", []) or [], config_dir, state)
         if changes:
             sections.append(("files", changes))
+
+    if "skills" in active and skills_has_work(config.get("skills") or {}, state):
+        changes = diff_skills(config.get("skills") or {}, config_dir, state)
+        if changes:
+            sections.append(("skills", changes))
 
     if "brew" in active:
         brew_subsections = _diff_brew(config.get("brew", {}), state)
