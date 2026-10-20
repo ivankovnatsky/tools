@@ -5,8 +5,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tools.system_paths import system_bin
 from tools.user import skills
+
+GIT = shutil.which("git")
 
 
 def _write(path, content="x"):
@@ -270,11 +271,11 @@ class ReviewRegressionTest(SkillsTestBase):
         self.assertFalse(any(c.startswith("  - remove") for c in self.diff(cfg)))
 
 
-@unittest.skipUnless(os.path.exists(system_bin("git")), "system git not available")
+@unittest.skipUnless(GIT, "git not available")
 class GitSourceTest(SkillsTestBase):
     def _git(self, *args):
         subprocess.run(
-            ["git", "-C", self.repo, *args],
+            [GIT, "-C", self.repo, *args],
             check=True,
             capture_output=True,
             env={
@@ -288,6 +289,10 @@ class GitSourceTest(SkillsTestBase):
 
     def setUp(self):
         super().setUp()
+        for name, value in (("system_bin", GIT), ("system_dir", os.path.dirname(GIT))):
+            patcher = mock.patch.object(skills, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.repo = os.path.join(self.tmp, "upstream")
         _make_skill(os.path.join(self.repo, "skills"), "pdf", "v1")
         os.makedirs(self.repo, exist_ok=True)
