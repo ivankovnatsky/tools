@@ -77,6 +77,25 @@ class DeployGatingTest(unittest.TestCase):
             self.assertFalse(self._deploy({}, state))
 
 
+class SkillsGatingTest(unittest.TestCase):
+    def _deploy(self, config, state):
+        with (
+            mock.patch.object(cli, "load_json", return_value=state),
+            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "install_skills", return_value=True) as install,
+        ):
+            cli._deploy(config, "/tmp")
+        return install
+
+    def test_skills_skipped_when_nothing_configured_or_tracked(self):
+        self._deploy({}, {}).assert_not_called()
+
+    def test_skills_run_when_only_state_remains(self):
+        state = {"skills": {"installed": {"/x/pdf": {"skill": "a/pdf", "hash": "h"}}}}
+        self._deploy({}, state).assert_called_once()
+
+
 class DeployCleanDiffTest(unittest.TestCase):
     """A clean diff means nothing approval-worthy — not nothing to do.
     Non-destructive maintenance (git pulls) must run on every deploy, not
