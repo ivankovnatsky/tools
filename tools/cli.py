@@ -18,6 +18,8 @@ from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
 from tools.user.pi import install_pi_packages
+from tools.user.skills import has_work as skills_has_work
+from tools.user.skills import install_skills
 from tools.user.uv import install_uv_packages
 
 
@@ -141,6 +143,11 @@ def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, activ
 
     if "files" in active:
         success &= install_files(config.get("files", []) or [], config_dir, state)
+
+    # Gated on state too, like gitRepos: dropping the whole section must
+    # still reach the reconciler so it can remove what it installed.
+    if "skills" in active and skills_has_work(config.get("skills") or {}, state):
+        success &= install_skills(config.get("skills") or {}, config_dir, state)
 
     if "brew" in active:
         success &= install_brew_packages(config.get("brew", {}), state)
