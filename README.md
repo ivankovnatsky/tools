@@ -27,7 +27,7 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`files`, `brew`, `ollamaModels`, `flatpak`.
+`files`, `skills`, `brew`, `ollamaModels`, `flatpak`.
 
 ## Config
 
@@ -56,6 +56,41 @@ Notable keys:
   `{dir, mode?, secrets?}`. `mode` must be a **quoted octal string** (`"0644"`);
   bare YAML ints are rejected as ambiguous. `secrets: true` suppresses inline
   content diffs for that entry.
+
+## Skills
+
+`skills:` installs [Agent Skills](https://agentskills.io) (directories
+containing `SKILL.md`) from git repos or local directories into every agent's
+skills directory:
+
+```yaml
+skills:
+  sources:
+    anthropic:
+      url: https://github.com/anthropics/skills
+      ref: main          # optional branch, tag or commit
+      subdir: skills     # optional
+    mine:
+      path: ./skills     # relative to the first --config path
+  targets: [~/.claude/skills, ~/.codex/skills, ~/.agents/skills]
+  enable:
+    - anthropic/pdf
+    - mine/*             # every skill in a source
+    - skill: mine/claw-only
+      targets: [~/.openclaw-skills]   # only here
+      as: claw                        # optional install name
+```
+
+- Skill IDs are `<source>/<path to the dir holding SKILL.md>`; nested skills
+  install flat as `<target>/<last path segment>/`.
+- Git sources are cloned into `cacheDir` (default `~/.cache/tools/skills`),
+  which tools owns outright. `diff` never touches the network: it previews
+  first fetches and url/ref changes, while new upstream commits on an
+  unchanged ref land on the next deploy, like `gitRepos` pulls.
+- Ownership follows `files:`. An existing directory tools did not create is
+  never overwritten, a copy modified since tools wrote it is neither updated
+  nor removed, and removals only run when every source fetched and every
+  entry resolved.
 
 ## State and ownership
 
