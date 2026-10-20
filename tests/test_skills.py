@@ -8,6 +8,7 @@ from unittest import mock
 from tools.user import skills
 
 GIT = shutil.which("git")
+GIT_BIN = GIT or "/usr/bin/git"
 
 
 def _write(path, content="x"):
@@ -32,6 +33,10 @@ class SkillsTestBase(unittest.TestCase):
         _make_skill(self.src, "pdf")
         _make_skill(self.src, "nested/xlsx")
         self.state = {}
+        for name, value in (("system_bin", GIT_BIN), ("system_dir", os.path.dirname(GIT_BIN))):
+            patcher = mock.patch.object(skills, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -289,10 +294,6 @@ class GitSourceTest(SkillsTestBase):
 
     def setUp(self):
         super().setUp()
-        for name, value in (("system_bin", GIT), ("system_dir", os.path.dirname(GIT))):
-            patcher = mock.patch.object(skills, name, return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
         self.repo = os.path.join(self.tmp, "upstream")
         _make_skill(os.path.join(self.repo, "skills"), "pdf", "v1")
         os.makedirs(self.repo, exist_ok=True)
