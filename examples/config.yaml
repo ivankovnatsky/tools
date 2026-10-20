@@ -65,6 +65,17 @@ curlShell: {}
 
 gitRepos: {}
 
+# Agent Skills (dirs with SKILL.md) from git repos or local dirs, copied to
+# each target as <target>/<name>/. See README "Skills" for the full shape.
+skills:
+  sources:
+    anthropic:
+      url: https://github.com/anthropics/skills
+      subdir: skills
+  targets:
+    - ~/.claude/skills
+  enable: []
+
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.
 flatpak:
