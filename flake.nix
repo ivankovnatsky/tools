@@ -61,6 +61,7 @@
 
         checks.default = toolsPackage.overridePythonAttrs (_: {
           doCheck = true;
+          nativeCheckInputs = [ pkgs.git ];
           checkPhase = ''
             runHook preCheck
             python -m unittest discover -s tests -v
