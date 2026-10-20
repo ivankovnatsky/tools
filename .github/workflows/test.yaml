@@ -15,7 +15,7 @@ jobs:
     # its platform-gated paths never execute on ubuntu.
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-26.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -25,7 +25,7 @@ jobs:
   lint:
     # ruff's result depends on neither the OS nor the interpreter version,
     # so one job is enough.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
