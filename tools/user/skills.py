@@ -137,9 +137,13 @@ def _source_base(name: str, source: Dict, cache_dir: str, config_dir: str) -> st
     return os.path.join(cache_dir, name)
 
 
+def _subdir(source: Dict) -> str:
+    return os.path.normpath(str(source.get("subdir") or "."))
+
+
 def source_root(name: str, source: Dict, cache_dir: str, config_dir: str) -> str:
     base = _source_base(name, source, cache_dir, config_dir)
-    return os.path.normpath(os.path.join(base, str(source.get("subdir") or ".")))
+    return os.path.normpath(os.path.join(base, _subdir(source)))
 
 
 def validate_sources(sources: Dict) -> List[str]:
@@ -160,7 +164,7 @@ def validate_sources(sources: Dict) -> List[str]:
         for key in ("url", "ref"):
             if str(source.get(key) or "").startswith("-"):
                 errors.append(f"source {name!r}: {key} must not start with '-'")
-        subdir = str(source.get("subdir") or ".")
+        subdir = _subdir(source)
         if os.path.isabs(subdir) or ".." in subdir.replace("\\", "/").split("/"):
             errors.append(f"source {name!r}: subdir must be relative without '..'")
     return errors
@@ -250,6 +254,9 @@ def resolve(
                     catalogs[source_name] = {}
                     continue
                 catalogs[source_name] = None  # not fetched yet
+            elif source.get("url") and not os.path.isdir(root):
+                # Outside the sparse cone until the next sync re-sparses it.
+                catalogs[source_name] = None
             elif not os.path.isdir(root):
                 errors.append(f"source {source_name!r}: directory not found: {root}")
                 catalogs[source_name] = {}
@@ -314,6 +321,25 @@ def _git_env() -> Dict[str, str]:
     return env
 
 
+def _sync_sparse(git: str, dest: str, subdir: str, env: Dict[str, str]) -> Optional[str]:
+    """Limit the checkout to subdir; a no-op when the cone already matches.
+
+    Returns an error message, or None on success.
+    """
+    rc, out, _ = run_command([git, "-C", dest, "sparse-checkout", "list"], env)
+    current = out.splitlines() if rc == 0 else None  # None: not sparse
+    if subdir == ".":
+        if current is None:
+            return None
+        cmd = [git, "-C", dest, "sparse-checkout", "disable"]
+    else:
+        if current == [subdir]:
+            return None
+        cmd = [git, "-C", dest, "sparse-checkout", "set", "--cone", "--", subdir]
+    rc, _, err = run_command(cmd, env)
+    return err.strip() or "failed" if rc != 0 else None
+
+
 def sync_git_source(name: str, source: Dict, cache_dir: str) -> bool:
     """Clone or fetch a git source into the cache and check out its ref."""
     git = system_bin("git")
@@ -339,10 +365,22 @@ def sync_git_source(name: str, source: Dict, cache_dir: str) -> bool:
             return False
         os.makedirs(cache_dir, exist_ok=True)
         log(f"skills: cloning {url} -> {dest}", Color.GREEN)
-        rc, _, err = run_command([git, "clone", "--quiet", "--", url, dest], env)
+        # Blobless and unchecked-out: where the server supports partial
+        # clone, only the blobs under subdir are downloaded, when the sparse
+        # checkout below materializes them. History stays complete, so any
+        # ref or commit hash still resolves.
+        rc, _, err = run_command(
+            [git, "clone", "--quiet", "--filter=blob:none", "--no-checkout", "--", url, dest],
+            env,
+        )
         if rc != 0:
             log(f"skills: failed to clone {name}: {err.strip()}", Color.RED)
             return False
+
+    err = _sync_sparse(git, dest, _subdir(source), env)
+    if err:
+        log(f"skills: {name}: cannot set sparse checkout: {err}", Color.RED)
+        return False
 
     # Resolve to a commit first: a bare `git checkout <name>` that is not a
     # revision is taken as a pathspec and succeeds without moving HEAD. A
@@ -477,7 +515,7 @@ def _from_source(skill_id: str, names) -> bool:
 
 
 def _source_fingerprint(source: Dict) -> Dict:
-    return {"url": source.get("url"), "ref": source.get("ref")}
+    return {"url": source.get("url"), "ref": source.get("ref"), "subdir": _subdir(source)}
 
 
 # --------------------------------------------------------------------------
@@ -598,7 +636,7 @@ def diff_skills(skills_config: Dict, config_dir: str, state: Dict) -> List[str]:
         if not _is_checkout(path):
             changes.append(f"  + fetch {name} ({source['url']})")
         elif cached.get(name) != _source_fingerprint(source):
-            changes.append(f"  ~ refetch {name} (url or ref changed)")
+            changes.append(f"  ~ refetch {name} (url, ref or subdir changed)")
 
     p = plan(skills_config, config_dir, state)
     changes += [f"  ! {err}" for err in p["errors"]]
