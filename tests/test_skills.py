@@ -317,12 +317,49 @@ class GitSourceTest(SkillsTestBase):
         self.assertTrue(self.deploy(self.git_config()))
         self.assertEqual(self.read_installed(), "v2")
 
+    def test_clone_checks_out_only_subdir(self):
+        _write(os.path.join(self.repo, "other", "big.bin"), "x")
+        self._git("add", "-A")
+        self._git("commit", "-q", "--no-gpg-sign", "-m", "other")
+
+        self.assertTrue(self.deploy(self.git_config()))
+        self.assertTrue(os.path.isdir(os.path.join(self.cache, "up", "skills")))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, "up", "other")))
+
+    def test_subdir_change_is_previewed_and_applied(self):
+        _make_skill(os.path.join(self.repo, "agents"), "xlsx", "a1")
+        self._git("add", "-A")
+        self._git("commit", "-q", "--no-gpg-sign", "-m", "agents")
+        self.assertTrue(self.deploy(self.git_config()))
+
+        moved = self.git_config(subdir="agents")
+        moved["enable"] = ["up/xlsx"]
+        changes = self.diff(moved)
+        self.assertIn("  ~ refetch up (url, ref or subdir changed)", changes)
+        self.assertFalse([c for c in changes if c.startswith("  !")], changes)
+
+        self.assertTrue(self.deploy(moved))
+        self.assertTrue(os.path.isfile(os.path.join(self.t1, "xlsx", "SKILL.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.t1, "pdf")))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, "up", "skills")))
+
+    def test_dropping_subdir_checks_out_everything(self):
+        _write(os.path.join(self.repo, "other", "big.bin"), "x")
+        self._git("add", "-A")
+        self._git("commit", "-q", "--no-gpg-sign", "-m", "other")
+        self.assertTrue(self.deploy(self.git_config()))
+
+        cfg = self.git_config(subdir=None)
+        cfg["enable"] = ["up/skills/pdf"]
+        self.assertTrue(self.deploy(cfg))
+        self.assertTrue(os.path.isfile(os.path.join(self.cache, "up", "other", "big.bin")))
+
     def test_ref_pins_and_ref_change_is_previewed(self):
         self.assertTrue(self.deploy(self.git_config(ref="v1")))
         self.assertEqual(self.read_installed(), "v1")
 
         moved = self.git_config(ref="main")
-        self.assertIn("  ~ refetch up (url or ref changed)", self.diff(moved))
+        self.assertIn("  ~ refetch up (url, ref or subdir changed)", self.diff(moved))
         self.assertTrue(self.deploy(moved))
         self.assertEqual(self.read_installed(), "v2")
 
