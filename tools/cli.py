@@ -14,6 +14,8 @@ from tools.user.files import install_files
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
 from tools.user.go import install_go_packages
+from tools.user.links import has_work as links_has_work
+from tools.user.links import install_links
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
@@ -148,6 +150,10 @@ def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, activ
     # still reach the reconciler so it can remove what it installed.
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
         success &= install_skills(config.get("skills") or {}, config_dir, state)
+
+    # After skills, so links into freshly installed skill dirs find their source.
+    if "links" in active and links_has_work(config.get("links") or [], state):
+        success &= install_links(config.get("links") or [], state)
 
     if "brew" in active:
         success &= install_brew_packages(config.get("brew", {}), state)
