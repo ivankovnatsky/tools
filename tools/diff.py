@@ -9,6 +9,8 @@ from typing import Dict, List
 from tools.log import Color, log
 from tools.user.brew import _normalize_tap
 from tools.user.flatpak import diff_flatpak
+from tools.user.links import diff_links
+from tools.user.links import has_work as links_has_work
 from tools.user.ollama_models import diff_ollama_models
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
@@ -30,6 +32,7 @@ ALL_SECTIONS = (
     "gitRepos",
     "files",
     "skills",
+    "links",
     "brew",
     "ollamaModels",
     "flatpak",
@@ -435,6 +438,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = diff_skills(config.get("skills") or {}, config_dir, state)
         if changes:
             sections.append(("skills", changes))
+
+    if "links" in active and links_has_work(config.get("links") or [], state):
+        changes = diff_links(config.get("links") or [], state)
+        if changes:
+            sections.append(("links", changes))
 
     if "brew" in active:
         brew_subsections = _diff_brew(config.get("brew", {}), state)
