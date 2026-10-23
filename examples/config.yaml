@@ -66,15 +66,21 @@ curlShell: {}
 gitRepos: {}
 
 # Agent Skills (dirs with SKILL.md) from git repos or local dirs, copied to
-# each target as <target>/<name>/. See README "Skills" for the full shape.
+# each target as <target>/<name>/ and symlinked into each linkTarget. See
+# README "Skills" for the full shape.
 skills:
   sources:
     anthropic:
       url: https://github.com/anthropics/skills
       subdir: skills
   targets:
+    - ~/.agents/skills
+  linkTargets:
     - ~/.claude/skills
   enable: []
+
+# Symlinks: target is the link, source is what it points at. See README "Links".
+links: []
 
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.
