@@ -276,6 +276,220 @@ class ReviewRegressionTest(SkillsTestBase):
         self.assertFalse(any(c.startswith("  - remove") for c in self.diff(cfg)))
 
 
+class LinkTargetsTest(SkillsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.agents = os.path.join(self.tmp, "home", ".agents", "skills")
+
+    def link_config(self, enable, **extra):
+        return self.config(enable, targets=[self.agents], linkTargets=[self.t1], **extra)
+
+    def assertLinked(self, link, copy):
+        self.assertTrue(os.path.islink(link), link)
+        self.assertEqual(os.readlink(link), copy)
+
+    def test_links_to_copy_and_is_idempotent(self):
+        cfg = self.link_config(["mine/pdf"])
+        link, copy = os.path.join(self.t1, "pdf"), os.path.join(self.agents, "pdf")
+
+        self.assertEqual(
+            self.diff(cfg),
+            [f"  + install mine/pdf -> {copy}", f"  + link mine/pdf: {link} -> {copy}"],
+        )
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertLinked(link, copy)
+        self.assertEqual(self.state["skills"]["links"][link], {"skill": "mine/pdf", "source": copy})
+        self.assertNotIn(link, self.state["skills"]["installed"])
+        self.assertEqual(self.diff(cfg), [])
+
+    def test_glob_source_links_every_skill(self):
+        self.assertTrue(self.deploy(self.link_config(["mine/*"])))
+
+        for name in ("pdf", "xlsx"):
+            self.assertLinked(os.path.join(self.t1, name), os.path.join(self.agents, name))
+
+    def test_existing_link_to_copy_is_adopted(self):
+        self.deploy(self.config(["mine/pdf"], targets=[self.agents]))
+        link = os.path.join(self.t1, "pdf")
+        os.makedirs(self.t1)
+        os.symlink("../../.agents/skills/pdf", link)
+        cfg = self.link_config(["mine/pdf"])
+
+        self.assertEqual(self.diff(cfg), [])
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertEqual(os.readlink(link), "../../.agents/skills/pdf")
+        self.assertIn(link, self.state["skills"]["links"])
+
+    def test_foreign_link_and_dir_are_skipped(self):
+        os.makedirs(self.t1)
+        os.symlink(self.tmp, os.path.join(self.t1, "pdf"))
+        _write(os.path.join(self.t1, "xlsx", "SKILL.md"), "hand-made")
+        cfg = self.link_config(["mine/*"])
+
+        changes = self.diff(cfg)
+        self.assertIn(
+            f"  ! skip {self.t1}/pdf: symlink to {self.tmp} not managed by tools", changes
+        )
+        self.assertIn(f"  ! skip {self.t1}/xlsx: exists and is not managed by tools", changes)
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertEqual(os.readlink(os.path.join(self.t1, "pdf")), self.tmp)
+        self.assertFalse(os.path.islink(os.path.join(self.t1, "xlsx")))
+        self.assertEqual(self.state["skills"]["links"], {})
+
+    def test_blocked_copy_gets_no_link(self):
+        _write(os.path.join(self.agents, "pdf", "SKILL.md"), "hand-made")
+        cfg = self.link_config(["mine/pdf"])
+
+        self.assertIn(
+            f"  ! skip {self.t1}/pdf: its copy {self.agents}/pdf is skipped", self.diff(cfg)
+        )
+        self.deploy(cfg)
+        self.assertFalse(os.path.lexists(os.path.join(self.t1, "pdf")))
+
+    def test_failed_copy_gets_no_link(self):
+        cfg = self.link_config(["mine/pdf"])
+        with mock.patch.object(skills, "_copy_tree", side_effect=OSError("disk full")):
+            self.assertFalse(self.deploy(cfg))
+
+        self.assertFalse(os.path.lexists(os.path.join(self.t1, "pdf")))
+        self.assertEqual(self.state["skills"]["links"], {})
+
+    def test_copy_target_moved_to_link_targets_replaces_copy(self):
+        self.deploy(self.config(["mine/pdf"], targets=[self.agents, self.t1]))
+        link, copy = os.path.join(self.t1, "pdf"), os.path.join(self.agents, "pdf")
+        cfg = self.link_config(["mine/pdf"])
+
+        self.assertEqual(self.diff(cfg), [f"  ~ replace copy with link mine/pdf: {link} -> {copy}"])
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertLinked(link, copy)
+        self.assertNotIn(link, self.state["skills"]["installed"])
+        self.assertIn(link, self.state["skills"]["links"])
+        self.assertEqual(self.diff(cfg), [])
+
+    def test_modified_copy_is_kept_instead_of_linked(self):
+        self.deploy(self.config(["mine/pdf"], targets=[self.agents, self.t1]))
+        link = os.path.join(self.t1, "pdf")
+        _write(os.path.join(link, "notes.md"), "mine")
+        cfg = self.link_config(["mine/pdf"])
+
+        self.assertEqual(
+            self.diff(cfg), [f"  ! skip {link}: copy modified since tools wrote it; kept"]
+        )
+        self.deploy(cfg)
+
+        self.assertFalse(os.path.islink(link))
+        self.assertTrue(os.path.exists(os.path.join(link, "notes.md")))
+
+    def test_dropped_skill_or_link_target_removes_link(self):
+        self.deploy(self.link_config(["mine/pdf", "mine/nested/xlsx"]))
+
+        cfg = self.link_config(["mine/pdf"])
+        self.assertEqual(
+            self.diff(cfg), [f"  - remove {self.agents}/xlsx", f"  - unlink {self.t1}/xlsx"]
+        )
+        self.assertTrue(self.deploy(cfg))
+        self.assertFalse(os.path.lexists(os.path.join(self.t1, "xlsx")))
+
+        self.assertTrue(self.deploy(self.config(["mine/pdf"], targets=[self.agents])))
+        self.assertFalse(os.path.lexists(os.path.join(self.t1, "pdf")))
+        self.assertTrue(os.path.isdir(os.path.join(self.agents, "pdf")))
+        self.assertEqual(self.state["skills"]["links"], {})
+
+    def test_repointed_link_is_left_in_place(self):
+        self.deploy(self.link_config(["mine/pdf"]))
+        link = os.path.join(self.t1, "pdf")
+        os.remove(link)
+        os.symlink(self.tmp, link)
+
+        self.assertTrue(self.deploy(self.config(["mine/pdf"], targets=[self.agents])))
+        self.assertEqual(os.readlink(link), self.tmp)
+
+    def test_errors_hold_link_removal_and_replacement(self):
+        xlsx_copies = {"skill": "mine/nested/xlsx", "targets": [self.agents, self.t1]}
+        self.deploy(self.link_config(["mine/pdf", {**xlsx_copies, "linkTargets": []}]))
+        cfg = self.link_config(["mine/nested/xlsx", "mine/typo"])
+
+        changes = self.diff(cfg)
+        self.assertFalse([c for c in changes if c.startswith(("  ~ replace", "  - "))], changes)
+        self.assertFalse(self.deploy(cfg))
+
+        self.assertTrue(os.path.islink(os.path.join(self.t1, "pdf")))
+        self.assertFalse(os.path.islink(os.path.join(self.t1, "xlsx")))
+
+    def test_per_entry_link_targets(self):
+        other = os.path.join(self.tmp, "home", ".pi", "skills")
+        claw = os.path.join(self.tmp, "home", "claw")
+        cfg = self.link_config(
+            [
+                {"skill": "mine/pdf", "linkTargets": [other]},
+                {"skill": "mine/nested/xlsx", "targets": [claw, self.agents]},
+            ]
+        )
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertLinked(os.path.join(other, "pdf"), os.path.join(self.agents, "pdf"))
+        self.assertFalse(os.path.lexists(os.path.join(self.t1, "pdf")))
+        self.assertLinked(os.path.join(self.t1, "xlsx"), os.path.join(claw, "xlsx"))
+
+    def test_path_both_copy_and_link_is_an_error(self):
+        cfg = self.config(["mine/pdf"], targets=[self.agents, self.t1], linkTargets=[self.t1])
+
+        self.assertIn(f"  ! {self.t1}/pdf: both a copy target and a link target", self.diff(cfg))
+        self.assertFalse(self.deploy(cfg))
+        self.assertFalse(os.path.islink(os.path.join(self.t1, "pdf")))
+
+    def test_link_targets_moved_back_to_targets_replaces_link(self):
+        self.deploy(self.link_config(["mine/pdf"]))
+        cfg = self.config(["mine/pdf"], targets=[self.agents, self.t1])
+
+        self.assertEqual(self.diff(cfg), [f"  + install mine/pdf -> {self.t1}/pdf"])
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertTrue(os.path.isfile(os.path.join(self.t1, "pdf", "SKILL.md")))
+        self.assertFalse(os.path.islink(os.path.join(self.t1, "pdf")))
+        self.assertEqual(self.state["skills"]["links"], {})
+
+    def test_old_copy_kept_while_link_cannot_move(self):
+        self.deploy(self.link_config(["mine/pdf"]))
+        new_home = os.path.join(self.tmp, "home", "new")
+        _write(os.path.join(new_home, "pdf", "SKILL.md"), "hand-made")
+        cfg = self.config(["mine/pdf"], targets=[new_home], linkTargets=[self.t1])
+
+        self.assertNotIn(f"  - remove {self.agents}/pdf", self.diff(cfg))
+        self.deploy(cfg)
+
+        self.assertTrue(os.path.exists(os.path.join(self.t1, "pdf", "SKILL.md")))
+
+    def test_link_never_points_at_another_skills_copy(self):
+        _make_skill(self.src, "other/pdf")
+        other = os.path.join(self.tmp, "home", ".pi", "skills")
+        cfg = self.link_config(["mine/pdf", {"skill": "mine/other/pdf", "linkTargets": [other]}])
+
+        self.assertFalse(self.deploy(cfg))
+        self.assertFalse(os.path.lexists(os.path.join(other, "pdf")))
+
+    def test_link_owned_by_links_section_is_skipped(self):
+        self.deploy(self.config(["mine/pdf"], targets=[self.agents]))
+        link = os.path.join(self.t1, "pdf")
+        os.makedirs(self.t1)
+        os.symlink(os.path.join(self.agents, "pdf"), link)
+        self.state["links"] = {"installed": {link: {"source": os.path.join(self.agents, "pdf")}}}
+        cfg = self.link_config(["mine/pdf"])
+
+        self.assertEqual(self.diff(cfg), [f"  ! skip {link}: managed by the links section"])
+        self.assertTrue(self.deploy(cfg))
+        self.assertEqual(self.state["skills"]["links"], {})
+
+    def test_malformed_link_state_entry_does_not_crash(self):
+        self.state["skills"] = {"links": {os.path.join(self.t1, "pdf"): "junk"}}
+        self.assertTrue(self.deploy(self.link_config(["mine/pdf"])))
+        self.assertLinked(os.path.join(self.t1, "pdf"), os.path.join(self.agents, "pdf"))
+
+
 @unittest.skipUnless(GIT, "git not available")
 class GitSourceTest(SkillsTestBase):
     def _git(self, *args):
