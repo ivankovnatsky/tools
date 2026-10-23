@@ -27,7 +27,7 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`files`, `skills`, `brew`, `ollamaModels`, `flatpak`.
+`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`.
 
 ## Config
 
@@ -72,12 +72,14 @@ skills:
       subdir: skills     # optional
     mine:
       path: ./skills     # relative to the first --config path
-  targets: [~/.claude/skills, ~/.codex/skills, ~/.agents/skills]
+  targets: [~/.agents/skills, ~/.codex/skills]   # copies
+  linkTargets: [~/.claude/skills]                 # symlinks to the first copy
   enable:
     - anthropic/pdf
     - mine/*             # every skill in a source
     - skill: mine/claw-only
       targets: [~/.openclaw-skills]   # only here
+      linkTargets: []                 # no links
       as: claw                        # optional install name
 ```
 
@@ -91,6 +93,33 @@ skills:
   never overwritten, a copy modified since tools wrote it is neither updated
   nor removed, and removals only run when every source fetched and every
   entry resolved.
+- `linkTargets` get `<linkTarget>/<name>` as an absolute symlink to the
+  skill's copy in its first target, made only once that copy is in place.
+  Links follow `links:` ownership: foreign files and symlinks are skipped, a
+  symlink already pointing at the copy is adopted. A path cannot be both a copy
+  and a link.
+- Moving a dir from `targets` to `linkTargets` replaces each unmodified copy
+  there with a link in one deploy; a modified copy is kept and not linked. The
+  reverse move replaces the links with copies.
+- A path tracked by `links:` is skipped here, and the other way round.
+
+## Links
+
+`links:` manages symlinks:
+
+```yaml
+links:
+  - source: ~/.agents/skills/jira   # what the link points at
+    target: ~/.claude/skills/jira   # the symlink to create
+```
+
+- `~` and `$VARS` expand; both paths must be absolute afterwards and each
+  target may appear once. Links get absolute targets; parent dirs are created.
+- An existing file, directory or foreign symlink is never replaced. A symlink
+  already pointing at the source (relative or absolute) is adopted silently.
+- A missing source is skipped with a warning, so no dangling link is made.
+- A tracked link is repointed or removed only while it still points where
+  tools left it, and removals are held while any entry is invalid.
 
 ## State and ownership
 
