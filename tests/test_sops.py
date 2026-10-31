@@ -1,0 +1,739 @@
+import contextlib
+import errno
+import io
+import json
+import os
+import stat
+import tempfile
+import unittest
+from unittest import mock
+
+from tools import fsutil
+from tools.placeholders import PlaceholderError
+from tools.user import secrets_flow, sops
+
+SECRET_VALUE = "hunter2-very-secret"
+
+
+class FakeSops:
+    """Stands in for the sops binary: {file: decrypted document}."""
+
+    def __init__(self, docs, fail=()):
+        self.docs = docs
+        self.fail = set(fail)
+        self.calls = []
+
+    def __call__(self, cmd, env):
+        self.calls.append((list(cmd), dict(env)))
+        path = cmd[-1]
+        if path in self.fail:
+            return 128, b"", "Failed to get the data key required to decrypt the SOPS file.\n"
+        doc = self.docs[path]
+        if "--output-type" in cmd:
+            return 0, json.dumps(doc).encode(), ""
+        return 0, doc if isinstance(doc, bytes) else json.dumps(doc).encode(), ""
+
+
+class SopsTestBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.realpath(self._tmp.name)
+        self.secrets_dir = os.path.join(self.tmp, "state", "secrets")
+        self.main = os.path.join(self.tmp, "cfg", "secrets.yaml")
+        self.other = os.path.join(self.tmp, "cfg", "other.yaml")
+        self.whole = os.path.join(self.tmp, "cfg", "ssh.bin")
+        for p in (self.main, self.other, self.whole):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write("ENC[...]")
+        self.fake = FakeSops(
+            {
+                self.main: {
+                    "externalDomain": "example.test",
+                    "nextDNS": {"IPs": ["192.0.2.1", "192.0.2.2"]},
+                    "token": SECRET_VALUE,
+                    "port": 5432,
+                    "flag": True,
+                },
+                self.other: {"cloudflare": {"apiToken": "cf-" + SECRET_VALUE}},
+                self.whole: b"-----BEGIN KEY-----\nabc\n",
+            }
+        )
+        self.state = {}
+        self.report = secrets_flow.RunReport()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def config(self, secrets, **extra):
+        return {
+            "secretsDir": self.secrets_dir,
+            "defaultSopsFile": self.main,
+            "age": {"keyFile": os.path.join(self.tmp, "age.txt")},
+            "binary": "/fake/sops",
+            "secrets": secrets,
+            **extra,
+        }
+
+    def decryptor(self, raw):
+        return sops.Decryptor(sops.parse_sops(raw).settings, runner=self.fake, env={})
+
+    def deploy(self, raw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = secrets_flow.deploy_sops(raw, self.state, self.report, self.decryptor(raw))
+        self.assertNotIn(SECRET_VALUE, out.getvalue())
+        return ok, out.getvalue()
+
+    def diff(self, raw):
+        rows = secrets_flow.diff_sops(raw, self.state, self.decryptor(raw))
+        self.assertNotIn(SECRET_VALUE, "\n".join(rows))
+        return rows
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+
+class ParseTest(unittest.TestCase):
+    def test_defaults_and_errors(self):
+        p = sops.parse_sops(
+            {
+                "secretsDir": "/s",
+                "defaultSopsFile": "/f.yaml",
+                "secrets": {
+                    "a": {"key": "x/y"},
+                    "b": {"key": "x", "mode": 400},
+                    "c": {"generate": {"length": 4}},
+                    "d": {"key": "x", "path": "/s/a"},
+                    "e/../f": {},
+                    "g": {"key": "x", "bogus": 1},
+                },
+            }
+        )
+        self.assertEqual([s.name for s in p.secrets], ["a"])
+        self.assertEqual(p.secrets[0].path, "/s/a")
+        self.assertEqual(p.secrets[0].mode, 0o400)
+        self.assertEqual(p.secrets[0].key, ("x", "y"))
+        self.assertEqual(len(p.errors), 5)
+
+    def test_path_fields_type_checked(self):
+        base = {"secretsDir": "/s", "defaultSopsFile": "/f"}
+        for spec in ({"path": 0}, {"path": ""}, {"sopsFile": 0}, {"sopsFile": ["x"]}):
+            p = sops.parse_sops({**base, "secrets": {"a": {"key": "k", **spec}}})
+            self.assertEqual(p.secrets, [], spec)
+            self.assertIn("must be a non-empty path string", p.errors[0])
+
+    def test_invalid_settings_drop_every_secret(self):
+        for extra in (
+            {"secretsDir": 0},
+            {"defaultSopsFile": 1},
+            {"binary": ""},
+            {"age": {"keyFile": 5}},
+        ):
+            raw = {"secretsDir": "/s", "defaultSopsFile": "/f", "secrets": {"a": {"key": "k"}}}
+            p = sops.parse_sops({**raw, **extra})
+            self.assertEqual(p.secrets, [], extra)
+            self.assertIn("non-empty path string", p.errors[-1])
+
+    def test_missing_sops_file_is_error(self):
+        p = sops.parse_sops({"secrets": {"a": {"key": "k"}}})
+        self.assertIn("no sopsFile", p.errors[0])
+
+    def test_only_missing_or_null_is_absent(self):
+        base = {"secretsDir": "/s", "defaultSopsFile": "/f"}
+        p = sops.parse_sops({**base, "age": None, "secrets": None})
+        self.assertEqual((p.secrets, p.errors), ([], []))
+        p = sops.parse_sops({**base, "secrets": {"a": {"key": "k", "restartUnits": None}}})
+        self.assertEqual((p.secrets[0].notify, p.errors), ((), []))
+        for age in ([], "", 0, False):
+            p = sops.parse_sops({**base, "age": age, "secrets": {"a": {"key": "k"}}})
+            self.assertEqual(p.secrets, [], age)
+            self.assertIn("age must be a mapping", p.errors[-1])
+        for secrets in ([], "", 0, False):
+            p = sops.parse_sops({**base, "secrets": secrets})
+            self.assertIn("secrets must be a mapping", p.errors[-1], secrets)
+        for notify in ("", 0, False, {}):
+            p = sops.parse_sops({**base, "secrets": {"a": {"key": "k", "restartUnits": notify}}})
+            self.assertEqual(p.secrets, [], notify)
+            self.assertIn("restartUnits must be a list of strings", p.errors[-1])
+
+    def test_any_present_section_has_work(self):
+        for raw in ({"secrets": []}, {"age": "bad"}, {}, {"secrets": {}}):
+            self.assertTrue(sops.has_work(raw, {}), raw)
+        self.assertFalse(sops.has_work(None, {}))
+        rows = secrets_flow.diff_sops({"secrets": []}, {})
+        self.assertIn("secrets must be a mapping", rows[0])
+        rows = secrets_flow.diff_sops({"age": "bad"}, {})
+        self.assertIn("age must be a mapping", rows[0])
+
+    def test_owner_and_group_type_checked(self):
+        base = {"secretsDir": "/s", "defaultSopsFile": "/f"}
+        for key, bad in (("owner", False), ("group", True), ("owner", -1), ("owner", "")):
+            p = sops.parse_sops({**base, "secrets": {"a": {"key": "k", key: bad}}})
+            self.assertEqual(p.secrets, [], (key, bad))
+            self.assertIn(f"{key} must be a user/group name or a non-negative id", p.errors[0])
+        for bad in (False, True, -1):
+            with self.assertRaises(ValueError):
+                fsutil.resolve_uid(bad)
+            with self.assertRaises(ValueError):
+                fsutil.resolve_gid(bad)
+        self.assertEqual(fsutil.resolve_uid(0), 0)
+        self.assertEqual(fsutil.resolve_gid("0"), 0)
+
+    def test_key_name_format_and_ssh_keys_follow_sops_nix(self):
+        base = {"secretsDir": "/s", "defaultSopsFile": "/f"}
+        p = sops.parse_sops(
+            {
+                **base,
+                "secrets": {
+                    "aws/region": {},
+                    "plain": {},
+                    "whole": {"key": ""},
+                    "bin": {"format": "binary"},
+                    "env": {"format": "dotenv", "key": "TOKEN"},
+                },
+            }
+        )
+        self.assertEqual(p.errors, [])
+        by = {s.name: s for s in p.secrets}
+        self.assertEqual(by["aws/region"].key, ("aws", "region"))
+        self.assertEqual(by["aws/region"].path, "/s/aws/region")
+        self.assertEqual(by["plain"].key, ("plain",))
+        self.assertIsNone(by["whole"].key)
+        self.assertIsNone(by["bin"].key)
+        self.assertEqual((by["env"].format, by["plain"].format), ("dotenv", "yaml"))
+        p = sops.parse_sops({**base, "defaultSopsFormat": "json", "secrets": {"a": {}}})
+        self.assertEqual(p.secrets[0].format, "json")
+        for bad in (
+            {"secrets": {"a": {"format": "toml"}}},
+            {"secrets": {"a": {"format": "binary", "key": "x"}}},
+            {"secrets": {"a/../b": {}}},
+            {"secrets": {"/a": {}}},
+            {"defaultSopsFormat": "xml"},
+        ):
+            p = sops.parse_sops({**base, **bad})
+            self.assertEqual(p.secrets, [], bad)
+            self.assertTrue(p.errors, bad)
+        p = sops.parse_sops({**base, "age": {"sshKeyPaths": ["/a", "/b"]}})
+        self.assertIn("at most one path", p.errors[0])
+        p = sops.parse_sops({**base, "age": {"sshKeyFile": "/a"}})
+        self.assertIn("sshKeyPaths", p.errors[0])
+
+    def test_nested_secret_paths_rejected(self):
+        base = {"secretsDir": "/s", "defaultSopsFile": "/f"}
+        p = sops.parse_sops({**base, "secrets": {"a": {}, "a/b": {}}})
+        self.assertEqual([s.name for s in p.secrets], ["a"])
+        self.assertIn("nests with secret a", p.errors[0])
+        p = sops.parse_sops({**base, "secrets": {"x": {"path": "/s/d/f"}, "y": {"path": "/s/d"}}})
+        self.assertIn("nests with secret x", p.errors[0])
+
+    def test_lookup_reports_invalid_config_not_unknown_secret(self):
+        parsed = sops.parse_sops({"age": [], "secrets": {"a": {"key": "k", "sopsFile": "/f"}}})
+        lookup = sops.make_lookup(parsed)
+        with self.assertRaisesRegex(PlaceholderError, "sops config is invalid: age must be"):
+            lookup("a")
+        with self.assertRaises(KeyError):
+            sops.make_lookup(sops.parse_sops({}))("a")
+
+
+class AtomicWriteTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.realpath(self._tmp.name)
+        self.path = os.path.join(self.tmp, "s")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def no_hardlinks(self, err=errno.EPERM):
+        def fail(src, dst):
+            raise OSError(err, os.strerror(err))
+
+        return mock.patch.object(fsutil.os, "link", side_effect=fail)
+
+    def test_exclusive_falls_back_without_hardlinks(self):
+        for err in (errno.EPERM, errno.ENOTSUP, errno.EMLINK):
+            with self.no_hardlinks(err):
+                fsutil.atomic_write(self.path, b"v", 0o400, exclusive=True)
+            with open(self.path, "rb") as f:
+                self.assertEqual(f.read(), b"v")
+            self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o400)
+            self.assertEqual(os.listdir(self.tmp), ["s"])
+            os.remove(self.path)
+
+    def test_exclusive_fallback_still_refuses_existing(self):
+        with open(self.path, "w") as f:
+            f.write("old")
+        with self.no_hardlinks(), self.assertRaises(FileExistsError):
+            fsutil.atomic_write(self.path, b"new", 0o400, exclusive=True)
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "old")
+        self.assertEqual(os.listdir(self.tmp), ["s"])
+
+    def test_other_link_errors_propagate(self):
+        with self.no_hardlinks(errno.EACCES), self.assertRaises(PermissionError):
+            fsutil.atomic_write(self.path, b"v", 0o400, exclusive=True)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_apply_attrs_refuses_symlink(self):
+        pointee = os.path.join(self.tmp, "p")
+        with open(pointee, "w") as f:
+            f.write("v")
+        os.chmod(pointee, 0o644)
+        os.symlink(pointee, self.path)
+        with self.assertRaises(OSError):
+            fsutil.apply_attrs(self.path, 0o400)
+        self.assertEqual(stat.S_IMODE(os.stat(pointee).st_mode), 0o644)
+        fsutil.apply_attrs(pointee, 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(pointee).st_mode), 0o600)
+
+    def test_read_current_does_not_follow_symlink(self):
+        pointee = os.path.join(self.tmp, "p")
+        with open(pointee, "w") as f:
+            f.write("v")
+        os.symlink(pointee, self.path)
+        current = fsutil.read_current(self.path)
+        self.assertTrue(current.exists)
+        self.assertIsNone(current.content)
+        self.assertIn("symlink", current.error)
+        self.assertNotEqual(fsutil.fingerprint(self.path), fsutil.fingerprint(pointee))
+
+    def test_secret_at_unmanaged_symlink_refused(self):
+        pointee = os.path.join(self.tmp, "p")
+        with open(pointee, "w") as f:
+            f.write("v")
+        os.chmod(pointee, 0o644)
+        os.symlink(pointee, self.path)
+        raw = {
+            "binary": "/fake/sops",
+            "secrets": {"s": {"key": "k", "sopsFile": pointee, "path": self.path}},
+        }
+        parsed = sops.parse_sops(raw)
+        runner = lambda cmd, env: (0, b'{"k": "v"}', "")  # noqa: E731
+        p = sops.plan(parsed, {}, sops.Decryptor(parsed.settings, runner=runner, env={}))
+        self.assertEqual(p.changes[0].action, "error")
+        self.assertIn("is a symlink", p.changes[0].error)
+        installed = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(sops.apply(p, parsed.settings, installed).success)
+        self.assertEqual(installed, {})
+        self.assertEqual(stat.S_IMODE(os.stat(pointee).st_mode), 0o644)
+        self.assertTrue(os.path.islink(self.path))
+
+    def test_generate_works_without_hardlinks(self):
+        raw = {"secretsDir": self.tmp, "secrets": {"jwt": {"generate": {"length": 16}}}}
+        parsed = sops.parse_sops(raw)
+        p = sops.plan(parsed, {}, sops.Decryptor(parsed.settings))
+        out = io.StringIO()
+        with self.no_hardlinks(), contextlib.redirect_stdout(out):
+            self.assertTrue(sops.apply(p, parsed.settings, {}).success)
+        with open(os.path.join(self.tmp, "jwt")) as f:
+            self.assertEqual(len(f.read()), 16)
+
+    def test_secret_paths_predictable(self):
+        raw = {
+            "secretsDir": "/s",
+            "defaultSopsFile": "/f",
+            "secrets": {"a": {}, "b": {"path": "/x"}},
+        }
+        self.assertEqual(sops.secret_paths(raw), {"a": "/s/a", "b": "/x"})
+
+
+class DecryptTest(SopsTestBase):
+    def test_nested_keys_list_index_whole_file_and_multiple_files(self):
+        raw = self.config(
+            {
+                "domain": {"key": "externalDomain"},
+                "ip1": {"key": "nextDNS/IPs/1"},
+                "cf": {"key": "cloudflare/apiToken", "sopsFile": self.other},
+                "ssh": {
+                    "key": "",
+                    "sopsFile": self.whole,
+                    "path": os.path.join(self.tmp, "ssh", "key"),
+                },
+            }
+        )
+        self.assertEqual(len(self.diff(raw)), 4)
+        self.fake.calls = []
+        ok, _ = self.deploy(raw)
+        self.assertTrue(ok)
+        d = self.secrets_dir
+        self.assertEqual(self.read(os.path.join(d, "domain")), "example.test")
+        self.assertEqual(self.read(os.path.join(d, "ip1")), "192.0.2.2")
+        self.assertEqual(self.read(os.path.join(d, "cf")), "cf-" + SECRET_VALUE)
+        self.assertEqual(
+            self.read(os.path.join(self.tmp, "ssh", "key")), "-----BEGIN KEY-----\nabc\n"
+        )
+        # One structured decrypt per file, plus one whole-file decrypt.
+        self.assertEqual(len(self.fake.calls), 3)
+
+    def test_non_string_values_are_errors(self):
+        raw = self.config({"port": {"key": "port"}, "flag": {"key": "flag"}})
+        rows = self.diff(raw)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertIn("is not a string", row)
+        ok, _ = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(os.path.join(self.secrets_dir, "port")))
+
+    def test_age_key_and_binary_passed_to_sops(self):
+        raw = self.config(
+            {"t": {"key": "token"}}, age={"sshKeyPaths": ["/k/id"], "keyFile": "/k/age"}
+        )
+        self.deploy(raw)
+        cmd, env = self.fake.calls[0]
+        self.assertEqual(
+            cmd[:6], ["/fake/sops", "--decrypt", "--input-type", "yaml", "--output-type", "json"]
+        )
+        self.assertEqual(env["SOPS_AGE_KEY_FILE"], "/k/age")
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], "/k/id")
+
+    def test_missing_binary_is_clear_error(self):
+        raw = self.config({"t": {"key": "token"}})
+        del raw["binary"]
+        d = sops.Decryptor(sops.parse_sops(raw).settings, runner=self.fake, which=lambda _: None)
+        rows = secrets_flow.diff_sops(raw, self.state, d)
+        self.assertIn("sops binary not found on PATH", rows[0])
+
+    def test_modes_and_private_dirs(self):
+        raw = self.config({"t": {"key": "token"}, "u": {"key": "token", "mode": "0600"}})
+        self.deploy(raw)
+        self.assertEqual(self.mode(os.path.join(self.secrets_dir, "t")), 0o400)
+        self.assertEqual(self.mode(os.path.join(self.secrets_dir, "u")), 0o600)
+        self.assertEqual(self.mode(self.secrets_dir), 0o751)
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(self.mode(os.path.dirname(self.secrets_dir)), 0o777 & ~umask)
+
+    def test_existing_shared_secrets_dir_left_alone_with_warning(self):
+        shared = os.path.join(self.tmp, "shared")
+        os.makedirs(shared)
+        os.chmod(shared, 0o755)
+        raw = self.config({"t": {"key": "token"}}, secretsDir=shared)
+        _, out = self.deploy(raw)
+        self.assertEqual(self.mode(shared), 0o755)
+        self.assertIn("group-writable or world-readable", out)
+        self.assertEqual(self.mode(os.path.join(shared, "t")), 0o400)
+
+    def test_private_existing_dir_no_warning(self):
+        os.makedirs(self.secrets_dir, mode=0o700)
+        os.chmod(self.secrets_dir, 0o700)
+        _, out = self.deploy(self.config({"t": {"key": "token"}}))
+        self.assertNotIn("accessible", out)
+
+    def test_unchanged_not_rewritten_and_diff_clean(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        before = os.stat(path)
+        self.assertEqual(self.diff(raw), [])
+        self.deploy(raw)
+        after = os.stat(path)
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        self.assertEqual(self.report.changed["sops"], [])
+
+    def test_value_change_rewrites_and_reports_without_value(self):
+        raw = self.config({"t": {"key": "token", "restartUnits": ["launchd:org.example.app"]}})
+        self.deploy(raw)
+        self.report = secrets_flow.RunReport()
+        self.fake.docs[self.main]["token"] = SECRET_VALUE + "-rotated"
+        rows = self.diff(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        self.assertEqual(
+            rows, [f"  ~ update {path} (secret)", "    notify: launchd:org.example.app"]
+        )
+        ok, out = self.deploy(raw)
+        self.assertIn(f"Updated: {path} (secret)", out)
+        self.assertEqual(self.read(path), SECRET_VALUE + "-rotated")
+        self.assertEqual(self.report.notify, [("launchd:org.example.app", "sops/t")])
+
+    def test_mode_drift_is_chmod(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        os.chmod(path, 0o644)
+        self.assertEqual(self.diff(raw), [f"  ~ chmod {path} -> 0o400"])
+        self.deploy(raw)
+        self.assertEqual(self.mode(path), 0o400)
+
+    def test_one_failure_does_not_abort_others(self):
+        self.fake.fail.add(self.other)
+        raw = self.config(
+            {
+                "cf": {"key": "cloudflare/apiToken", "sopsFile": self.other},
+                "missing": {"key": "nope/here"},
+                "t": {"key": "token"},
+            }
+        )
+        ok, out = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertIn("Failed to get the data key", out)
+        self.assertIn("key nope not found", out)
+        self.assertTrue(os.path.exists(os.path.join(self.secrets_dir, "t")))
+        self.assertEqual(sorted(self.report.failed_secrets), ["cf", "missing"])
+
+    def test_removed_secret_deleted_only_if_tracked(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        stray = os.path.join(self.secrets_dir, "not-ours")
+        with open(stray, "w") as f:
+            f.write("x")
+        empty = self.config({})
+        self.assertEqual(self.diff(empty), [f"  - remove {path}"])
+        self.deploy(empty)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(stray))
+        self.assertEqual(self.state["sops"]["installed"], {})
+
+    def test_modified_secret_kept_on_removal(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        os.chmod(path, 0o600)
+        with open(path, "w") as f:
+            f.write("hand edited, longer content")
+        _, out = self.deploy(self.config({}))
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("modified since tools wrote it", out)
+
+    def test_removal_held_on_config_error(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        self.deploy(self.config({"bad": {"key": "x", "mode": 1}}))
+        self.assertTrue(os.path.exists(os.path.join(self.secrets_dir, "t")))
+
+    def test_state_has_no_value_or_hash(self):
+        self.deploy(self.config({"t": {"key": "token"}}))
+        record = self.state["sops"]["installed"][os.path.join(self.secrets_dir, "t")]
+        self.assertEqual(set(record), {"name", "ino", "mtime_ns"})
+
+    def test_existing_identical_file_is_adopted(self):
+        os.makedirs(self.secrets_dir)
+        path = os.path.join(self.secrets_dir, "t")
+        with open(path, "w") as f:
+            f.write(SECRET_VALUE)
+        os.chmod(path, 0o400)
+        raw = self.config({"t": {"key": "token"}})
+        self.assertEqual(self.diff(raw), [])
+        self.deploy(raw)
+        self.assertIn(path, self.state["sops"]["installed"])
+
+
+class NoDoubleExpansionTest(unittest.TestCase):
+    def test_paths_not_env_expanded(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"X": "expanded"}):
+            p = sops.parse_sops(
+                {
+                    "secretsDir": "/s/$X",
+                    "defaultSopsFile": "/f/${X}.yaml",
+                    "secrets": {"a": {"key": "k", "path": "/p/$X"}, "b": {"key": "k"}},
+                }
+            )
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.secrets[0].path, "/p/$X")
+        self.assertEqual(p.secrets[0].sops_file, "/f/${X}.yaml")
+        self.assertEqual(p.secrets[1].path, "/s/$X/b")
+
+
+class OwnershipTest(SopsTestBase):
+    def test_sops_and_files_claiming_one_path_both_refuse(self):
+        from tools import diff as diff_mod
+        from tools.user import files
+
+        target = os.path.join(self.secrets_dir, "t")
+        src = os.path.join(self.tmp, "cfg", "plain.txt")
+        with open(src, "w") as f:
+            f.write("not a secret")
+        files_entries = [{"source": "plain.txt", "target": target}]
+        raw = self.config({"t": {"key": "token"}})
+        conflicts = secrets_flow.ownership_conflicts(
+            files_entries=files_entries,
+            sops_raw=raw,
+            state=self.state,
+            config_dir=os.path.join(self.tmp, "cfg"),
+        )
+        self.assertEqual(conflicts, {target: "claimed by files and sops"})
+
+        rows = secrets_flow.diff_sops(raw, self.state, self.decryptor(raw), conflicts)
+        self.assertIn("claimed by files and sops", rows[0])
+        file_rows = diff_mod._diff_files(
+            files_entries, os.path.join(self.tmp, "cfg"), {}, conflicts
+        )
+        self.assertIn("refusing", file_rows[0])
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok_sops = secrets_flow.deploy_sops(
+                raw, self.state, self.report, self.decryptor(raw), conflicts
+            )
+            ok_files = files.install_files(
+                files_entries, os.path.join(self.tmp, "cfg"), self.state, conflicts
+            )
+        self.assertFalse(ok_sops)
+        self.assertFalse(ok_files)
+        self.assertFalse(os.path.exists(target))
+
+    def test_state_only_claim_frees_itself(self):
+        from tools.user import files
+
+        target = os.path.join(self.secrets_dir, "t")
+        os.makedirs(self.secrets_dir)
+        with open(target, "w") as f:
+            f.write("old")
+        import hashlib
+
+        self.state["files"] = {target: {"hash": hashlib.sha256(b"old").hexdigest()}}
+        raw = self.config({"t": {"key": "token"}})
+        conflicts = secrets_flow.ownership_conflicts(sops_raw=raw, state=self.state)
+        self.assertIn(target, conflicts)
+        # files no longer declares it, so it removes its copy...
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(files.install_files([], self.tmp, self.state, conflicts))
+        self.assertFalse(os.path.exists(target))
+        # ...and the next run has a single owner.
+        self.assertEqual(secrets_flow.ownership_conflicts(sops_raw=raw, state=self.state), {})
+
+    def test_stale_secret_under_managed_link_not_removed(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        link = os.path.join(self.tmp, "linked")
+        os.symlink(repo, link)
+        path = os.path.join(link, "tok")
+        with open(path, "w") as f:
+            f.write("v")
+        self.state["sops"] = {"installed": {path: {"name": "tok", **fsutil.fingerprint(path)}}}
+        self.state["links"] = {"installed": {link: {"source": repo}}}
+        raw = self.config({})
+        conflicts = secrets_flow.ownership_conflicts(sops_raw=raw, state=self.state)
+        rows = secrets_flow.diff_sops(raw, self.state, self.decryptor(raw), conflicts)
+        self.assertTrue(rows[0].startswith(f"  ~ keep {path} (is under"), rows)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = secrets_flow.deploy_sops(
+                raw, self.state, self.report, self.decryptor(raw), conflicts
+            )
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(os.path.join(repo, "tok")))
+        self.assertIn(path, self.state["sops"]["installed"])
+
+    def test_untracked_existing_file_refused_unless_force(self):
+        path = os.path.join(self.tmp, "ssh", "config")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("Host handwritten\n")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        rows = self.diff(raw)
+        self.assertIn("exists and is not tracked by tools; set force: true", rows[0])
+        ok, _ = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertEqual(self.read(path), "Host handwritten\n")
+        self.assertNotIn(path, self.state["sops"]["installed"])
+
+        raw = self.config({"tok": {"key": "token", "path": path, "force": True}})
+        self.assertEqual(self.diff(raw), [f"  ~ replace {path} (secret, not tracked by tools)"])
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok)
+        self.assertIn(f"Replaced untracked: {path}", out)
+        self.assertEqual(self.read(path), SECRET_VALUE)
+        self.assertEqual(self.diff(raw), [])
+        p = sops.parse_sops({**raw, "secrets": {"t": {"key": "k", "force": "yes"}}})
+        self.assertIn("force must be a bool", p.errors[0])
+
+    def test_respelled_path_keeps_secret_and_single_entry(self):
+        real = os.path.join(self.tmp, "Sec")
+        os.makedirs(real)
+        alias = os.path.join(self.tmp, "alias")
+        os.symlink(real, alias)
+        pairs = [(os.path.join(real, "a"), os.path.join(alias, "a"))]
+        if fsutil._case_insensitive(real):
+            pairs.append((os.path.join(real, "b"), os.path.join(self.tmp, "sec", "B")))
+        for first, second in pairs:
+            self.state = {}
+            self.deploy(self.config({"t": {"key": "token", "path": first}}))
+            raw = self.config({"t": {"key": "token", "path": second}})
+            self.assertEqual(self.diff(raw), [], (first, second))
+            ok, out = self.deploy(raw)
+            self.assertTrue(ok, out)
+            self.assertEqual(self.read(first), SECRET_VALUE)
+            self.assertEqual(list(self.state["sops"]["installed"]), [second])
+
+
+class GenerateTest(SopsTestBase):
+    def test_generated_once_never_regenerated(self):
+        raw = self.config({"jwt": {"generate": {"length": 48, "charset": "hex"}}})
+        path = os.path.join(self.secrets_dir, "jwt")
+        self.assertEqual(self.diff(raw), [f"  + generate {path} (secret)"])
+        self.deploy(raw)
+        value = self.read(path)
+        self.assertEqual(len(value), 48)
+        self.assertTrue(set(value) <= set("0123456789abcdef"))
+        self.assertEqual(self.mode(path), 0o400)
+        self.deploy(raw)
+        self.assertEqual(self.read(path), value)
+        self.assertEqual(self.diff(raw), [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_existing_value_adopted_only_with_force(self):
+        path = os.path.join(self.tmp, "forgejo", "internal_token")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("pre-existing")
+        os.chmod(path, 0o644)
+        ok, out = self.deploy(self.config({"tok": {"generate": {}, "path": path}}))
+        self.assertFalse(ok)
+        self.assertIn("set force: true to adopt it", out)
+        self.assertEqual(self.mode(path), 0o644)
+        self.assertNotIn(path, self.state["sops"]["installed"])
+        ok, _ = self.deploy(self.config({"tok": {"generate": {}, "path": path, "force": True}}))
+        self.assertTrue(ok)
+        self.assertEqual(self.read(path), "pre-existing")
+        self.assertEqual(self.mode(path), 0o400)
+        self.assertTrue(self.state["sops"]["installed"][path]["generated"])
+
+    def test_lookup_never_follows_symlink_at_generated_path(self):
+        pointee = os.path.join(self.tmp, "elsewhere")
+        with open(pointee, "w") as f:
+            f.write("not-a-secret-target")
+        os.makedirs(self.secrets_dir, exist_ok=True)
+        os.symlink(pointee, os.path.join(self.secrets_dir, "jwt"))
+        parsed = sops.parse_sops(self.config({"jwt": {"generate": {}}}))
+        lookup = sops.make_lookup(parsed, decryptor=self.decryptor(self.config({})))
+        with self.assertRaisesRegex(sops.SecretUnavailable, "symlink"):
+            lookup("jwt")
+
+    def test_dropped_generated_secret_is_kept(self):
+        raw = self.config({"jwt": {"generate": {}}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "jwt")
+        _, out = self.deploy(self.config({}))
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("generated secret; kept on disk", out)
+        self.assertEqual(self.state["sops"]["installed"], {})
+
+    def test_generated_mode_drift_is_fixed_without_rewriting(self):
+        raw = self.config({"jwt": {"generate": {}, "mode": "0400"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "jwt")
+        value = self.read(path)
+        os.chmod(path, 0o644)
+        self.assertEqual(self.diff(raw), [f"  ~ chmod {path} -> 0o400"])
+        self.deploy(raw)
+        self.assertEqual(self.mode(path), 0o400)
+        self.assertEqual(self.read(path), value)
+
+    def test_custom_chars(self):
+        self.deploy(self.config({"p": {"generate": {"length": 16, "chars": "ab"}}}))
+        self.assertTrue(set(self.read(os.path.join(self.secrets_dir, "p"))) <= {"a", "b"})
+
+
+if __name__ == "__main__":
+    unittest.main()

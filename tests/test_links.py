@@ -53,6 +53,25 @@ class LinkTest(LinksTestBase):
 
         self.assertEqual(os.readlink(self.target), self.src)
 
+    def test_env_paths_survive_config_loader(self):
+        from tools.config import resolve_config
+
+        config = {
+            "vars": {"name": "jira"},
+            "links": [
+                {"source": "$SRC", "target": "$HOME/home/.claude/skills/${name}"},
+                {"source": "${SRC}", "target": "${HOME}/home/.claude/skills/other"},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "SRC": self.src}):
+            entries = resolve_config(config, env={})["links"]
+            self.assertEqual(entries[0]["target"], "$HOME/home/.claude/skills/jira")
+            self.assertEqual(entries[1]["source"], "${SRC}")
+            self.assertTrue(self.deploy(entries))
+
+        self.assertEqual(os.readlink(self.target), self.src)
+        self.assertEqual(os.readlink(os.path.join(self.tmp, "home/.claude/skills/other")), self.src)
+
     def test_source_change_repoints_tracked_link(self):
         self.deploy([self.entry()])
         entries = [self.entry(source=self.src2)]

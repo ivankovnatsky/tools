@@ -630,5 +630,16 @@ class GitSourceTest(SkillsTestBase):
         self.assertTrue(os.path.exists(os.path.join(self.t1, "pdf")))
 
 
+class SkillsEnvPathTest(unittest.TestCase):
+    def test_env_vars_expand_in_paths(self):
+        with mock.patch.dict(os.environ, {"HOME": "/h", "SK": "/sk"}):
+            self.assertEqual(skills._expand("$HOME/.agents/skills"), "/h/.agents/skills")
+            self.assertEqual(skills._expand("${SK}/x"), "/sk/x")
+            self.assertEqual(skills.cache_dir_for({"cacheDir": "$HOME/c"}), "/h/c")
+            self.assertEqual(
+                skills._source_base("s", {"path": "$SK/local"}, "/cache", "/cfg"), "/sk/local"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

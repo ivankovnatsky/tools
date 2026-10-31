@@ -237,5 +237,33 @@ class McpOwnershipTest(unittest.TestCase):
         self.assertIn("newsrv", state["mcp"]["servers"])
 
 
+class McpRuntimePlaceholderTest(unittest.TestCase):
+    _reconcile = McpOwnershipTest._reconcile
+
+    def test_bearer_env_header_reaches_claude_unresolved(self):
+        from tools.config import resolve_config
+
+        config = {
+            "mcp": {
+                "servers": {
+                    "x": {
+                        "scope": "user",
+                        "transport": "http",
+                        "url": "https://example/x",
+                        "headers": ["Authorization: Bearer ${API_KEY}"],
+                    }
+                }
+            }
+        }
+        servers = resolve_config(config, env={"API_KEY": "real-key"})["mcp"]["servers"]
+        state, fake = {}, FakeClaude()
+        self.assertTrue(self._reconcile(servers, state, fake))
+        add = next(c for c in fake.commands if c[2] == "add")
+        self.assertIn("Authorization: Bearer ${API_KEY}", add)
+        self.assertNotIn("real-key", repr(fake.commands))
+        self.assertNotIn("real-key", repr(state))
+        self.assertIn("${API_KEY}", repr(state))
+
+
 if __name__ == "__main__":
     unittest.main()
