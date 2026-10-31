@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+
+import json
+import re
+import subprocess
+import sys
+import webbrowser
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
+
+import click
+
+
+@dataclass
+class Notification:
+    thread_id: str
+    subject_type: str
+    subject_api_url: str
+    repo_full_name: str
+    subject_title: str
+    latest_comment_url: str
+    updated_at: str
+
+
+def run_gh(args: List[str]) -> str:
+    """Run gh CLI and return stdout, raising on error."""
+    proc = subprocess.run(
+        ["gh", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
+        raise RuntimeError(f"gh {' '.join(args)} failed: {msg}")
+    return proc.stdout
+
+
+def fetch_notifications() -> List[Notification]:
+    """Fetch unread notifications via gh api, returning basic fields per thread."""
+    jq = '.[] | [.id, .subject.type, .subject.url // "", .repository.full_name, .subject.title, .subject.latest_comment_url // "", .updated_at] | @tsv'
+    out = run_gh(
+        [
+            "api",
+            "/notifications",
+            "--paginate",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            jq,
+        ]
+    )
+
+    notifications: List[Notification] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        (
+            thread_id,
+            subject_type,
+            subject_api_url,
+            repo_full_name,
+            subject_title,
+            latest_comment_url,
+            updated_at,
+        ) = parts
+        notifications.append(
+            Notification(
+                thread_id=thread_id.strip(),
+                subject_type=subject_type.strip(),
+                subject_api_url=subject_api_url.strip(),
+                repo_full_name=repo_full_name.strip(),
+                subject_title=subject_title.strip(),
+                latest_comment_url=latest_comment_url.strip(),
+                updated_at=updated_at.strip(),
+            )
+        )
+    return notifications
+
+
+def _resolve_failed_job_urls(repo_full_name: str, run_id: str) -> List[str]:
+    """Query the jobs endpoint for a workflow run and return all failed job URLs."""
+    try:
+        jobs_json = run_gh(
+            [
+                "api",
+                f"/repos/{repo_full_name}/actions/runs/{run_id}/jobs",
+                "--jq",
+                ".jobs[] | {html_url: .html_url, conclusion: .conclusion}",
+            ]
+        )
+
+        failed_urls: List[str] = []
+        first_url = ""
+        for line in jobs_json.splitlines():
+            if not line.strip():
+                continue
+            try:
+                job = json.loads(line)
+                url = job.get("html_url", "")
+                if not url:
+                    continue
+                if job.get("conclusion") == "failure":
+                    failed_urls.append(url)
+                if not first_url:
+                    first_url = url
+            except json.JSONDecodeError:
+                continue
+
+        if failed_urls:
+            return failed_urls
+        if first_url:
+            return [first_url]
+        return []
+    except Exception:
+        return []
+
+
+def _resolve_check_suite_by_workflow_name(
+    repo_full_name: str, workflow_name: str, branch: str = ""
+) -> List[str]:
+    """Find recent workflow run matching the given name and optional branch.
+
+    For CheckSuite notifications without a subject.url, query recent workflow runs
+    and match by workflow name to get deep links to all failed jobs.
+    """
+    try:
+        # Build query params for more targeted search
+        endpoint = f"/repos/{repo_full_name}/actions/runs"
+        if branch:
+            endpoint += f"?branch={branch}"
+        params = [
+            "api",
+            endpoint,
+            "--jq",
+            ".workflow_runs[0:20] | .[] | {id: .id, name: .name, html_url: .html_url, conclusion: .conclusion}",
+        ]
+
+        runs_json = run_gh(params)
+
+        # Parse JSON lines and find matching workflow (prefer failed runs)
+        matched_run = None
+        for line in runs_json.splitlines():
+            if not line.strip():
+                continue
+            try:
+                run_data = json.loads(line)
+                if run_data.get("name") == workflow_name:
+                    if run_data.get("conclusion") == "failure":
+                        run_id = str(run_data.get("id", ""))
+                        if run_id:
+                            job_urls = _resolve_failed_job_urls(repo_full_name, run_id)
+                            if job_urls:
+                                return job_urls
+                        html = run_data.get("html_url", "")
+                        return [html] if html else []
+                    if not matched_run:
+                        matched_run = run_data
+            except json.JSONDecodeError:
+                continue
+
+        if matched_run:
+            html = matched_run.get("html_url", "")
+            return [html] if html else []
+        return []
+    except Exception:
+        return []
+
+
+def _resolve_check_suite_via_check_runs(api: str) -> List[str]:
+    """Resolve deep link URLs from a check-suite API URL by querying its check runs.
+
+    Fetches the check runs for the suite and returns html_urls of all failed runs,
+    or the first run if none failed.
+    """
+    m = re.match(
+        r"https://api\.github\.com/repos/([^/]+)/([^/]+)/check-suites/(\d+)", api
+    )
+    if not m:
+        return []
+
+    try:
+        runs_json = run_gh(
+            [
+                "api",
+                f"{api}/check-runs",
+                "--jq",
+                ".check_runs[] | {html_url: .html_url, conclusion: .conclusion}",
+            ]
+        )
+
+        failed_urls: List[str] = []
+        first_url = ""
+        for line in runs_json.splitlines():
+            if not line.strip():
+                continue
+            try:
+                run_data = json.loads(line)
+                url = run_data.get("html_url", "")
+                if not url:
+                    continue
+                if run_data.get("conclusion") == "failure":
+                    failed_urls.append(url)
+                if not first_url:
+                    first_url = url
+            except json.JSONDecodeError:
+                continue
+
+        if failed_urls:
+            return failed_urls
+        if first_url:
+            return [first_url]
+        return []
+    except Exception:
+        return []
+
+
+def _resolve_check_suite_pull_request(api: str) -> str:
+    """Find the associated pull request URL from a check-suite API URL."""
+    try:
+        pr_url = run_gh(["api", api, "--jq", ".pull_requests[0].url // empty"]).strip()
+        if not pr_url:
+            return ""
+        html = run_gh(["api", pr_url, "--jq", ".html_url // empty"]).strip()
+        return html
+    except Exception:
+        return ""
+
+
+def _resolve_check_suite_url_fallback(api: str) -> str:
+    """Construct a UI URL for a Check Suite when html_url is missing."""
+    m = re.match(
+        r"https://api\.github\.com/repos/([^/]+)/([^/]+)/check-suites/(\d+)", api
+    )
+    if not m:
+        return ""
+    owner, repo, suite_id = m.groups()
+    try:
+        sha = run_gh(["api", api, "--jq", ".head_sha // empty"]).strip()
+        if not sha:
+            return ""
+        return f"https://github.com/{owner}/{repo}/commit/{sha}/checks?check_suite_id={suite_id}"
+    except Exception:
+        return ""
+
+
+def _resolve_latest_event_url(n: Notification) -> str:
+    """Query the issue/PR timeline to find the event matching updated_at.
+
+    For merges, closes, review requests, and reviews that don't produce a
+    distinct latest_comment_url, walk the timeline backwards to find the
+    triggering event and return a deep-link URL.
+    """
+    m = re.search(r"/(?:issues|pulls)/(\d+)$", n.subject_api_url)
+    if not m:
+        return ""
+    number = m.group(1)
+
+    try:
+        # Fetch the last page of timeline events (most recent)
+        events_json = run_gh(
+            [
+                "api",
+                f"/repos/{n.repo_full_name}/issues/{number}/timeline",
+                "--paginate",
+                "--jq",
+                '.[] | {event: .event, id: .id, html_url: .html_url, updated_at: (.updated_at // .submitted_at // .created_at // "")}',
+            ]
+        )
+    except Exception:
+        return ""
+
+    # Parse all events and find the last one at or before updated_at
+    events = []
+    for line in events_json.splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    if not events:
+        return ""
+
+    # Get the base HTML URL for the issue/PR
+    is_pr = "/pulls/" in n.subject_api_url
+    base_html = f"https://github.com/{n.repo_full_name}/{'pull' if is_pr else 'issues'}/{number}"
+
+    # Walk events in reverse to find the most recent relevant one
+    for ev in reversed(events):
+        ev_time = ev.get("updated_at", "")
+        if ev_time and ev_time > n.updated_at:
+            continue
+
+        html_url = ev.get("html_url", "")
+        if html_url:
+            return html_url
+
+        event_id = ev.get("id")
+        if event_id:
+            return f"{base_html}#event-{event_id}"
+
+    return ""
+
+
+def resolve_html_urls(n: Notification, deep_link_event: bool = False) -> List[str]:
+    """Resolve browser URLs for a notification subject.
+
+    Returns a list of URLs (multiple for CI failures with several failed jobs).
+    For PR notifications, defaults to the diff view (/changes). With
+    ``deep_link_event=True``, deep-links to the triggering comment/review/event
+    instead. For other subjects, tries `gh api <subject.url> --jq .html_url`
+    first (works for PR, Issue, WorkflowRun, etc). Falls back to check-run
+    resolution for CheckSuite notifications, then to workflow run matching,
+    then to simple API->HTML URL conversion.
+    """
+    api = n.subject_api_url
+
+    # Parse title for CheckSuite: "<workflow_name> workflow run <status> for <branch>"
+    workflow_name = ""
+    branch = ""
+    if n.subject_type == "CheckSuite" and " workflow run" in n.subject_title:
+        workflow_name = n.subject_title.split(" workflow run")[0].strip()
+        # Extract branch from " for <branch> branch" suffix
+        title_after_run = n.subject_title.split(" workflow run", 1)[1]
+        m = re.search(r" for (.+?)(?:\s+branch)?$", title_after_run)
+        if m:
+            branch = m.group(1).strip()
+
+    # Special case: CheckSuite with null subject.url
+    if not api and n.subject_type == "CheckSuite":
+        workflow_urls = _resolve_check_suite_by_workflow_name(
+            n.repo_full_name, workflow_name, branch
+        )
+        if workflow_urls:
+            return workflow_urls
+        return [f"https://github.com/{n.repo_full_name}/actions"]
+
+    if not api:
+        return []
+
+    # For check-suites, try to get the specific failed check run deep links
+    if n.subject_type == "CheckSuite" and "/check-suites/" in api:
+        check_run_urls = _resolve_check_suite_via_check_runs(api)
+        if check_run_urls:
+            return check_run_urls
+
+        pr_url = _resolve_check_suite_pull_request(api)
+        if pr_url:
+            return [pr_url]
+
+        fallback = _resolve_check_suite_url_fallback(api)
+        if fallback:
+            return [fallback]
+
+        return [f"https://github.com/{n.repo_full_name}/actions"]
+
+    # Default for PRs: link directly to the diff view (/changes)
+    if n.subject_type == "PullRequest" and not deep_link_event:
+        m = re.search(r"/pulls/(\d+)$", api)
+        if m:
+            number = m.group(1)
+            return [f"https://github.com/{n.repo_full_name}/pull/{number}/changes"]
+
+    # For Issues, and PRs with --event, deep-link to the triggering event
+    if n.subject_type in ("Issue", "PullRequest"):
+        # If latest_comment_url points to a specific comment, resolve it
+        if n.latest_comment_url and n.latest_comment_url != api:
+            try:
+                comment_html = run_gh(
+                    ["api", n.latest_comment_url, "--jq", ".html_url // empty"]
+                ).strip()
+                if comment_html:
+                    return [comment_html]
+            except Exception:
+                pass
+
+        # Otherwise, query the timeline for the triggering event
+        event_url = _resolve_latest_event_url(n)
+        if event_url:
+            return [event_url]
+
+    # Fetch the object's html_url via gh (works for PR, Issue, WorkflowRun, etc)
+    try:
+        html = run_gh(["api", api, "--jq", ".html_url // empty"]).strip()
+        if html:
+            return [html]
+    except Exception:
+        pass
+
+    # Fallback: special-case Check Suite (no html_url in some responses)
+    check_suite_url = _resolve_check_suite_url_fallback(api)
+    if check_suite_url:
+        return [check_suite_url]
+
+    # Generic fallback: Convert API URL to web URL
+    url = api.replace("api.github.com/repos", "github.com")
+    url = url.replace("/pulls/", "/pull/")
+    return [url]
+
+
+def add_notification_context(url: str) -> str:
+    """Add notification context query parameters to URL.
+
+    Adds notifications_query parameter to help GitHub highlight the notification
+    you came from in the UI.
+    """
+    # Disabled: just return the URL unchanged
+    return url
+
+
+def open_in_browser(url: str) -> bool:
+    """Open URL in the default browser."""
+    if sys.platform == "darwin":
+        proc = subprocess.run(
+            ["open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return proc.returncode == 0
+
+    # Fallback: default browser; open in a new tab if possible
+    try:
+        return webbrowser.open_new_tab(url)
+    except Exception:
+        return False
+
+
+def mark_thread_read(thread_id: str) -> None:
+    # Per API: PATCH /notifications/threads/{thread_id} marks as read
+    run_gh(
+        [
+            "api",
+            f"/notifications/threads/{thread_id}",
+            "-X",
+            "PATCH",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ]
+    )
+
+
+def collect_urls(
+    ns: Iterable[Notification],
+    deep_link_event: bool = False,
+) -> List[Tuple[str, str]]:
+    """Return list of (url, thread_id) for all notifications."""
+    result: List[Tuple[str, str]] = []
+    for n in ns:
+        urls = resolve_html_urls(n, deep_link_event=deep_link_event)
+        if not urls:
+            continue
+        for url in urls:
+            url = add_notification_context(url)
+            result.append((url, n.thread_id))
+    return result
+
+
+@click.command(
+    name="open-gh-notifications",
+    help=(
+        "Open unread GitHub notifications in your browser using gh CLI. "
+        "PR notifications open at the diff view (/changes) by default; pass "
+        "--event to deep-link to the triggering comment/review/event instead. "
+        "Threads are marked as read after opening."
+    ),
+)
+@click.option(
+    "-s",
+    "--show",
+    is_flag=True,
+    default=False,
+    help="Only print the URLs that would be opened (no browser, no marking read)",
+)
+@click.option(
+    "-e",
+    "--event",
+    "deep_link_event",
+    is_flag=True,
+    default=False,
+    help="For PRs, deep-link to the triggering event (comment/review/merge) instead of the diff view",
+)
+def main(show: bool, deep_link_event: bool) -> None:
+    try:
+        notifications = fetch_notifications()
+    except Exception as e:
+        click.echo(f"Failed to fetch notifications via gh: {e}", err=True)
+        sys.exit(1)
+
+    url_pairs = collect_urls(notifications, deep_link_event=deep_link_event)
+
+    if not url_pairs:
+        click.echo("No notifications found.")
+        return
+
+    click.echo("URLs to open:")
+    for url, _ in url_pairs:
+        click.echo(url)
+
+    if show:
+        click.echo("Would open URLs in a new browser window")
+        return
+
+    for url, thread_id in url_pairs:
+        opened = open_in_browser(url)
+        if opened:
+            try:
+                mark_thread_read(thread_id)
+            except Exception as e:
+                click.echo(
+                    f"Warning: failed to mark thread {thread_id} read: {e}",
+                    err=True,
+                )
+
+    click.echo("Opening URLs in a new browser window")
+
+
+if __name__ == "__main__":
+    main(prog_name="gh-notifications")

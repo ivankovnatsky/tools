@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""Monitor an Anker Solix C1000 Gen 2 (A1763) and trigger graceful host shutdowns.
+
+Architecture (read-only against Anker):
+
+    anker-monitor serve   -- one process, one Anker cloud login. Reads the C1000
+                             battery SOC over Anker's cloud MQTT stream and exposes
+                             it on the LAN: GET /soc lists every MQTT-capable device
+                             on the account (the --pn/--sn one flagged "primary"),
+                             /soc/<sn> returns one. Optionally posts a Discord note
+                             each time a device's SOC crosses a --notify-step boundary
+                             and when a device starts charging.
+    anker-monitor check   -- runs on each protected host. Polls /soc and reads the
+                             primary entry (or a bare object from an older serve);
+                             when SOC stays at/below the threshold it shuts the host
+                             down cleanly (before the C1000's own ~15% AC cutoff).
+
+The C1000 Gen 2 is a *standalone* PPS: the Anker cloud REST cache carries no SOC or
+power for it, so realtime data is only available via the cloud MQTT stream. "MQTT"
+here is a protocol to Anker's cloud broker over the internet -- no local broker or
+hardware is involved.
+
+get_status() only returns data while the device is subscribed AND a realtime trigger
+is active; message_poller() handles both (subscribe + auto re-trigger).
+
+serve credentials come from the environment: ANKERUSER, ANKERPASSWORD, ANKERCOUNTRY.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import subprocess
+
+import click
+from aiohttp import ClientSession, ClientTimeout, web
+from anker_solix_api.api import AnkerSolixApi
+from anker_solix_api.mqtt_factory import SolixMqttDeviceFactory
+
+try:  # shared repo helper on PYTHONPATH; notifications are best-effort
+    from discord import send_discord
+except Exception:  # noqa: BLE001 - never let a missing notifier break monitoring
+    send_discord = None
+
+LOG = logging.getLogger("anker-monitor")
+
+DEFAULT_PN = "A1763"  # C1000 Gen 2
+TRIGGER_TIMEOUT = 300  # seconds the device keeps publishing before re-trigger
+BLIND_ALERT_AFTER = 2  # consecutive readless polls before alerting "can't read battery"
+
+
+def _read_webhook(path):
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError as err:
+        LOG.warning("cannot read webhook file %s: %s", path, err)
+        return None
+
+
+def _notify(webhook, message):
+    """Best-effort Discord post for critical events only; never raises."""
+    if not webhook or send_discord is None:
+        return
+    try:
+        send_discord(webhook, message, source="anker-monitor")
+    except Exception as err:  # noqa: BLE001 - a failed alert must not break the loop
+        LOG.warning("discord notify failed: %s", err)
+
+
+def _load_secrets(path):
+    """Parse one secrets file holding email/password/country as key=value or key: value."""
+    creds = {}
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Split on whichever delimiter comes first, so a value that itself
+            # contains '=' (e.g. "password: ab=cd") is kept intact.
+            positions = [line.find(d) for d in ("=", ":")]
+            positions = [p for p in positions if p != -1]
+            if not positions:
+                continue
+            idx = min(positions)
+            key, value = line[:idx], line[idx + 1 :]
+            creds[key.strip().lower()] = value.strip().strip("\"'")
+    user = creds.get("email") or creds.get("user") or creds.get("ankeruser")
+    password = creds.get("password") or creds.get("ankerpassword")
+    country = creds.get("country") or creds.get("ankercountry") or "US"
+    if not user or not password:
+        raise click.ClickException(f"{path}: missing email/password")
+    return user, password, country
+
+
+def _creds(secrets_file):
+    """Resolve creds from a single secrets file, else the ANKER* env vars."""
+    if secrets_file:
+        return _load_secrets(secrets_file)
+    user, password = os.environ.get("ANKERUSER"), os.environ.get("ANKERPASSWORD")
+    if not user or not password:
+        raise click.ClickException(
+            "provide --secrets-file (or ANKERUSER/ANKERPASSWORD)"
+        )
+    return user, password, os.environ.get("ANKERCOUNTRY", "US")
+
+
+def cred_options(func):
+    """Single --secrets-file option for commands that reach Anker."""
+    return click.option(
+        "--secrets-file",
+        type=click.Path(exists=True),
+        default=None,
+        help="File with email/password/country (key=value or key: value). Else ANKER* env.",
+    )(func)
+
+
+def _match_device(api, pn, sn):
+    for serial, dev in api.devices.items():
+        if sn and serial == sn:
+            return serial
+        if not sn and dev.get("device_pn") == pn:
+            return serial
+    return None
+
+
+def _to_num(value):
+    """Coerce a library value (SOC/power are numeric strings) to float, or None."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _marker(st):
+    return st.get("msg_timestamp") or st.get("utc_timestamp") or st.get("last_update")
+
+
+def _soc(st):
+    # Combined SOC across main unit and expansion packs. Some models publish
+    # only main_battery_soc (no battery_soc).
+    soc = st.get("battery_soc")
+    return _to_num(soc if soc is not None else st.get("main_battery_soc"))
+
+
+def _ac_in_w(st):
+    """AC charge power; models name the key differently."""
+    return _to_num(st.get("ac_input_power", st.get("ac_input_power_total")))
+
+
+def _charging(st):
+    """True while any charge source is active, from whichever keys the model publishes.
+
+    A1761 reports charging_status (0 off, 1 solar, 2 AC, 3 both); A1763 only the
+    per-source input switches.
+    """
+    status = _to_num(st.get("charging_status"))
+    if status is not None:
+        return status > 0
+    switches = [st.get(k) for k in ("ac_input_power_switch", "dc_input_power_switch")]
+    if any(v is not None for v in switches):
+        return any(bool(_to_num(v)) for v in switches)
+    return (_ac_in_w(st) or 0) > 0
+
+
+def _exp_soc(st):
+    """SOC of each attached expansion pack (exp_<n>_soc), in pack order."""
+    packs = sorted(
+        (int(m.group(1)), _to_num(v))
+        for k, v in st.items()
+        if (m := re.fullmatch(r"exp_(\d+)_soc", k))
+    )
+    return [None if v is None else int(v) for _, v in packs]
+
+
+async def _serve(
+    host,
+    port,
+    pn,
+    sn,
+    max_age,
+    creds,
+    webhook_file,
+    notify_step,
+    notify_on,
+    notify_charging,
+):
+    user, password, country = creds
+    webhook = _read_webhook(webhook_file)
+    async with ClientSession() as websession:
+        api = AnkerSolixApi(user, password, country, websession, LOG)
+        found, poller = await _connect(api, pn, sn, all_devices=True)
+        primary = found[0][0]
+
+        # Per-device tracking. "marker"/"at" record when the device's data last
+        # changed, to detect a stalled stream. Sampled by a background task (not
+        # lazily on request) so age reflects when MQTT data actually arrived, even if
+        # no client polls for a long time. "bucket" is the last SOC bucket
+        # (soc // notify_step) announced; None until first reading so a restart never
+        # re-posts the current level.
+        devs = {
+            serial: {
+                "device": device,
+                "name": api.devices[serial].get("name")
+                or api.devices[serial].get("alias")
+                or serial,
+                "marker": None,
+                "at": 0.0,
+                "bucket": None,
+                "charging": None,
+            }
+            for serial, device in found
+        }
+
+        def step_notify(d, soc_num):
+            if not notify_step or soc_num is None:
+                return
+            cur = int(soc_num) // notify_step
+            prev = d["bucket"]
+            d["bucket"] = cur
+            if prev is None or cur == prev:
+                return
+            trend = "discharging" if cur < prev else "charging"
+            if notify_on == "discharge" and trend != "discharging":
+                return
+            if notify_on == "charge" and trend != "charging":
+                return
+            _notify(webhook, f"{d['name']} battery {int(soc_num)}% ({trend})")
+
+        def charging_notify(d, st):
+            charging = _charging(st)
+            prev = d["charging"]
+            d["charging"] = charging
+            if not notify_charging or prev is None or not charging or prev:
+                return
+            soc_num = _soc(st)
+            soc_txt = "?" if soc_num is None else f"{int(soc_num)}%"
+            ac_in = _ac_in_w(st)
+            watts = f", {ac_in:g}W in" if ac_in else ""
+            _notify(webhook, f"{d['name']} started charging at {soc_txt}{watts}")
+
+        async def sampler():
+            while True:
+                for d in devs.values():
+                    st = d["device"].get_status()
+                    marker = _marker(st)
+                    if marker is not None and marker != d["marker"]:
+                        d["marker"] = marker
+                        d["at"] = asyncio.get_running_loop().time()
+                        step_notify(d, _soc(st))
+                        charging_notify(d, st)
+                await asyncio.sleep(5)
+
+        def reading(serial):
+            d = devs[serial]
+            st = d["device"].get_status()
+            now = asyncio.get_running_loop().time()
+            age = now - d["at"] if d["marker"] is not None else None
+            soc_num = _soc(st)
+            main_num = _to_num(st.get("main_battery_soc"))
+            stale = age is None or age > max_age
+            return {
+                # null when stale so the checker treats it as unavailable, not a reading
+                "soc": None if stale or soc_num is None else int(soc_num),
+                "main_soc": None if stale or main_num is None else int(main_num),
+                "exp_soc": [] if stale else _exp_soc(st),
+                "ac_w": _to_num(st.get("ac_output_power")),
+                "ac_on": bool(
+                    st.get("ac_output_power_switch", st.get("ac_output_status"))
+                ),
+                "ac_in_w": _ac_in_w(st),
+                "charging": _charging(st),
+                "sn": serial,
+                "name": d["name"],
+                "primary": serial == primary,
+                "age": None if age is None else round(age, 1),
+                "stale": stale,
+                "ts": st.get("last_update") or st.get("utc_timestamp"),
+                # everything the library mapped from the stream, unfiltered
+                "status": st,
+            }
+
+        async def soc_all(_request):
+            return web.json_response([reading(s) for s in devs])
+
+        async def soc_by_sn(request):
+            serial = request.match_info["sn"]
+            if serial not in devs:
+                raise web.HTTPNotFound(text=f"unknown device {serial}")
+            return web.json_response(reading(serial))
+
+        sampler_task = asyncio.create_task(sampler())
+        app = web.Application()
+        app.router.add_get("/soc", soc_all)
+        app.router.add_get("/soc/{sn}", soc_by_sn)
+        app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, host, port).start()
+        LOG.warning(
+            "serving SOC for %s on http://%s:%s/soc", ", ".join(devs), host, port
+        )
+
+        try:
+            # Tie lifecycle to the poller: if it stops or errors, exit so the service
+            # manager restarts us instead of serving null/stale data indefinitely.
+            await poller
+        finally:
+            sampler_task.cancel()
+            poller.cancel()
+            api.stopMqttSession()
+            await runner.cleanup()
+
+
+def _primary_reading(data):
+    """Pick the primary entry from a /soc list; a bare object is used as-is."""
+    if isinstance(data, list):
+        entry = next((d for d in data if d.get("primary")), None)
+        if entry is None:
+            raise ValueError("no primary entry in /soc list")
+        return entry
+    return data
+
+
+async def _check(
+    url, threshold, debounce, interval, shutdown, shutdown_cmd, webhook_file
+):
+    webhook = _read_webhook(webhook_file)
+    below = 0
+    blind = 0  # consecutive polls with no usable reading
+    blind_alerted = False
+    acted = False  # sent the shutdown/would-shutdown alert for the current low episode
+    timeout = ClientTimeout(total=10)
+    async with ClientSession(timeout=timeout) as s:
+        while True:
+            raw = None
+            unreachable = False
+            try:
+                async with s.get(url) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                raw = _primary_reading(data).get("soc")
+                soc = _to_num(raw)
+            except Exception as err:  # noqa: BLE001 - unreachable endpoint must not shut down
+                soc, unreachable, err_detail = None, True, str(err)
+
+            valid = soc is not None and 0 <= soc <= 100
+
+            # No usable reading -> hold (never shut down), and alert once if we stay blind.
+            if not valid:
+                if unreachable:
+                    LOG.warning("soc endpoint unreachable; holding")
+                    detail = f"endpoint unreachable ({err_detail})"
+                else:
+                    if raw is not None:
+                        LOG.warning("ignoring invalid soc=%r; holding", raw)
+                    detail = "invalid/stale reading"
+                below = 0
+                blind += 1
+                if blind >= BLIND_ALERT_AFTER and not blind_alerted:
+                    _notify(
+                        webhook,
+                        f"can't read battery SOC ({detail}); monitoring is blind",
+                    )
+                    blind_alerted = True
+                await asyncio.sleep(interval)
+                continue
+
+            # Valid reading restored.
+            if blind_alerted:
+                _notify(webhook, f"battery SOC readable again ({soc:g}%)")
+            blind = 0
+            blind_alerted = False
+
+            if soc <= threshold:
+                below += 1
+                click.echo(f"soc={soc:g}% <= {threshold}% ({below}/{debounce})")
+                if below >= debounce:
+                    if not shutdown:
+                        # Dry-run: alert once, then keep polling (do NOT exit, or the
+                        # supervisor would relaunch us and re-alert every restart).
+                        if not acted:
+                            click.echo(
+                                f"threshold sustained; would run: {shutdown_cmd}"
+                            )
+                            _notify(
+                                webhook,
+                                f"[DRY-RUN] battery {soc:g}% <= {threshold}% sustained; "
+                                "would shut this host down (not armed)",
+                            )
+                            acted = True
+                    else:
+                        if not acted:
+                            _notify(
+                                webhook,
+                                f"battery {soc:g}% <= {threshold}% sustained; "
+                                "shutting this host down now",
+                            )
+                            acted = True
+                        click.echo(f"threshold sustained; running: {shutdown_cmd}")
+                        result = subprocess.run(shutdown_cmd, shell=True)
+                        if result.returncode != 0:
+                            LOG.error(
+                                "shutdown command failed (exit %s); retrying next poll",
+                                result.returncode,
+                            )
+            else:
+                below = 0
+                acted = False  # recovered above threshold; re-arm alerting
+            await asyncio.sleep(interval)
+
+
+@click.group()
+@click.option("-v", "--verbose", is_flag=True)
+def cli(verbose):
+    """Monitor an Anker Solix C1000 and shut down hosts on low battery."""
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
+
+
+@cli.command()
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", type=int, default=8787, show_default=True)
+@click.option(
+    "--pn",
+    default=DEFAULT_PN,
+    show_default=True,
+    help="Device product number to match.",
+)
+@click.option("--sn", default=None, help="Exact device serial (overrides --pn).")
+@click.option(
+    "--max-age",
+    type=int,
+    default=60,
+    show_default=True,
+    help="Report soc as null once the MQTT stream stalls this many seconds.",
+)
+@click.option(
+    "--webhook-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="File with a Discord webhook URL; used for --notify-step posts.",
+)
+@click.option(
+    "--notify-step",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Post to Discord each time SOC crosses a multiple of this percent (0 = off).",
+)
+@click.option(
+    "--notify-on",
+    type=click.Choice(["both", "discharge", "charge"]),
+    default="both",
+    show_default=True,
+    help="Which direction of --notify-step crossings to post.",
+)
+@click.option(
+    "--notify-charging/--no-notify-charging",
+    default=True,
+    show_default=True,
+    help="Post to Discord when a device starts charging.",
+)
+@cred_options
+def serve(
+    host,
+    port,
+    pn,
+    sn,
+    max_age,
+    webhook_file,
+    notify_step,
+    notify_on,
+    notify_charging,
+    secrets_file,
+):
+    """Read SOC of all account devices over Anker cloud MQTT and expose GET /soc."""
+    creds = _creds(secrets_file)
+    try:
+        asyncio.run(
+            _serve(
+                host,
+                port,
+                pn,
+                sn,
+                max_age,
+                creds,
+                webhook_file,
+                notify_step,
+                notify_on,
+                notify_charging,
+            )
+        )
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command()
+@click.option("--url", default="http://localhost:8787/soc", show_default=True)
+@click.option(
+    "--threshold",
+    type=int,
+    default=30,
+    show_default=True,
+    help="Shut down when SOC is at/below this percent.",
+)
+@click.option(
+    "--debounce",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Consecutive sub-threshold polls required before acting.",
+)
+@click.option(
+    "--interval", type=int, default=30, show_default=True, help="Seconds between polls."
+)
+@click.option("--shutdown", is_flag=True, help="Actually run the shutdown command.")
+@click.option("--shutdown-cmd", default="shutdown -h now", show_default=True)
+@click.option(
+    "--webhook-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="File with a Discord webhook URL; alerts on shutdown and blind monitoring.",
+)
+def check(url, threshold, debounce, interval, shutdown, shutdown_cmd, webhook_file):
+    """Poll a serve endpoint and shut this host down on sustained low SOC."""
+    try:
+        asyncio.run(
+            _check(
+                url, threshold, debounce, interval, shutdown, shutdown_cmd, webhook_file
+            )
+        )
+    except KeyboardInterrupt:
+        pass
+
+
+async def _connect(api, pn, sn, all_devices=False):
+    """Discover the primary device (and, with all_devices, every other MQTT-capable
+    device on the account) and start one subscribed, auto-triggered MQTT session.
+
+    Returns ([(serial, device), ...] primary first, poller task).
+    """
+    await api.get_bind_devices()
+    serial = _match_device(api, pn, sn)
+    if not serial:
+        raise click.ClickException(
+            f"no device matching pn={pn} sn={sn or '*'} on this account"
+        )
+    device = SolixMqttDeviceFactory(api, serial).create_device()
+    if device is None:
+        raise click.ClickException(f"device {serial} (pn={pn}) has no MQTT support")
+    found = [(serial, device)]
+    if all_devices:
+        for other in api.devices:
+            if other == serial:
+                continue
+            dev = None
+            if api.devices[other].get("mqtt_supported"):
+                dev = SolixMqttDeviceFactory(api, other).create_device()
+            if dev is None:
+                LOG.warning("skipping %s: no MQTT support", other)
+                continue
+            found.append((other, dev))
+    session = await api.startMqttSession()
+    if session is None:
+        raise click.ClickException("failed to start Anker MQTT session")
+    serials = {serial for serial, _ in found}
+    topics = {f"{session.get_topic_prefix(api.devices[s])}#" for s in serials}
+    poller = asyncio.create_task(
+        session.message_poller(topics, serials, timeout=TRIGGER_TIMEOUT)
+    )
+    return found, poller
+
+
+async def _await_status(device, wait):
+    """Poll the MQTT cache until battery_soc is populated or timeout."""
+    st = device.get_status()
+    for _ in range(max(1, wait // 5)):
+        if _soc(st) is not None:
+            return st
+        await asyncio.sleep(5)
+        st = device.get_status()
+    return st
+
+
+@cli.command()
+@click.option("--pn", default=DEFAULT_PN, show_default=True)
+@click.option("--sn", default=None, help="Exact device serial (overrides --pn).")
+@click.option(
+    "--wait",
+    type=int,
+    default=60,
+    show_default=True,
+    help="Max seconds to wait for the first realtime message.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Print the full status dict as JSON."
+)
+@cred_options
+def status(pn, sn, wait, as_json, secrets_file):
+    """One-shot: print the full realtime status the device publishes."""
+    creds = _creds(secrets_file)
+
+    async def run():
+        user, password, country = creds
+        async with ClientSession() as websession:
+            api = AnkerSolixApi(user, password, country, websession, LOG)
+            found, poller = await _connect(api, pn, sn)
+            device = found[0][1]
+            try:
+                st = await _await_status(device, wait)
+                if not st:
+                    raise click.ClickException(
+                        "no data received (device asleep or trigger not honored)"
+                    )
+                if as_json:
+                    click.echo(json.dumps(st, indent=2, default=str, sort_keys=True))
+                else:
+                    for key in sorted(st):
+                        click.echo(f"{key} = {st[key]}")
+            finally:
+                poller.cancel()
+                api.stopMqttSession()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command()
+@click.option("--pn", default=None, help="Filter by product number.")
+@cred_options
+def devices(pn, secrets_file):
+    """List devices on the account (debug; verify creds/region and find the SN)."""
+    creds = _creds(secrets_file)
+
+    async def run():
+        user, password, country = creds
+        async with ClientSession() as websession:
+            api = AnkerSolixApi(user, password, country, websession, LOG)
+            await api.update_sites()
+            await api.get_bind_devices()
+            if not api.devices:
+                click.echo(
+                    f"no devices for this account on region {country!r} "
+                    "(check ANKERCOUNTRY and that the account owns the device)"
+                )
+                return
+            for serial, dev in api.devices.items():
+                if pn and dev.get("device_pn") != pn:
+                    continue
+                click.echo(
+                    f"{serial}  pn={dev.get('device_pn')}  type={dev.get('type')}  "
+                    f"name={dev.get('name') or dev.get('alias')}"
+                )
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    cli()

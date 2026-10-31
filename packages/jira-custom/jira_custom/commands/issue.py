@@ -1,0 +1,684 @@
+"""Issue commands for jira-custom."""
+
+import os
+import tempfile
+import webbrowser
+import click
+
+from ..adf import (
+    adf_to_markdown,
+    find_unsupported,
+    get_description_adf,
+    markdown_to_adf,
+    set_description_adf,
+)
+from ..client import get_jira_client
+from ..editor import edit_in_editor
+from ..utils import ISSUE_KEY, parse_labels, move_issue_type, parse_jira_url
+from .attachment import attachment_group
+from .comment import comment_group, comment_edit_fn
+from .transition import transition_group
+
+
+def issue_create_fn(
+    project,
+    summary,
+    issue_type="Task",
+    description=None,
+    parent=None,
+    assignee=None,
+    labels=None,
+):
+    """Create a new issue"""
+    jira = get_jira_client()
+    fields = {
+        "project": {"key": project},
+        "summary": summary,
+        "issuetype": {"name": issue_type},
+    }
+    if parent:
+        fields["parent"] = {"key": parent}
+    if assignee:
+        fields["assignee"] = {"name": assignee}
+    if labels:
+        fields["labels"] = list(labels)
+    # API v2 takes wiki markup; set markdown descriptions through v3 as ADF.
+    # Convert first so a bad description fails before the issue exists.
+    doc = markdown_to_adf(description) if description else None
+    issue = jira.create_issue(fields=fields)
+    if doc:
+        try:
+            set_description_adf(jira, issue.key, doc)
+        except click.ClickException:
+            click.echo(issue.key)
+            raise
+    click.echo(issue.key)
+
+
+def issue_update_fn(
+    issue_key,
+    summary=None,
+    description=None,
+    assignee=None,
+    labels_add=None,
+    labels_remove=None,
+    issue_type=None,
+):
+    """Update an existing issue"""
+    jira = get_jira_client()
+
+    # Type changes use Bulk Move API (separate async operation)
+    if issue_type:
+        move_issue_type(jira, issue_key, issue_type)
+        click.echo(f"Changed {issue_key} type to {issue_type}", err=True)
+        # If only type change requested, we're done
+        if not any([summary, description, assignee, labels_add, labels_remove]):
+            return
+
+    issue = jira.issue(issue_key)
+
+    fields = {}
+    update = {}
+
+    if summary:
+        fields["summary"] = summary
+    if assignee:
+        fields["assignee"] = {"name": assignee}
+
+    if labels_add or labels_remove:
+        label_ops = []
+        if labels_add:
+            for label in labels_add:
+                label_ops.append({"add": label})
+        if labels_remove:
+            for label in labels_remove:
+                label_ops.append({"remove": label})
+        update["labels"] = label_ops
+
+    if not fields and not update and not description:
+        raise click.ClickException("No fields to update")
+
+    doc = markdown_to_adf(description) if description else None
+
+    if update:
+        issue.update(fields=fields, update=update)
+    elif fields:
+        issue.update(fields=fields)
+
+    if doc:
+        set_description_adf(jira, issue_key, doc)
+
+    click.echo(f"Updated {issue_key}", err=True)
+
+
+def issue_edit_fn(issue_key, field="description"):
+    """Edit an issue field in $EDITOR"""
+    jira = get_jira_client()
+
+    if field == "description":
+        doc = get_description_adf(jira, issue_key)
+        unsupported = find_unsupported(doc)
+        if unsupported:
+            # Saving markdown back would drop these; edit in the web UI instead
+            raise click.ClickException(
+                f"Description has content markdown can't hold "
+                f"({', '.join(unsupported)}); edit it in the web UI"
+            )
+        original = adf_to_markdown(doc)
+    elif field == "summary":
+        original = jira.issue(issue_key).fields.summary or ""
+    else:
+        raise click.ClickException(f"Unsupported field: {field}")
+
+    new_text = edit_in_editor(original, suffix=f"-{issue_key}-{field}")
+
+    if new_text == original:
+        click.echo("No changes made", err=True)
+        return
+
+    if field == "description":
+        try:
+            set_description_adf(jira, issue_key, markdown_to_adf(new_text))
+        except click.ClickException as e:
+            # Don't lose the editor session; keep the text for a retry
+            with tempfile.NamedTemporaryFile(
+                mode="w", prefix=f"jira-{issue_key}-", suffix=".md", delete=False
+            ) as f:
+                f.write(new_text)
+            raise click.ClickException(f"{e.message}\nYour edit is saved in {f.name}")
+    else:
+        jira.issue(issue_key).update(fields={field: new_text})
+    click.echo(f"Updated {field} of {issue_key}", err=True)
+
+
+def status_get_fn(issue_key):
+    """Get issue status"""
+    jira = get_jira_client()
+    issue = jira.issue(issue_key)
+    click.echo(issue.fields.status.name)
+
+
+def issue_assign_fn(issue_key, user):
+    """Assign or unassign an issue"""
+    jira = get_jira_client()
+    issue = jira.issue(issue_key)
+
+    if user.lower() == "x":
+        issue.update(assignee=None)
+        click.echo(f"Unassigned {issue_key}", err=True)
+    else:
+        issue.update(assignee={"name": user})
+        click.echo(f"Assigned {issue_key} to {user}", err=True)
+
+
+def issue_view_fn(issue_key):
+    """View issue details"""
+    jira = get_jira_client()
+    issue = jira.issue(issue_key)
+    fields = issue.fields
+
+    click.echo(f"Issue:       {issue.key}")
+    click.echo(f"Summary:     {fields.summary}")
+    click.echo(f"Status:      {fields.status.name}")
+    click.echo(f"Type:        {fields.issuetype.name}")
+    click.echo(f"Priority:    {fields.priority.name if fields.priority else 'None'}")
+
+    assignee = fields.assignee.displayName if fields.assignee else "Unassigned"
+    reporter = fields.reporter.displayName if fields.reporter else "Unknown"
+    click.echo(f"Assignee:    {assignee}")
+    click.echo(f"Reporter:    {reporter}")
+
+    if hasattr(fields, "labels") and fields.labels:
+        click.echo(f"Labels:      {', '.join(fields.labels)}")
+
+    if hasattr(fields, "components") and fields.components:
+        components = [c.name for c in fields.components]
+        click.echo(f"Components:  {', '.join(components)}")
+
+    click.echo(f"Created:     {fields.created}")
+    click.echo(f"Updated:     {fields.updated}")
+    if fields.resolutiondate:
+        click.echo(f"Resolved:    {fields.resolutiondate}")
+
+    if hasattr(fields, "parent") and fields.parent:
+        click.echo(f"Parent:      {fields.parent.key}")
+
+    click.echo()
+    click.echo("-" * 60)
+    click.echo("Description:")
+    click.echo()
+    try:
+        description = adf_to_markdown(get_description_adf(jira, issue_key))
+    except click.ClickException as e:
+        click.echo(f"  (Markdown unavailable: {e.message}; showing wiki markup)")
+        description = fields.description
+    if description:
+        click.echo(description, nl=False)
+    else:
+        click.echo("  (No description)")
+
+    if hasattr(fields, "attachment") and fields.attachment:
+        click.echo()
+        click.echo("-" * 60)
+        click.echo(f"Attachments ({len(fields.attachment)}):")
+        click.echo()
+        for att in fields.attachment:
+            size = int(att.size)
+            if size >= 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+            elif size >= 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size} B"
+            click.echo(f"  [{att.id}] {att.filename} ({size_str})")
+
+    if hasattr(fields, "issuelinks") and fields.issuelinks:
+        click.echo()
+        click.echo("-" * 60)
+        click.echo("Linked Issues:")
+        click.echo()
+        for link in fields.issuelinks:
+            if hasattr(link, "outwardIssue"):
+                click.echo(
+                    f"{link.type.outward} {link.outwardIssue.key}: {link.outwardIssue.fields.summary}"
+                )
+            if hasattr(link, "inwardIssue"):
+                click.echo(
+                    f"{link.type.inward} {link.inwardIssue.key}: {link.inwardIssue.fields.summary}"
+                )
+
+    comments = jira.comments(issue)
+    if comments:
+        top_comment = comments[-1]
+        click.echo()
+        click.echo("-" * 60)
+        click.echo(f"Latest Comment ({len(comments)} total):")
+        click.echo()
+        click.echo(f"Author:  {top_comment.author.displayName}")
+        click.echo(f"Created: {top_comment.created}")
+        click.echo()
+        click.echo(top_comment.body)
+
+
+def issue_fields_fn(filter_pattern=None):
+    """List fields that may be required for transitions"""
+    jira = get_jira_client()
+
+    # Get all field definitions
+    url = f"{jira._options['server']}/rest/api/2/field"
+    response = jira._session.get(url)
+    if response.status_code != 200:
+        raise click.ClickException(f"Failed to get fields: {response.text}")
+
+    all_fields = response.json()
+
+    # Keywords that suggest transition-related fields
+    transition_keywords = [
+        "resolution",
+        "steps",
+        "action",
+        "taken",
+        "done",
+        "closing",
+        "reason",
+        "complete",
+        "finish",
+        "resolve",
+    ]
+
+    if filter_pattern:
+        # User-provided filter
+        keywords = [filter_pattern.lower()]
+    else:
+        keywords = transition_keywords
+
+    # Filter to custom fields matching keywords
+    matching = []
+    for f in all_fields:
+        name = f.get("name", "").lower()
+        if f.get("custom") and any(kw in name for kw in keywords):
+            matching.append(f)
+
+    if not matching:
+        click.echo("No matching fields found")
+        return
+
+    click.echo("Fields matching transition-related keywords:")
+    click.echo()
+    for f in sorted(matching, key=lambda x: x.get("name", "")):
+        fid = f.get("id")
+        name = f.get("name")
+        schema = f.get("schema", {})
+        ftype = schema.get("type", "unknown")
+        click.echo(f"  {fid}: {name} [{ftype}]")
+
+
+def issue_link_fn(inward_key, outward_key, link_type):
+    """Link two issues"""
+    jira = get_jira_client()
+    jira.create_issue_link(
+        type=link_type, inwardIssue=inward_key, outwardIssue=outward_key
+    )
+    click.echo(f"Linked {inward_key} -> {outward_key} ({link_type})", err=True)
+
+
+def issue_unlink_fn(key1, key2):
+    """Remove link between two issues"""
+    jira = get_jira_client()
+    issue = jira.issue(key1)
+
+    for link in issue.fields.issuelinks:
+        linked_key = None
+        if hasattr(link, "outwardIssue"):
+            linked_key = link.outwardIssue.key
+        elif hasattr(link, "inwardIssue"):
+            linked_key = link.inwardIssue.key
+
+        if linked_key == key2:
+            jira.delete_issue_link(link.id)
+            click.echo(f"Unlinked {key1} <-> {key2}", err=True)
+            return
+
+    raise click.ClickException(f"No link found between {key1} and {key2}")
+
+
+def link_types_list_fn():
+    """List available link types"""
+    jira = get_jira_client()
+    for lt in jira.issue_link_types():
+        click.echo(f"{lt.name}")
+        click.echo(f"  Inward:  {lt.inward}")
+        click.echo(f"  Outward: {lt.outward}")
+        click.echo()
+
+
+def issue_types_list_fn(project=None, show_ids=False):
+    """List available issue types"""
+    jira = get_jira_client()
+
+    if project:
+        proj = jira.project(project)
+        issue_types = proj.issueTypes
+    else:
+        issue_types = jira.issue_types()
+
+    for it in issue_types:
+        subtask = " (subtask)" if it.subtask else ""
+        if show_ids:
+            click.echo(f"{it.id}\t{it.name}{subtask}")
+        else:
+            click.echo(f"{it.name}{subtask}")
+
+
+def issue_list_fn(
+    project=None,
+    parent=None,
+    issue_type=None,
+    status=None,
+    assignee=None,
+    reporter=None,
+    priority=None,
+    labels=None,
+    jql=None,
+    order_by="created",
+    reverse=False,
+    limit=50,
+):
+    """List issues with flexible JQL-based filtering"""
+    jira = get_jira_client()
+
+    jql_parts = []
+
+    if jql:
+        jql_parts.append(f"({jql})")
+
+    if project:
+        jql_parts.append(f'project = "{project}"')
+
+    if parent:
+        jql_parts.append(f"parent = {parent}")
+
+    if issue_type:
+        jql_parts.append(f'issuetype = "{issue_type}"')
+
+    if status:
+        if status.startswith("~"):
+            jql_parts.append(f'status != "{status[1:]}"')
+        else:
+            jql_parts.append(f'status = "{status}"')
+
+    if assignee:
+        if assignee.lower() == "unassigned":
+            jql_parts.append("assignee IS EMPTY")
+        elif assignee.lower() == "me":
+            email = os.getenv("JIRA_EMAIL")
+            jql_parts.append(f'assignee = "{email}"')
+        else:
+            jql_parts.append(f'assignee = "{assignee}"')
+
+    if reporter:
+        if reporter.lower() == "me":
+            email = os.getenv("JIRA_EMAIL")
+            jql_parts.append(f'reporter = "{email}"')
+        else:
+            jql_parts.append(f'reporter = "{reporter}"')
+
+    if priority:
+        jql_parts.append(f'priority = "{priority}"')
+
+    if labels:
+        for label in labels:
+            if label.startswith("~"):
+                jql_parts.append(f'labels != "{label[1:]}"')
+            else:
+                jql_parts.append(f'labels = "{label}"')
+
+    if not jql_parts:
+        raise click.ClickException(
+            "At least one filter is required (--project, --parent, --jql, etc.)"
+        )
+
+    order_dir = "ASC" if reverse else "DESC"
+    jql_query = " AND ".join(jql_parts) + f" ORDER BY {order_by} {order_dir}"
+
+    issues = jira.search_issues(jql_query, maxResults=limit)
+
+    if not issues:
+        click.echo("No issues found", err=True)
+        return
+
+    click.echo(f"{'KEY':<15} {'TYPE':<12} {'STATUS':<15} {'ASSIGNEE':<20} {'SUMMARY'}")
+    click.echo("-" * 100)
+
+    for issue in issues:
+        key = issue.key
+        itype = issue.fields.issuetype.name[:10]
+        status_name = issue.fields.status.name[:13]
+        assignee_name = (
+            issue.fields.assignee.displayName[:18]
+            if issue.fields.assignee
+            else "Unassigned"
+        )
+        summary = issue.fields.summary
+        if len(summary) > 35:
+            summary = summary[:32] + "..."
+        click.echo(
+            f"{key:<15} {itype:<12} {status_name:<15} {assignee_name:<20} {summary}"
+        )
+
+
+def open_issue_fn(issue_key=None):
+    """Open issue or project in browser"""
+    server = os.getenv("JIRA_SERVER")
+
+    if issue_key:
+        url = f"{server}/browse/{issue_key}"
+    else:
+        url = server
+
+    webbrowser.open(url)
+    click.echo(f"Opened {url}", err=True)
+
+
+@click.group("issue")
+def issue_group():
+    """Manage issues"""
+    pass
+
+
+# Add subgroups
+issue_group.add_command(attachment_group)
+issue_group.add_command(comment_group)
+issue_group.add_command(transition_group)
+
+
+@issue_group.command("create")
+@click.argument("project")
+@click.argument("summary")
+@click.option("--type", "issue_type", default="Task", help="Issue type (default: Task)")
+@click.option("-d", "--description", help="Issue description")
+@click.option("-p", "--parent", help="Parent issue key for sub-tasks")
+@click.option("-a", "--assignee", help="Assignee email/name")
+@click.option("-l", "--label", multiple=True, help="Add label (can be repeated)")
+def issue_create_cmd(
+    project, summary, issue_type, description, parent, assignee, label
+):
+    """Create a new issue"""
+    labels = list(label) if label else None
+    issue_create_fn(project, summary, issue_type, description, parent, assignee, labels)
+
+
+@issue_group.command("update")
+@click.argument("issue_key", type=ISSUE_KEY)
+@click.option("-s", "--summary", help="New issue summary/title")
+@click.option("-d", "--description", help="New issue description")
+@click.option("-a", "--assignee", help="New assignee (email/name)")
+@click.option(
+    "-l", "--label", multiple=True, help="Add/remove label (prefix with - to remove)"
+)
+@click.option(
+    "-t", "--type", "issue_type", help="Change issue type (e.g., Task, Story, Bug)"
+)
+def issue_update_cmd(issue_key, summary, description, assignee, label, issue_type):
+    """Update an existing issue"""
+    labels_add, labels_remove = parse_labels(list(label)) if label else (None, None)
+    issue_update_fn(
+        issue_key, summary, description, assignee, labels_add, labels_remove, issue_type
+    )
+
+
+@issue_group.command("edit")
+@click.argument("url_or_key")
+@click.option(
+    "-f",
+    "--field",
+    default="description",
+    type=click.Choice(["description", "summary"]),
+    help="Field to edit (default: description)",
+)
+def issue_edit_cmd(url_or_key, field):
+    """Edit an issue field in $EDITOR.
+
+    Accepts a full Jira URL or plain issue key. If the URL contains a
+    focusedCommentId parameter, edits that comment instead.
+
+      jira-custom issue edit PROJ-123
+      jira-custom issue edit https://.../browse/PROJ-123
+      jira-custom issue edit https://.../browse/PROJ-123?focusedCommentId=197541
+    """
+    issue_key, comment_id = parse_jira_url(url_or_key)
+    if comment_id:
+        comment_edit_fn(issue_key, comment_id)
+    else:
+        issue_edit_fn(issue_key, field)
+
+
+@issue_group.command("view")
+@click.argument("issue_key", type=ISSUE_KEY)
+def issue_view_cmd(issue_key):
+    """View issue details"""
+    issue_view_fn(issue_key)
+
+
+@issue_group.command("status")
+@click.argument("issue_key", type=ISSUE_KEY)
+def issue_status_cmd(issue_key):
+    """Get issue status"""
+    status_get_fn(issue_key)
+
+
+@issue_group.command("fields")
+@click.option("-f", "--filter", "filter_pattern", help="Filter fields by name pattern")
+def issue_fields_cmd(filter_pattern):
+    """List custom fields that may be required for transitions"""
+    issue_fields_fn(filter_pattern)
+
+
+@issue_group.command("assign")
+@click.argument("issue_key", type=ISSUE_KEY)
+@click.argument("user")
+def issue_assign_cmd(issue_key, user):
+    """Assign/unassign issue (use 'x' to unassign)"""
+    issue_assign_fn(issue_key, user)
+
+
+@issue_group.command("link")
+@click.argument("inward_key", type=ISSUE_KEY)
+@click.argument("outward_key", type=ISSUE_KEY)
+@click.argument("link_type")
+def issue_link_cmd(inward_key, outward_key, link_type):
+    """Link two issues"""
+    issue_link_fn(inward_key, outward_key, link_type)
+
+
+@issue_group.command("unlink")
+@click.argument("key1", type=ISSUE_KEY)
+@click.argument("key2", type=ISSUE_KEY)
+def issue_unlink_cmd(key1, key2):
+    """Remove link between issues"""
+    issue_unlink_fn(key1, key2)
+
+
+@issue_group.command("link-types")
+def issue_link_types_cmd():
+    """List available link types"""
+    link_types_list_fn()
+
+
+@issue_group.command("types")
+@click.option("-p", "--project", help="Show types for specific project")
+@click.option("--ids", is_flag=True, help="Show issue type IDs")
+def issue_types_cmd(project, ids):
+    """List available issue types"""
+    issue_types_list_fn(project, ids)
+
+
+@issue_group.command("list")
+@click.option("-p", "--project", help="Filter by project key")
+@click.option("-P", "--parent", help="Filter by parent issue key (list children)")
+@click.option("-t", "--type", "issue_type", help="Filter by issue type")
+@click.option("-s", "--status", help="Filter by status (prefix ~ to exclude)")
+@click.option("-a", "--assignee", help="Filter by assignee (use 'me' or 'unassigned')")
+@click.option("-r", "--reporter", help="Filter by reporter (use 'me')")
+@click.option("-y", "--priority", help="Filter by priority")
+@click.option(
+    "-l", "--label", multiple=True, help="Filter by label (prefix ~ to exclude)"
+)
+@click.option("-q", "--jql", help="Raw JQL query (combined with other filters)")
+@click.option("--order-by", default="created", help="Sort field (default: created)")
+@click.option(
+    "--reverse", is_flag=True, help="Reverse sort order (ASC instead of DESC)"
+)
+@click.option("-n", "--limit", type=int, default=50, help="Max results (default: 50)")
+def issue_list_cmd(
+    project,
+    parent,
+    issue_type,
+    status,
+    assignee,
+    reporter,
+    priority,
+    label,
+    jql,
+    order_by,
+    reverse,
+    limit,
+):
+    """List issues with flexible filtering
+
+    Examples:
+
+      # List children of an issue
+      jira-custom issue list -P PROJ-28797
+
+      # List all tasks in a project
+      jira-custom issue list -p PROJ -t Task
+
+      # List my open issues
+      jira-custom issue list -p PROJ -a me -s "~Done"
+
+      # Raw JQL query
+      jira-custom issue list -q "sprint in openSprints()"
+    """
+    labels = list(label) if label else None
+    issue_list_fn(
+        project,
+        parent,
+        issue_type,
+        status,
+        assignee,
+        reporter,
+        priority,
+        labels,
+        jql,
+        order_by,
+        reverse,
+        limit,
+    )
+
+
+@issue_group.command("open")
+@click.argument("issue_key", required=False, type=ISSUE_KEY)
+def issue_open_cmd(issue_key):
+    """Open issue in browser"""
+    open_issue_fn(issue_key)

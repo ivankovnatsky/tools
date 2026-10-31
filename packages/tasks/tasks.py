@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""Table view of markdown task files.
+
+Recursively scans `--root` for `*.md` files and parses multiple task
+formats simultaneously. By default it scans the `Planning/Tasks`
+subdirectory of the Syncthing-managed Obsidian notes vault at
+`~/Notes/Planning/Tasks` — plus the vault's `Archive/Tasks` directory for
+archived tasks. If no vault is found and no `--root`/`$TASKS_ROOT` is
+given, the command errors out (it never scans cwd); if the vault exists
+but `Planning/Tasks` is missing, the whole vault is scanned. Passing
+`--root` restricts scanning to that single directory (add `--archive-root`
+to also scan an archive).
+
+- TaskForge inline (Obsidian Tasks): checkbox states `[ /!>x-]` plus emoji
+  metadata (➕ created, 🛫 start, ⏳ scheduled, 📅 due, ✅ done, ❌ cancelled,
+  priority 🔺⏫🔼🔽⏬, `#tag`s, and ` — ` notes separator).
+- TaskNote files: YAML frontmatter with `title`, `status`, optional
+  `taskSourceType: taskNotes`, and a free-form markdown body.
+
+Usage:
+  tasks [all|pending|completed|done|cancelled]
+      [--root PATH] [--archive-root PATH] [--limit N]
+      [--format simple|json]
+
+Subcommands select which tasks to show (default `pending`); options follow the
+subcommand name. A bare `tasks` (or `tasks` with only options) runs `pending`.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+import click
+
+NOTES_CANDIDATES = ("Notes",)
+
+
+def resolve_roots(
+    root: Path | None,
+    archive_root: Path | None,
+    include_default_archive: bool = True,
+) -> list[Path]:
+    """Resolve the list of scan roots.
+
+    Defaults: `<notes-vault>/Planning/Tasks` (active) plus
+    `<notes-vault>/Archive/Tasks` (archived) when they exist. Both roots
+    point at a `Tasks` directory so project names come out consistently
+    relative to it (e.g. `Finance`, `Configs/NixConfig`). If the vault
+    exists but `Planning/Tasks` doesn't (layout changed again), falls back
+    to scanning the whole vault; errors out only when no vault directory
+    exists at all. Vault detection mirrors the `notes` skill and uses the
+    Syncthing-managed `~/Notes` path on every host. An explicit `root`
+    restricts scanning to that directory alone (no implicit archive); pass
+    `archive_root` to also scan an archive.
+    With `include_default_archive=False` the archive default is
+    skipped (used by `pending` mode — archived tasks are finished by
+    definition); an explicit `archive_root` is still honored.
+    """
+    if root is None:
+        home = Path.home()
+        vault: Path | None = None
+        for rel in NOTES_CANDIDATES:
+            if (home / rel).is_dir():
+                vault = home / rel
+                break
+        if vault is None:
+            raise click.UsageError(
+                "No notes vault found (checked "
+                + ", ".join(f"~/{c}" for c in NOTES_CANDIDATES)
+                + ") and no --root/$TASKS_ROOT given. Refusing to scan cwd."
+            )
+        if (vault / "Planning" / "Tasks").is_dir():
+            root = vault / "Planning" / "Tasks"
+        else:
+            # Layout changed again? Scan the whole vault rather than miss tasks.
+            root = vault
+        if archive_root is None and include_default_archive:
+            candidate = vault / "Archive" / "Tasks"
+            if candidate.is_dir():
+                archive_root = candidate
+
+    roots = [root]
+    if archive_root is not None:
+        r, a = root.resolve(), archive_root.resolve()
+        # Skip the archive root if either root contains the other — the
+        # containing root's rglob already covers the nested one, and scanning
+        # both would emit duplicate tasks.
+        if not (a == r or a.is_relative_to(r) or r.is_relative_to(a)):
+            roots.append(archive_root)
+    return roots
+
+
+TASK_RE = re.compile(r"^- \[([ x/!>\-])\] (.*)$")
+SUBKV_RE = re.compile(r"^  - ([A-Za-z][A-Za-z0-9_]*): (.*)$")
+
+CHECKBOX_STATUS = {
+    " ": "todo",
+    "/": "in-progress",
+    "!": "on-hold",
+    ">": "planned",
+    "x": "done",
+    "-": "cancelled",
+}
+
+PENDING_STATUSES = {"todo", "in-progress", "on-hold", "planned"}
+COMPLETED_STATUSES = {"done", "cancelled"}
+KNOWN_STATUSES = PENDING_STATUSES | COMPLETED_STATUSES
+
+INLINE_DATE_EMOJI = {
+    "➕": "createdDate",  # ➕
+    "\U0001f6eb": "start",  # 🛫
+    "⏳": "scheduled",  # ⏳
+    "\U0001f4c5": "due",  # 📅
+    "✅": "completedDate",  # ✅
+    "❌": "cancelledDate",  # ❌
+}
+
+PRIORITY_EMOJI = {
+    "\U0001f53a": "highest",  # 🔺
+    "⏫": "high",  # ⏫
+    "\U0001f53c": "medium",  # 🔼
+    "\U0001f53d": "low",  # 🔽
+    "⏬": "lowest",  # ⏬
+}
+
+INLINE_DATE_RE = re.compile(
+    "("
+    + "|".join(re.escape(e) for e in INLINE_DATE_EMOJI)
+    + r")\s*(\d{4}-\d{2}-\d{2})(?=\s|$)"
+)
+INLINE_PRIORITY_RE = re.compile(
+    "(" + "|".join(re.escape(e) for e in PRIORITY_EMOJI) + ")"
+)
+TAG_RE = re.compile(r"(?:^|\s)#([A-Za-z][\w/]*(?:-[\w/]+)*)")
+PAREN_BLOCK_RE = re.compile(r"\(([^()]*)\)")
+PAREN_KV_RE = re.compile(
+    r"^(created|completed|due|cancelled|started|scheduled):\s*(.*)$",
+    re.IGNORECASE,
+)
+FM_DELIM = "---"
+FM_KEY_RE = re.compile(r"^([A-Za-z][\w-]*):\s*(.*)$")
+
+
+@dataclass
+class Task:
+    project: str = ""
+    status: str = "todo"
+    title: str = ""
+    notes: str = ""
+    file: str = ""
+    line: int = 0
+    extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class Options:
+    all: bool = False
+    pending: bool = False
+    completed: bool = False
+    done: bool = False
+    cancelled: bool = False
+    limit: int | None = 20
+
+
+def _strip_quotes(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def parse_inline_meta(text: str) -> tuple[str, dict, list[str]]:
+    """Strip TaskForge emoji/tag metadata from a checkbox title.
+
+    Returns (cleaned_text, extras_dict, tags_list).
+    """
+    extras: dict = {}
+    tags: list[str] = []
+
+    def tag_sub(m: re.Match) -> str:
+        tags.append(m.group(1))
+        return " "
+
+    text = TAG_RE.sub(tag_sub, text)
+
+    def pri_sub(m: re.Match) -> str:
+        extras["priority"] = PRIORITY_EMOJI[m.group(1)]
+        return " "
+
+    text = INLINE_PRIORITY_RE.sub(pri_sub, text)
+
+    def date_sub(m: re.Match) -> str:
+        extras.setdefault(INLINE_DATE_EMOJI[m.group(1)], m.group(2))
+        return " "
+
+    text = INLINE_DATE_RE.sub(date_sub, text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text, extras, tags
+
+
+def parse_paren_tail(text: str) -> tuple[str, dict]:
+    """Strip a legacy `(key: val, key: val)` metadata block from a title.
+
+    Scans `(...)` blocks rightmost-first and strips the first one whose
+    contents parse entirely as `key: value` pairs. This lets a trailing
+    non-meta paren (e.g. `(note)`) coexist with a meta block earlier in the
+    title.
+    """
+    matches = list(PAREN_BLOCK_RE.finditer(text))
+    for m in reversed(matches):
+        parts = [p.strip() for p in m.group(1).split(",") if p.strip()]
+        if not parts:
+            continue
+        candidate: dict = {}
+        ok = True
+        for p in parts:
+            kv = PAREN_KV_RE.match(p)
+            if not kv:
+                ok = False
+                break
+            candidate[kv.group(1).lower()] = kv.group(2).strip()
+        if ok:
+            new_text = text[: m.start()] + " " + text[m.end() :]
+            new_text = re.sub(r"\s+", " ", new_text).strip()
+            return new_text, candidate
+    return text, {}
+
+
+def split_title_notes(text: str) -> tuple[str, str]:
+    parts = text.split(" — ", 1)  # ` — ` em-dash separator
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return text.strip(), ""
+
+
+def parse_frontmatter(lines: list[str]) -> tuple[dict, int]:
+    """Parse YAML-ish frontmatter at the top of `lines`.
+
+    Supports scalar values (with optional quotes), flow lists `[a, b]`, and
+    block lists (`key:` followed by `  - item` lines). Returns (data, body_start_index).
+    Returns ({}, 0) if no frontmatter is present or it never closes.
+    """
+    if not lines or lines[0].strip() != FM_DELIM:
+        return {}, 0
+    data: dict = {}
+    current_list_key: str | None = None
+    i = 1
+    while i < len(lines):
+        ln = lines[i]
+        if ln.strip() == FM_DELIM:
+            return data, i + 1
+        if current_list_key is not None and ln.startswith("  - "):
+            data[current_list_key].append(_strip_quotes(ln[4:].strip()))
+            i += 1
+            continue
+        current_list_key = None
+        m = FM_KEY_RE.match(ln)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if val == "":
+                data[key] = []
+                current_list_key = key
+            elif val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1]
+                data[key] = [_strip_quotes(x) for x in inner.split(",") if x.strip()]
+            else:
+                data[key] = _strip_quotes(val)
+        i += 1
+    return {}, 0
+
+
+TASKNOTE_FIELDS = (
+    "createdDate",
+    "dateCreated",
+    "completedDate",
+    "cancelledDate",
+    "due",
+    "dueAt",
+    "scheduled",
+    "start",
+    "priority",
+    "project",
+    "context",
+    "recurrence",
+    "taskSourceType",
+)
+
+
+def make_tasknote(
+    fm: dict, body_lines: list[str], path: Path, project: str
+) -> Task | None:
+    status = fm.get("status")
+    title = fm.get("title", "")
+    is_tasknote = fm.get("taskSourceType") == "taskNotes" or (
+        isinstance(status, str) and status in KNOWN_STATUSES and title
+    )
+    if not is_tasknote:
+        return None
+
+    extra: dict = {}
+    for k in TASKNOTE_FIELDS:
+        v = fm.get(k)
+        if v:
+            extra[k] = v
+    tags = fm.get("tags")
+    if isinstance(tags, list) and tags:
+        extra["tags"] = ",".join(tags)
+    elif isinstance(tags, str) and tags:
+        extra["tags"] = tags
+
+    body = "\n".join(body_lines).strip()
+    notes = " ".join(body.split())
+
+    return Task(
+        project=project,
+        status=status if status in KNOWN_STATUSES else "todo",
+        title=title,
+        notes=notes,
+        file=str(path),
+        line=1,
+        extra=extra,
+    )
+
+
+def parse_file(path: Path, root: Path) -> list[Task]:
+    rel = path.relative_to(root)
+    project = str(rel.parent) if rel.parent != Path(".") else path.parent.name
+
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    tasks: list[Task] = []
+
+    fm, body_start = parse_frontmatter(lines)
+    if fm:
+        body_lines = lines[body_start:]
+        tn = make_tasknote(fm, body_lines, path, project)
+        if tn is not None:
+            # The TaskNote IS the task; body checkboxes are its sub-checklist
+            # and should not surface as their own top-level tasks.
+            tasks.append(tn)
+            return tasks
+        scan_lines = lines[body_start:]
+        scan_offset = body_start
+    else:
+        scan_lines = lines
+        scan_offset = 0
+
+    i = 0
+    while i < len(scan_lines):
+        line = scan_lines[i]
+        m = TASK_RE.match(line)
+        if not m:
+            i += 1
+            continue
+
+        status = CHECKBOX_STATUS.get(m.group(1), "todo")
+        raw = m.group(2)
+
+        cleaned, inline_extras, tags = parse_inline_meta(raw)
+        cleaned, paren_extras = parse_paren_tail(cleaned)
+        title, notes_inline = split_title_notes(cleaned)
+
+        t = Task(
+            project=project,
+            status=status,
+            title=title,
+            file=str(path),
+            line=scan_offset + i + 1,
+        )
+        if tags:
+            t.extra["tags"] = ",".join(tags)
+        # Precedence: inline emoji meta > sub-bullet meta > legacy paren tail.
+        # Inline is the canonical TaskForge source; legacy formats only fill
+        # gaps inline didn't supply.
+        t.extra.update(inline_extras)
+        for k, v in paren_extras.items():
+            t.extra.setdefault(k, v)
+
+        j = i + 1
+        notes_extra: list[str] = []
+        while j < len(scan_lines):
+            ln = scan_lines[j]
+            if not ln.startswith("  "):
+                break
+            sub = SUBKV_RE.match(ln)
+            if sub:
+                k, v = sub.group(1), sub.group(2).strip()
+                t.extra.setdefault(k, v)
+            else:
+                stripped = ln.strip().lstrip("- ").strip()
+                if stripped:
+                    notes_extra.append(stripped)
+            j += 1
+
+        explicit_notes = t.extra.pop("notes", "")
+        t.notes = " | ".join(
+            x for x in [notes_inline, explicit_notes, *notes_extra] if x
+        )
+
+        tasks.append(t)
+        i = j
+    return tasks
+
+
+def gather(roots: list[Path]) -> list[Task]:
+    files: list[tuple[Path, Path]] = []
+    for root in roots:
+        files.extend(
+            (f, root)
+            for f in root.rglob("*.md")
+            if not any(part.startswith(".") for part in f.relative_to(root).parts)
+        )
+    files.sort(key=lambda pair: pair[0].stat().st_mtime)
+    out: list[Task] = []
+    for f, root in files:
+        out.extend(parse_file(f, root))
+    pending = [t for t in out if t.status in PENDING_STATUSES]
+    done = [t for t in out if t.status in COMPLETED_STATUSES]
+    other = [t for t in out if t.status not in KNOWN_STATUSES]
+    return pending + done + other
+
+
+def filter_tasks(tasks: list[Task], args) -> list[Task]:
+    out = tasks
+    if args.pending:
+        out = [t for t in out if t.status in PENDING_STATUSES]
+    elif args.completed:
+        out = [t for t in out if t.status in COMPLETED_STATUSES]
+    elif args.done:
+        out = [t for t in out if t.status == "done"]
+    elif args.cancelled:
+        out = [t for t in out if t.status == "cancelled"]
+    elif not args.all:
+        out = [t for t in out if t.status in PENDING_STATUSES]
+    if args.limit:
+        out = out[: args.limit]
+    return out
+
+
+def _show_status_column(tasks: list[Task]) -> bool:
+    return any(t.status != "todo" for t in tasks)
+
+
+def _status_cell(t: Task) -> str:
+    return "" if t.status == "todo" else t.status
+
+
+def render_simple(tasks: list[Task], totals: dict | None = None) -> str:
+    """Bare list of titles, one per line, truncated to terminal width.
+
+    A `status  ` prefix is prepended only when some task is not plain `todo`.
+    No header or separator — the trailing totals line summarizes the set.
+    """
+    show_status = _show_status_column(tasks)
+    sep = "  "
+    status_width = (
+        max((len(_status_cell(t)) for t in tasks), default=0) if show_status else 0
+    )
+    prefix_width = status_width + len(sep) if show_status else 0
+    term_width = shutil.get_terminal_size((100, 24)).columns
+    title_width = max(20, term_width - prefix_width)
+
+    out: list[str] = []
+    for t in tasks:
+        title = t.title
+        if len(title) > title_width:
+            title = title[: max(1, title_width - 1)] + ".."
+        prefix = _status_cell(t).ljust(status_width) + sep if show_status else ""
+        line = (prefix + title).rstrip()
+        if t.status in COMPLETED_STATUSES:
+            line = f"\033[2m{line}\033[0m"
+        out.append(line)
+    out.append("")
+    if totals:
+        out.append(
+            f"shown: {len(tasks)}  "
+            f"total: {totals['total']} "
+            f"(pending: {totals['pending']}, "
+            f"done: {totals['done']}, "
+            f"cancelled: {totals['cancelled']})"
+        )
+    else:
+        out.append(f"{len(tasks)} tasks")
+    return "\n".join(out)
+
+
+def _execute(
+    mode: str,
+    root: Path | None,
+    archive_root: Path | None,
+    limit: int | None,
+    output_format: str,
+) -> None:
+    if limit is None:
+        limit = 0 if mode == "all" else 20
+
+    args = Options(
+        all=mode == "all",
+        pending=mode == "pending",
+        completed=mode == "completed",
+        done=mode == "done",
+        cancelled=mode == "cancelled",
+        limit=limit,
+    )
+    scan_roots = resolve_roots(
+        root, archive_root, include_default_archive=mode != "pending"
+    )
+    all_tasks = gather([r.resolve() for r in scan_roots])
+    tasks = filter_tasks(all_tasks, args)
+    totals = {
+        "total": len(all_tasks),
+        "pending": sum(1 for t in all_tasks if t.status in PENDING_STATUSES),
+        "done": sum(1 for t in all_tasks if t.status == "done"),
+        "cancelled": sum(1 for t in all_tasks if t.status == "cancelled"),
+    }
+    if output_format == "json":
+        click.echo(json.dumps([asdict(t) for t in tasks], indent=2, ensure_ascii=False))
+    else:
+        click.echo(render_simple(tasks, totals))
+
+
+def shared_options(f):
+    """Options common to every subcommand. Live after the subcommand name."""
+    f = click.option(
+        "--root",
+        type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+        envvar="TASKS_ROOT",
+        default=None,
+        help=(
+            "Active-tasks root to scan recursively. Defaults to "
+            "~/Notes/Planning/Tasks on every host; errors out if no vault "
+            "exists."
+        ),
+    )(f)
+    f = click.option(
+        "--archive-root",
+        type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+        envvar="TASKS_ARCHIVE_ROOT",
+        default=None,
+        help=(
+            "Archived-tasks root scanned in addition to --root. Defaults to the "
+            "vault's Archive/Tasks directory when it exists; not added when "
+            "--root is passed explicitly."
+        ),
+    )(f)
+    f = click.option(
+        "--limit",
+        type=click.IntRange(min=0),
+        default=None,
+        metavar="N",
+        help="Limit rows. Use 0 for no limit. Defaults to no limit with 'all', otherwise 20.",
+    )(f)
+    f = click.option(
+        "--format",
+        "output_format",
+        type=click.Choice(["simple", "json"]),
+        default="simple",
+        show_default=True,
+        help="Output format. simple is a plain title list. json carries full metadata.",
+    )(f)
+    return f
+
+
+class DefaultGroup(click.Group):
+    """Group that runs the `pending` subcommand when none is given.
+
+    Options live on the subcommands, so a bare invocation (or one with only
+    options, e.g. `tasks --format json`) is dispatched to `pending`.
+    """
+
+    DEFAULT = "pending"
+
+    def parse_args(self, ctx, args):
+        if not args or (args[0].startswith("-") and args[0] not in ("-h", "--help")):
+            args = [self.DEFAULT, *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(
+    cls=DefaultGroup,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help="Listing of markdown task files under a directory. Defaults to 'pending'.",
+)
+def main():
+    pass
+
+
+@main.command(name="all", help="Show all tasks.")
+@shared_options
+def cmd_all(root, archive_root, limit, output_format):
+    _execute("all", root, archive_root, limit, output_format)
+
+
+@main.command(name="pending", help="Show pending tasks. This is the default.")
+@shared_options
+def cmd_pending(root, archive_root, limit, output_format):
+    _execute("pending", root, archive_root, limit, output_format)
+
+
+@main.command(name="completed", help="Show completed tasks (done or cancelled).")
+@shared_options
+def cmd_completed(root, archive_root, limit, output_format):
+    _execute("completed", root, archive_root, limit, output_format)
+
+
+@main.command(name="done", help="Show done tasks only.")
+@shared_options
+def cmd_done(root, archive_root, limit, output_format):
+    _execute("done", root, archive_root, limit, output_format)
+
+
+@main.command(name="cancelled", help="Show cancelled tasks only.")
+@shared_options
+def cmd_cancelled(root, archive_root, limit, output_format):
+    _execute("cancelled", root, archive_root, limit, output_format)
+
+
+if __name__ == "__main__":
+    main(prog_name="tasks")
