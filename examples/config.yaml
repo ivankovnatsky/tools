@@ -135,3 +135,100 @@ dock:
       view: grid
       display: stack
       sort: dateadded
+
+# Service settings over HTTP APIs. See README "Services". Every *File is a
+# path (e.g. a sops-decrypted secret); inline secrets are rejected. Each
+# service also takes timeout / retries / retryDelay.
+services:
+  arr:
+    radarr: # sonarr and lidarr take the same keys
+      baseUrl: http://127.0.0.1:7878
+      apiKeyFile: /run/secrets/radarr-api-key
+      bindAddress: "*"
+      downloadClients:
+        - name: Transmission
+          host: 127.0.0.1
+          port: 9091
+          urlBase: /transmission/
+          usernameFile: /run/secrets/transmission-username
+          passwordFile: /run/secrets/transmission-password
+          category: radarr
+      rootFolders: [/media/movies] # authoritative when present
+    prowlarr:
+      baseUrl: http://127.0.0.1:9696
+      apiKeyFile: /run/secrets/prowlarr-api-key
+      bindAddress: "*"
+      indexers: # authoritative when present
+        - { name: EZTV, definitionName: eztv, priority: 25 }
+      applications: # authoritative when present
+        - name: Radarr
+          baseUrl: http://127.0.0.1:7878
+          apiKeyFile: /run/secrets/radarr-api-key
+          prowlarrUrl: http://127.0.0.1:9696
+          syncLevel: fullSync
+          syncCategories: [2000, 2040, 2045]
+
+  beszel:
+    baseUrl: https://beszel.@DOMAIN@
+    baseUrlFiles: { DOMAIN: /run/secrets/external-domain }
+    emailFile: /run/secrets/beszel-email
+    passwordFile: /run/secrets/beszel-password
+    discordWebhookFile: /run/secrets/discord-webhook-beszel
+    userSettings: { chartTime: 12h }
+    systems: # authoritative when present
+      - { name: server, host: 127.0.0.1, port: "45876" }
+
+  forgejo:
+    baseUrl: http://127.0.0.1:3300
+    forgejoBin: /opt/homebrew/bin/forgejo
+    configFile: /srv/forgejo/app.ini
+    workPath: /srv/forgejo
+    tokenFile: /srv/forgejo/mgmt-token # admin API token cache (0600)
+    users:
+      - usernameFile: /run/secrets/forgejo-admin-name
+        admin: true
+        emailFile: /run/secrets/forgejo-admin-email
+        passwordFile: /run/secrets/forgejo-admin-password
+      - username: alice
+        emailFile: /run/secrets/forgejo-alice-email
+        passwordFile: /run/secrets/forgejo-alice-password
+        gpgKeyFile: /run/secrets/forgejo-alice-gpg
+    repositories:
+      - { name: notes, owner: alice, private: true }
+
+  jellyfin:
+    baseUrl: http://127.0.0.1:8096
+    apiKeyFile: /run/secrets/jellyfin-api-key
+    bindAddress: 0.0.0.0
+    libraries:
+      - name: Movies
+        type: movies
+        paths: [/media/movies]
+        enableRealtimeMonitor: true
+        automaticRefreshIntervalDays: 7
+
+  nextdns:
+    profiles:
+      home:
+        profileFile: nextdns/profile.json # relative to the first --config path
+        apiKeyFile: /run/secrets/nextdns-api-key
+        profileIdFile: /run/secrets/nextdns-profile-home # else <profileIdDir>/nextdns-profile-<name>, then by name
+        vars: { serverIp: 192.0.2.10 } # @serverIp@ in profileFile
+        varsFiles: { domain: /run/secrets/external-domain }
+
+  syncthing:
+    baseUrl: http://127.0.0.1:8384
+    configDir: ~/Library/Application Support/Syncthing # or apiKeyFile
+    localDeviceName: server
+    gui:
+      usernameFile: /run/secrets/syncthing-gui-username
+      passwordFile: /run/secrets/syncthing-gui-password # plain or bcrypt
+    deviceDefinitionsFile: /run/secrets/syncthing-devices.json # {name: id}
+    devices: [server, laptop]
+    folders: # authoritative when present
+      notes-id:
+        path: ~/Notes
+        label: Notes
+        devices: [server, laptop]
+        ignorePatterns: [.git]
+    restart: false
