@@ -1,9 +1,9 @@
 # tools
 
 Declarative configuration manager for the user environment: packages (brew, bun,
-npm, uv, go, flatpak), git checkouts, dotfiles, MCP servers, ollama models, and
-curl-piped installers — reconciled from a YAML/JSON/TOML config against a local
-state file.
+npm, uv, go, flatpak), git checkouts, dotfiles, MCP servers, ollama models,
+curl-piped installers, and self-hosted service settings via their HTTP APIs —
+reconciled from a YAML/JSON/TOML config against a local state file.
 
 ## Usage
 
@@ -28,7 +28,7 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 `files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`, `launchd`,
-`defaults`, `dock`.
+`defaults`, `dock`, `services`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
@@ -292,6 +292,100 @@ rows:
 | Removal | value left as is | table above |
 | Config error | eval fails | section held |
 | `diff` | none | per key, restarts listed once |
+
+## Services
+
+`services:` configures running services through their HTTP APIs (ported from the
+nix-config `*-mgmt` tools). One sub-key per service; a missing sub-key is not
+managed and an absent section makes no network calls.
+
+```yaml
+services:
+  jellyfin:
+    baseUrl: http://127.0.0.1:8096
+    apiKeyFile: /run/secrets/jellyfin-api-key
+    bindAddress: 0.0.0.0
+    libraries:
+      - name: Movies
+        type: movies
+        paths: [/media/movies]
+        automaticRefreshIntervalDays: 7
+  beszel:
+    baseUrl: https://beszel.@DOMAIN@ # @NAME@ filled from baseUrlFiles
+    baseUrlFiles: { DOMAIN: /run/secrets/external-domain }
+    emailFile: /run/secrets/beszel-email
+    passwordFile: /run/secrets/beszel-password
+    systems: [{ name: server, host: 127.0.0.1 }]
+```
+
+Full shapes for `arr` (radarr/sonarr/lidarr/prowlarr), `beszel`, `forgejo`,
+`jellyfin`, `nextdns` and `syncthing` are in
+[examples/config.yaml](examples/config.yaml). Every service also takes `timeout`
+(default 30s), `retries` (5), `retryDelay` (2s, doubled) and `prune`.
+
+- Secrets are file paths only (`*File`); values are redacted as `***` and never stored.
+- Masked secrets are compared against an HMAC of the last value pushed to that endpoint (key in `services.key`, 0600).
+- Only differences are written; updates merge into the full remote object.
+- `diff` reads only (no retries, no file changes); `deploy` retries reads but not writes.
+- A bad read shape, a duplicate identity, or an unresolved name aborts that service before any write.
+- One failing service doesn't stop the others.
+
+| Service   | Deleted when not listed                                   | Never deleted                  |
+| --------- | --------------------------------------------------------- | ------------------------------ |
+| arr       | `rootFolders`; Prowlarr `indexers`, `applications`        | download clients               |
+| beszel    | `systems`                                                 | Discord webhook                |
+| forgejo   | older `tools-admin-*`/`tools-user-*` tokens on rotation   | users, repos, GPG keys         |
+| jellyfin  | media paths inside a listed library                       | libraries                      |
+| nextdns   | `denylist`, `allowlist`, `rewrites` in the profile file   | profiles                       |
+| syncthing | `devices` (plus folder-named devices), `folders`          | the local device               |
+
+### Differences from nix-config
+
+Business logic matches the `*-mgmt` tools. Differences below are safety or
+correctness only.
+
+All services:
+
+| Behaviour | Original | tools | Why |
+| --- | --- | --- | --- |
+| Absent/null list key | Nix module sent `[]` | unmanaged | no accidental wipe |
+| Delete every object of a kind | allowed | needs `prune: true` | guards commented-out config |
+| Replacement order | remove, then add | add, then remove; skip removes if an add failed | never left with neither |
+| Unexpected read shape | treated as empty | aborts the service | no writes from a bad picture |
+| Input files | read as needed | all read before the first write | no half-applied run |
+| 2xx body with `errors` | success | failed write | no deletes after a rejected add |
+| Duplicate identities | last one wins | error before writes | ambiguous target |
+| Inline secrets | allowed | `*File` only | no secrets in config |
+| Unchanged sections | written every run | written only when different | idempotent |
+| One service fails | whole run stops | others continue | isolation |
+
+| Service | Behaviour | Original | tools | Why |
+| --- | --- | --- | --- | --- |
+| arr | Masked password/apiKey | pushed every run | pushed when the file changes | convergence |
+| arr | Update PUT fields | our fields only | merged into server fields | keeps unmanaged settings |
+| arr | Root folder paths | exact match | trailing slash ignored | convergence |
+| beszel | System listing | first page only | all pages | no duplicate creates |
+| forgejo | Token names | fixed `forgejo-mgmt` | `tools-admin-*`/`tools-user-*`, older ones deleted | a lost token can be recreated |
+| forgejo | Admin token without `tokenFile` | minted every run | same, but not shown as a diff | parity without noise |
+| forgejo | GPG key gpg can't parse | upload tried, 422 ignored | config error | 422 also means malformed |
+| forgejo | User token | printed to the log | written to `tokenFile` (0600) | no token in logs |
+| jellyfin | Path compare | exact | trailing slash ignored | convergence |
+| jellyfin | Null lists from server | crash | empty | robustness |
+| jellyfin | Path containing a comma | split by Jellyfin | config error | query-string paths split on commas |
+| nextdns | `@NAME@` vars | `sed` on JSON text | replaced inside JSON strings | no JSON injection |
+| nextdns | Domain/rewrite match | case-sensitive | case-insensitive | no delete/re-add churn |
+| nextdns | Profile name matches several | first one | error | wrong-profile writes |
+| nextdns | Id file without `profileIdFile` | fixed `~/.config/sops-nix/secrets` | `profileIdDir` (same default, null disables) | configurable |
+| syncthing | Local device | removable | never removed | keeps the node reachable |
+| syncthing | Local device name | `devices` rename after `localDeviceName` | `localDeviceName` wins when set | no rename loop |
+| syncthing | Device IDs | exact string | canonical form | no delete/re-add |
+| syncthing | Folder device list | replaced | merged | keeps per-device settings |
+| syncthing | Unknown device name | used as a raw ID | error | real device not removed |
+| syncthing | Raw ID not configured | written, dropped by server | folder held | convergence |
+| syncthing | Folder path | exact match | trailing slash ignored | convergence |
+| syncthing | Absent label/`ignorePatterns` | reset every run | unmanaged | no `.stignore` wipe |
+| syncthing | GUI password | bcrypt locally, every run | plaintext, server hashes, on change | no bcrypt dependency |
+| syncthing | `restart` | every run | only after changes | idempotent |
 
 ## State and ownership
 
