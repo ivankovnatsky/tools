@@ -9,7 +9,7 @@ Architecture (read-only against Anker):
                              on the account (the --pn/--sn one flagged "primary"),
                              /soc/<sn> returns one. Optionally posts a Discord note
                              each time a device's SOC crosses a --notify-step boundary
-                             and when a device starts charging.
+                             and when a device starts charging or discharging.
     anker-monitor check   -- runs on each protected host. Polls /soc and reads the
                              primary entry (or a bare object from an older serve);
                              when SOC stays at/below the threshold it shuts the host
@@ -151,6 +151,11 @@ def _ac_in_w(st):
     return _to_num(st.get("ac_input_power", st.get("ac_input_power_total")))
 
 
+def _out_w(st):
+    """Total output power (AC + DC), falling back to AC output power."""
+    return _to_num(st.get("output_power_total", st.get("ac_output_power")))
+
+
 def _charging(st):
     """True while any charge source is active, from whichever keys the model publishes.
 
@@ -164,6 +169,11 @@ def _charging(st):
     if any(v is not None for v in switches):
         return any(bool(_to_num(v)) for v in switches)
     return (_ac_in_w(st) or 0) > 0
+
+
+def _discharging(st):
+    """True while drawing output power with no active charge source."""
+    return not _charging(st) and (_out_w(st) or 0) > 0
 
 
 def _exp_soc(st):
@@ -187,6 +197,7 @@ async def _serve(
     notify_step,
     notify_on,
     notify_charging,
+    notify_discharging,
 ):
     user, password, country = creds
     webhook = _read_webhook(webhook_file)
@@ -211,6 +222,7 @@ async def _serve(
                 "at": 0.0,
                 "bucket": None,
                 "charging": None,
+                "discharging": None,
             }
             for serial, device in found
         }
@@ -242,6 +254,18 @@ async def _serve(
             watts = f", {ac_in:g}W in" if ac_in else ""
             _notify(webhook, f"{d['name']} started charging at {soc_txt}{watts}")
 
+        def discharging_notify(d, st):
+            discharging = _discharging(st)
+            prev = d["discharging"]
+            d["discharging"] = discharging
+            if not notify_discharging or prev is None or not discharging or prev:
+                return
+            soc_num = _soc(st)
+            soc_txt = "?" if soc_num is None else f"{int(soc_num)}%"
+            out_w = _out_w(st)
+            watts = f", {out_w:g}W out" if out_w else ""
+            _notify(webhook, f"{d['name']} started discharging at {soc_txt}{watts}")
+
         async def sampler():
             while True:
                 for d in devs.values():
@@ -252,6 +276,7 @@ async def _serve(
                         d["at"] = asyncio.get_running_loop().time()
                         step_notify(d, _soc(st))
                         charging_notify(d, st)
+                        discharging_notify(d, st)
                 await asyncio.sleep(5)
 
         def reading(serial):
@@ -273,6 +298,7 @@ async def _serve(
                 ),
                 "ac_in_w": _ac_in_w(st),
                 "charging": _charging(st),
+                "discharging": _discharging(st),
                 "sn": serial,
                 "name": d["name"],
                 "primary": serial == primary,
@@ -463,6 +489,12 @@ def cli(verbose):
     show_default=True,
     help="Post to Discord when a device starts charging.",
 )
+@click.option(
+    "--notify-discharging/--no-notify-discharging",
+    default=True,
+    show_default=True,
+    help="Post to Discord when a device starts discharging.",
+)
 @cred_options
 def serve(
     host,
@@ -474,6 +506,7 @@ def serve(
     notify_step,
     notify_on,
     notify_charging,
+    notify_discharging,
     secrets_file,
 ):
     """Read SOC of all account devices over Anker cloud MQTT and expose GET /soc."""
@@ -491,6 +524,7 @@ def serve(
                 notify_step,
                 notify_on,
                 notify_charging,
+                notify_discharging,
             )
         )
     except KeyboardInterrupt:
