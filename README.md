@@ -100,7 +100,8 @@ Options follow sops-nix.
 sops:
   age:
     keyFile: ~/.config/sops/age/keys.txt
-    sshKeyPaths: [~/.ssh/id_ed25519] # at most one
+    sshKeyPaths: [~/.ssh/id_ed25519] # age1 recipients via ssh-to-age; ssh-ed25519 only for the first readable key
+  sshToAgeBinary: null # default: ssh-to-age from PATH
   secretsDir: ~/.local/state/tools/secrets # default
   defaultSopsFile: secrets/default.yaml # relative to the first --config path
   defaultSopsFormat: yaml # default
@@ -127,6 +128,8 @@ sops:
 - Values must be strings (as sops-nix); quote numbers in the sops file. Numeric key segments index lists (`nextDNS/IPs/0`), as nix-config uses.
 - An existing untracked file with different content is refused unless the entry sets `force: true`.
 - One secret's path may not contain another's (`a` vs `a/b`).
+- A whole-file secret (`key: ""`) is decrypted with input and output type set to its `format`, as sops-nix does.
+- An `sshKeyPaths` key that can't be read or converted is skipped with a warning, as in sops-nix; a missing `ssh-to-age` only skips conversion. The converted key is never written to disk.
 - `restartUnits` only prints `notify <unit> (changed: ...)` for now; there's no handler yet.
 
 ## Templates
@@ -166,9 +169,15 @@ templates:
 - An unmanaged symlink at a target is never followed.
 - Only tracked, unmodified files are removed; any invalid entry holds removals.
 - Nothing is removed through a managed link.
-- State keeps inode + mtime, never values or hashes.
+- sops/templates state keeps device, inode and mtime, never values or hashes.
 - An untracked existing file's content is never shown; sops/templates replace it only with `force: true`, `files:` as before.
 - State entries match declared paths by file identity, so a respelled path (alias, case) is the same entry.
+- A tracked entry also records the file's device and inode; another file at that path (for example behind a repointed parent symlink) counts as untracked. A changed device number alone (APFS renumbers at mount) is accepted when the inode and mtime (or the `files:` hash) still match, and is re-recorded.
+- `sops`/`templates` paths outside every `gitRepos` destination are written before `gitRepos` (so clones can use them); paths inside one, secrets whose `sopsFile` is inside one, templates using such a secret, then removals, after it. `tools diff` lists them in that order (`sops (after gitRepos)`).
+- A path inside a `gitRepos` destination that is still not a checkout at write time (clone failed, section not run, or a plain directory; a `.git` file, as in linked worktrees and submodules, counts as a checkout) is refused, as is one where any enclosing destination is not a checkout.
+- Ownership is re-checked after cloning, so a symlink a checkout brings in can't make two sections' paths collide unnoticed.
+- `${sops:}` of a generated secret reads its file only while it is the file tools wrote.
+- With config errors, `tools diff` lists the removals deploy holds (`~ hold`).
 
 ## Differences from nix-config/sops-nix
 
@@ -179,7 +188,7 @@ templates:
 | `sops.placeholder.NAME` | Nix placeholder string | `${sops:NAME}` | no Nix evaluation |
 | Template `content` | text only | text, or YAML data via `format` | services get their native format |
 | `restartUnits` | restarts systemd units | prints a notice (no handler yet) | launchd handler comes later |
-| `age.sshKeyPaths` | any number | at most one | `sops` reads a single key file |
+| `age.sshKeyPaths` | converted in-process | first readable key passed to `sops` (`SOPS_AGE_SSH_PRIVATE_KEY_FILE`, for `ssh-ed25519` recipients); every key also converted by `ssh-to-age` (`sshToAgeBinary` or `PATH`) into `SOPS_AGE_KEY`; without `ssh-to-age`, a warning and no conversion | `sops` only reads one SSH key, and only for `ssh-ed25519` recipients |
 | Removal | old generations pruned | only tracked, unmodified files | never delete what tools didn't write |
 | Ownership | none | one owner per path; no writes through symlinks | safety |
 | Diff | n/a | path + action, content masked | no secrets in logs |
