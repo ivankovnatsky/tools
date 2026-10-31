@@ -2,6 +2,7 @@
 
 import errno
 import grp
+import hashlib
 import os
 import pwd
 import stat
@@ -129,12 +130,51 @@ def fingerprint(path: str) -> Optional[Dict[str, int]]:
         st = os.lstat(path)
     except OSError:
         return None
-    return {"ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
+    return {"dev": st.st_dev, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
+
+
+def _content_hash(path: str) -> Optional[str]:
+    try:
+        fd = _open_regular(path)
+        with os.fdopen(fd, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def same_identity(path: str, record) -> bool:
+    """Whether ``path`` is still the file ``record`` was taken from (not, say,
+    another file behind a repointed parent symlink).
+
+    The inode must match. Device numbers are not stable across mounts
+    (APFS assigns them at mount time), so a different ``dev`` is accepted
+    when the content is provably unchanged: same mtime, or the recorded
+    ``hash`` where the record keeps one.
+    """
+    if not isinstance(record, dict) or "ino" not in record:
+        return False
+    fp = fingerprint(path)
+    if fp is None or record["ino"] != fp["ino"]:
+        return False
+    if "dev" not in record or record["dev"] == fp["dev"]:
+        return True
+    if record.get("mtime_ns") == fp["mtime_ns"]:
+        return True
+    return bool(record.get("hash")) and _content_hash(path) == record["hash"]
+
+
+def refresh_dev(path: str, record: Dict) -> None:
+    """Re-record the device number of a file ``same_identity`` accepted."""
+    fp = fingerprint(path)
+    if fp is not None and "dev" in record and record["dev"] != fp["dev"]:
+        record["dev"] = fp["dev"]
 
 
 def matches_fingerprint(path: str, record: Dict) -> bool:
     fp = fingerprint(path)
-    return fp is not None and all(record.get(k) == v for k, v in fp.items())
+    if fp is None or "mtime_ns" not in record:
+        return False
+    return same_identity(path, record) and record["mtime_ns"] == fp["mtime_ns"]
 
 
 _CASE_INSENSITIVE: Dict[int, bool] = {}
@@ -321,6 +361,18 @@ def atomic_write(
         if os.path.lexists(tmp):
             os.unlink(tmp)
         raise
+
+
+def describe_removals(errors, remove, forget) -> list:
+    """Diff rows for removals; with config errors deploy holds them, and says so."""
+    if errors:
+        held = "held until config errors are fixed"
+        return [f"  ~ hold {path} (would remove; {held})" for path in remove] + [
+            f"  ~ hold {path} (would forget: {reason}; {held})" for path, reason in forget
+        ]
+    return [f"  - remove {path}" for path in remove] + [
+        f"  ~ forget {path} ({reason})" for path, reason in forget
+    ]
 
 
 def removal_blocked(conflicts, path: str) -> Optional[str]:
