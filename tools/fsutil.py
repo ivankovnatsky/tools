@@ -164,9 +164,10 @@ def same_identity(path: str, record) -> bool:
 
 
 def refresh_dev(path: str, record: Dict) -> None:
-    """Re-record the device number of a file ``same_identity`` accepted."""
+    """Record the current device number of a file ``same_identity`` accepted,
+    including records written before ``dev`` was tracked."""
     fp = fingerprint(path)
-    if fp is not None and "dev" in record and record["dev"] != fp["dev"]:
+    if fp is not None and record.get("ino") == fp["ino"] and record.get("dev") != fp["dev"]:
         record["dev"] = fp["dev"]
 
 
