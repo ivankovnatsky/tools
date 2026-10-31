@@ -6,6 +6,9 @@ import click
 from tools.config import ConfigError, deep_merge, load_config, load_config_dir
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
+from tools.services import has_work as services_has_work
+from tools.services import install_services
+from tools.services.keys import key_path as services_key_path
 from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
@@ -89,7 +92,13 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     # become permanently unowned.
     try:
         success = _run_sections(
-            config, config_dir, state, paths, active, lambda: save_json(state_file, state)
+            config,
+            config_dir,
+            state,
+            paths,
+            active,
+            lambda: save_json(state_file, state),
+            state_file,
         )
     finally:
         save_json(state_file, state)
@@ -103,6 +112,7 @@ def _run_sections(
     paths: dict,
     active: set,
     persist=lambda: None,
+    state_file: str = "",
 ) -> bool:
     success = True
 
@@ -182,6 +192,15 @@ def _run_sections(
     # After files, so restartOn hashes see files written in this run.
     if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
         success &= install_launchd(config.get("launchd") or {}, state)
+
+    # Talks to service APIs; gated so an absent section makes no network calls.
+    if "services" in active and services_has_work(config.get("services")):
+        success &= install_services(
+            config.get("services"),
+            config_dir,
+            state,
+            services_key_path(state_file) if state_file else None,
+        )
 
     # Last: dock entries point at apps brew casks may have just installed.
     # Restarts wait for both: a Dock killed mid-deploy can drop a later
