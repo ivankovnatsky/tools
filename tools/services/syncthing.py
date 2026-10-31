@@ -509,6 +509,11 @@ def _sync_folders(
                 payload.pop("devices")  # unchanged: leave the remote list alone
             if diffs:
                 ctx.change(f"~ folder {folder.id} ({', '.join(diffs)})")
+                if "devices" in diffs:
+                    for d in sorted(set(devices) - set(have_devices)):
+                        ctx.change(f"+ folder {folder.id} device {_short(d)}")
+                    for d in sorted(set(have_devices) - set(devices)):
+                        ctx.change(f"- folder {folder.id} device {_short(d)}")
                 ctx.do(
                     f"update folder {folder.id}",
                     lambda f=folder, p=payload: client.request(

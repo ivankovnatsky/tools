@@ -144,10 +144,49 @@ def matches(desired, current) -> bool:
     return desired == current
 
 
+@dataclass
+class _Inputs:
+    desired: Dict
+    api_key: str
+    profile_id: Optional[str]
+
+
+def _resolve_inputs(profile: Profile, ctx: Context) -> _Inputs:
+    """Every file a profile needs, read and validated; no request is made."""
+    desired = _load_profile(profile, ctx)
+    key = ctx.secret(profile.api_key_file, f"{profile.name} apiKeyFile")
+    profile_id = None
+    if profile.profile_id_file:
+        profile_id = ctx.secret(profile.profile_id_file, f"{profile.name} profileIdFile")
+    elif profile.profile_id_dir:
+        # As nextdns-mgmt `update --name`: a per-name id file, else name lookup.
+        path = f"{profile.profile_id_dir}/nextdns-profile-{profile.name}"
+        profile_id = ctx.optional_secret(path, f"{profile.name} profile id")
+    return _Inputs(desired, key, profile_id)
+
+
 def reconcile(spec: NextDnsSpec, ctx: Context) -> None:
+    # Inputs of every profile before the first write: a bad file in a later
+    # profile must not follow writes to an earlier one.
+    inputs = {}
     for profile in spec.profiles:
         try:
-            _sync_profile(spec, profile, ctx)
+            inputs[profile.name] = _resolve_inputs(profile, ctx)
+        except ServiceError as e:
+            ctx.fail(f"{profile.name}: {e}")
+    if not ctx.ok:
+        return
+    if spec.profiles:
+        ctx.client(spec.endpoint)
+    ctx.kept(
+        "profiles",
+        "profile",
+        ((p.name, p.name) for p in spec.profiles),
+        "profiles are never deleted",
+    )
+    for profile in spec.profiles:
+        try:
+            _sync_profile(spec, profile, inputs[profile.name], ctx)
         except ServiceError as e:
             ctx.fail(f"{profile.name}: {e}")
         except Exception as e:  # noqa: BLE001 - one profile's bug must not skip the rest
@@ -195,6 +234,7 @@ def _load_profile(profile: Profile, ctx: Context) -> Dict:
     subs = dict(profile.vars)
     for key, path in profile.vars_files.items():
         subs[key] = ctx.secret(path, f"{profile.name} varsFiles.{key}").replace("\n", "")
+        ctx.sensitive(subs[key])
     data = _substitute(data, subs)
     if isinstance(data, dict) and isinstance(data.get("data"), dict):
         return validate_profile(data["data"], profile.profile_file)
@@ -244,22 +284,64 @@ def validate_profile(data: Dict, where: str) -> Dict:
     return data
 
 
-def _sync_profile(spec: NextDnsSpec, profile: Profile, ctx: Context) -> None:
-    endpoint = spec.endpoint
-    # Parse the file before touching the API so a broken file can never
-    # leave an empty freshly-created profile behind.
-    desired = _load_profile(profile, ctx)
-    key = ctx.secret(profile.api_key_file, f"{profile.name} apiKeyFile")
-    client = ctx.client(endpoint, {"X-Api-Key": key})
+_SINGULAR = {"blocklists": "blocklist", "natives": "native", "tlds": "tld"}
+
+
+def _redacted(ctx: Context, value):
+    if isinstance(value, str):
+        return ctx.redact(value)
+    if isinstance(value, list):
+        return [_redacted(ctx, v) for v in value]
+    if isinstance(value, dict):
+        return {_redacted(ctx, k): _redacted(ctx, v) for k, v in value.items()}
+    return value
+
+
+def _show(ctx: Context, value) -> str:
+    """Secrets are masked in the raw value, before any escaping could hide them."""
+    value = _redacted(ctx, value)
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def _ids(items) -> Dict[str, object]:
+    """{raw identity: value} for `{id: ...}` objects, or plain list items."""
+    if not isinstance(items, list):
+        return {}
+    out = {}
+    for i in items:
+        value = i["id"] if isinstance(i, dict) and "id" in i else i
+        out[json.dumps(value, sort_keys=True)] = value
+    return out
+
+
+def _list_rows(ctx: Context, what: str, want, have, path: str = "") -> None:
+    """Id rows for every list nested in a PATCH body: each one replaces the remote list."""
+    if not isinstance(want, dict):
+        return
+    have = have if isinstance(have, dict) else {}
+    for key, value in want.items():
+        name = f"{path}.{key}" if path else _SINGULAR.get(key, key)
+        if isinstance(value, list):
+            _id_rows(ctx, f"{what} {name}", value, have.get(key))
+        else:
+            _list_rows(ctx, what, value, have.get(key), name)
+
+
+def _id_rows(ctx: Context, what: str, want, have) -> None:
+    """The ids a replacing write adds and drops, so no removal hides in a `~` row."""
+    want_ids, have_ids = _ids(want), _ids(have)
+    for i in sorted(want_ids.keys() - have_ids.keys()):
+        ctx.change(f"+ {what} {_show(ctx, want_ids[i])}")
+    for i in sorted(have_ids.keys() - want_ids.keys()):
+        ctx.change(f"- {what} {_show(ctx, have_ids[i])}")
+
+
+def _sync_profile(spec: NextDnsSpec, profile: Profile, inputs: _Inputs, ctx: Context) -> None:
+    desired = inputs.desired
+    client = ctx.client(spec.endpoint, {"X-Api-Key": inputs.api_key})
     client.label = f"nextdns/{profile.name}"
 
-    profile_id = None
-    if profile.profile_id_file:
-        profile_id = ctx.secret(profile.profile_id_file, f"{profile.name} profileIdFile")
-    elif profile.profile_id_dir:
-        # As nextdns-mgmt `update --name`: a per-name id file, else name lookup.
-        path = f"{profile.profile_id_dir}/nextdns-profile-{profile.name}"
-        profile_id = ctx.optional_secret(path, f"{profile.name} profile id")
+    profile_id = inputs.profile_id
     if profile_id is None:
         found = [p for p in _list_profiles(client) if _name_matches(p.get("name"), profile.name)]
         if len(found) > 1:
@@ -271,16 +353,14 @@ def _sync_profile(spec: NextDnsSpec, profile: Profile, ctx: Context) -> None:
 
     if profile_id is None:
         ctx.change(f"+ profile {profile.name}")
-        if not ctx.apply:
-            for section in desired:
-                ctx.change(f"~ {profile.name} {section} (after create)")
-            return
-        try:
-            created = client.request("POST", "/profiles", {"name": profile.name})
-            profile_id = created["data"]["id"]
-        except (ServiceError, KeyError, TypeError) as e:
-            ctx.fail(f"create profile {profile.name}: {e}")
-            return
+        if ctx.apply:
+            try:
+                created = client.request("POST", "/profiles", {"name": profile.name})
+                profile_id = created["data"]["id"]
+            except (ServiceError, KeyError, TypeError) as e:
+                ctx.fail(f"create profile {profile.name}: {e}")
+                return
+        # A dry run plans the new profile as empty, exactly as deploy writes it.
         current = {}
     else:
         resp = client.get_dict(f"/profiles/{profile_id}")
@@ -321,10 +401,12 @@ def _sync_profile(spec: NextDnsSpec, profile: Profile, ctx: Context) -> None:
                     arrays[k] = want.pop(k)
         if not matches(want, have):
             ctx.change(f"~ {label} {section}")
+            _list_rows(ctx, f"{label} {section}", want, have)
             ctx.do(f"{label} {section}", lambda: client.request("PATCH", f"{base}/{section}", want))
         for k, items in arrays.items():
             if not matches(items, have.get(k)):
                 ctx.change(f"~ {label} {section}/{k}")
+                _id_rows(ctx, f"{label} {section}/{k}", items, have.get(k))
                 ctx.do(
                     f"{label} {section}/{k}",
                     lambda k=k, items=items: client.request("PUT", f"{base}/{section}/{k}", items),
@@ -381,6 +463,7 @@ def _sync_profile(spec: NextDnsSpec, profile: Profile, ctx: Context) -> None:
             name, content = _rewrite_key(have[key])
             rid = have[key].get("id")
             if not rid:
+                ctx.change(f"- {label} rewrite {name} -> {content} (no id, cannot be removed)")
                 continue
             ctx.change(f"- {label} rewrite {name} -> {content}")
             if not adds_ok:
@@ -393,6 +476,7 @@ def _sync_profile(spec: NextDnsSpec, profile: Profile, ctx: Context) -> None:
 
     if "settings" in desired and not matches(desired["settings"], current.get("settings")):
         ctx.change(f"~ {label} settings")
+        _list_rows(ctx, f"{label} settings", desired["settings"], current.get("settings"))
         ctx.do(
             f"{label} settings",
             lambda: client.request("PATCH", f"{base}/settings", desired["settings"]),

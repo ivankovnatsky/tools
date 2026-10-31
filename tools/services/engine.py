@@ -12,7 +12,7 @@ import os
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from tools.log import Color, log
 from tools.services.http import ApiClient, InvalidSpec, ServiceError, norm_url
@@ -158,6 +158,34 @@ class Context:
                 f"refusing to remove all {remote} {kind}; set prune: true to allow it"
             )
 
+    def kept(self, kind: str, label: str, items: Iterable[Tuple[str, str]], why: str) -> None:
+        """Show items that left the config but stay remote because `kind` is never deleted.
+
+        `items` are (resolved identity, printable name) pairs. State keeps an
+        HMAC of each identity and its printable name, never a resolved value,
+        so a name moved into a file is still the same item. Each dropped item
+        is shown once rather than kept silently.
+        """
+        if self.fingerprint_key is None:
+            return  # no key yet (diff before first deploy): nothing recorded
+        now: Dict[str, str] = {}
+        for identity, name in items:
+            msg = f"managed\0{kind}\0{identity}".encode()
+            now[hmac.new(self.fingerprint_key, msg, hashlib.sha256).hexdigest()] = name
+        before = self.state.get("managed", {}).get(kind, {})
+        if not isinstance(before, dict):
+            before = {}
+        for digest in sorted(before.keys() - now.keys(), key=lambda d: str(before[d])):
+            self.change(f"= {label} {before[digest]} removed from config, kept ({why})")
+        if self.apply:
+            managed = self.state.setdefault("managed", {})
+            if now:
+                managed[kind] = now
+            else:
+                managed.pop(kind, None)
+            if not managed:
+                self.state.pop("managed")
+
     def value(self, ref: Dict[str, str], what: str) -> str:
         """Resolve a `{"value": ...}` / `{"file": ...}` reference from spec.one_of."""
         if "file" in ref:
@@ -176,6 +204,7 @@ class Context:
         for name, path in endpoint.url_files.items():
             # Newlines dropped like `tr -d '\n'`: a trailing one would split the URL.
             value = self.secret(path, f"@{name}@").replace("\n", "")
+            self.sensitive(value)
             url = url.replace(f"@{name}@", value)
         return ApiClient(
             url,

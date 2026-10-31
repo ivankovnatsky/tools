@@ -231,19 +231,36 @@ def parse(raw, base_dir: Optional[str] = None) -> ArrSpec:
 
 
 def reconcile(spec: ArrSpec, ctx: Context) -> None:
+    # Inputs of every app before the first write: a bad file for a later app
+    # must not follow writes to an earlier one.
+    clients = {}
     for app in spec.apps:
         try:
-            _reconcile_app(app, ctx)
+            clients[app.kind] = _resolve_inputs(app, ctx)
+        except ServiceError as e:
+            ctx.fail(f"{app.kind}: {e}")
+    if not ctx.ok:
+        return
+    apps = {app.kind: app for app in spec.apps}
+    for kind in ORDER:
+        if kind in CATEGORY_FIELD:
+            dcs = (apps.get(kind) and apps[kind].download_clients) or []
+            ctx.kept(
+                f"{kind} download clients",
+                f"{kind} download client",
+                ((dc.name, dc.name) for dc in dcs),
+                "download clients are never deleted",
+            )
+    for app in spec.apps:
+        try:
+            _reconcile_app(app, clients[app.kind], ctx)
         except ServiceError as e:
             ctx.fail(f"{app.kind}: {e}")
         except Exception as e:  # noqa: BLE001 - one app's bug must not skip the others
             ctx.fail(f"{app.kind}: unexpected {type(e).__name__}: {e}")
 
 
-def _reconcile_app(app: App, ctx: Context) -> None:
-    api_key = ctx.secret(app.api_key_file, f"{app.kind} apiKeyFile")
-    client = ctx.client(app.endpoint, {"X-Api-Key": api_key})
-    client.label = app.kind
+def _reconcile_app(app: App, client: ApiClient, ctx: Context) -> None:
     prefix = API_PREFIX[app.kind]
 
     # Every collection is read and validated before the first write, so a bad
@@ -259,13 +276,15 @@ def _reconcile_app(app: App, ctx: Context) -> None:
         steps.append((_sync_indexers, _read_indexers(app, client, ctx)))
     if app.applications is not None:
         steps.append((_sync_applications, _read_applications(app, client, ctx)))
-    _resolve_inputs(app, ctx)
     for sync, current in steps:
         sync(app, client, prefix, ctx, current)
 
 
-def _resolve_inputs(app: App, ctx: Context) -> None:
-    """Read every secret up front; the sync steps then reuse the cached values."""
+def _resolve_inputs(app: App, ctx: Context) -> ApiClient:
+    """Read every input file up front; the sync steps then reuse the cached values."""
+    api_key = ctx.secret(app.api_key_file, f"{app.kind} apiKeyFile")
+    client = ctx.client(app.endpoint, {"X-Api-Key": api_key})
+    client.label = app.kind
     for dc in app.download_clients or []:
         ctx.value(dc.username, f"{dc.name} username")
         ctx.secret(dc.password_file, f"{dc.name} passwordFile")
@@ -275,6 +294,7 @@ def _resolve_inputs(app: App, ctx: Context) -> None:
         if idx.username is not None:
             ctx.value(idx.username, f"{idx.name} username")
             ctx.secret(idx.password_file, f"{idx.name} passwordFile")
+    return client
 
 
 def _sync_host_config(app: App, client: ApiClient, prefix: str, ctx: Context, current) -> None:

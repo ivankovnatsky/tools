@@ -91,6 +91,12 @@ def parse(raw, base_dir: Optional[str] = None) -> JellyfinSpec:
 def reconcile(spec: JellyfinSpec, ctx: Context) -> None:
     key = ctx.secret(spec.api_key_file, "apiKeyFile")
     client = ctx.client(spec.endpoint, {"X-Emby-Token": key})
+    ctx.kept(
+        "libraries",
+        "library",
+        ((lib.name, lib.name) for lib in spec.libraries or []),
+        "libraries are never deleted",
+    )
     # Both snapshots are read and validated before the first write.
     network = _read_network(client) if spec.bind_address is not None else None
     libraries = _read_libraries(client, spec.libraries) if spec.libraries is not None else None

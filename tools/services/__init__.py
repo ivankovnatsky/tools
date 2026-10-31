@@ -29,12 +29,43 @@ SERVICES = {
 def has_work(config) -> bool:
     """Gate: an absent or empty section means no-op and no network calls.
 
-    State is not consulted: nothing here is deleted on the strength of state,
-    so dropping the section simply stops managing those services.
+    State is not consulted here: a dropped service only needs
+    `release_services`, which makes no network calls.
     """
     if not isinstance(config, dict):
         return bool(config)  # malformed: run so it is reported, not ignored
     return any(v is not None for v in config.values())
+
+
+def _released(config, state: Dict, apply: bool) -> List[Tuple[str, List[str]]]:
+    """Services in state but no longer configured: shown, their state dropped.
+
+    Remote objects are never deleted on the strength of state.
+    """
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        return []  # malformed: reported by run_services, nothing released
+    results = []
+    for name in sorted(state):
+        if name in SERVICES and config.get(name) is None:
+            row = f"  = {name} removed from config; remote objects are kept"
+            results.append((name, [row]))
+            if apply:
+                log(f"{name}:", Color.BLUE)
+                log(row, Color.YELLOW)
+                del state[name]
+    return results
+
+
+def release_services(config, state: Dict) -> None:
+    """Deploy side of a dropped section: forget its state, touch nothing remote."""
+    _released(config, state.get("services", {}), apply=True)
+
+
+def released_rows(config, state: Dict) -> List[Tuple[str, List[str]]]:
+    rows = _released(config, copy.deepcopy(state.get("services", {})), apply=False)
+    return [(name, [f"  {row}" for row in r]) for name, r in rows]
 
 
 def run_services(
@@ -77,6 +108,7 @@ def run_services(
         if ctx.changes:
             results.append((name, ctx.changes))
         ok &= ctx.ok
+    results += _released(config, state, apply)
     return results, ok
 
 

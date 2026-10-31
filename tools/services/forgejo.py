@@ -82,6 +82,8 @@ def parse(raw, base_dir: Optional[str] = None) -> ForgejoSpec:
         )  # fmt: skip
         if u.get("admin") and u.get("tokenFile") is not None:
             raise InvalidSpec(f"{where}: tokenFile is not used on an admin; set forgejo.tokenFile")
+        if u.get("admin") and u.get("gpgKeyFile") is not None:
+            raise InvalidSpec(f"{where}: gpgKeyFile is not used on an admin")
         email = s.path(u, "emailFile", where, base_dir)
         password = s.path(u, "passwordFile", where, base_dir)
         if not email or not password:
@@ -142,6 +144,11 @@ def _write_private(path: str, value: str) -> None:
         raise
 
 
+def _ref_name(ref: Dict[str, str], key: str) -> str:
+    """How state and output name an identity without reading a secret file."""
+    return ref["value"] if "value" in ref else f"{key}File {ref['file']}"
+
+
 def reconcile(spec: ForgejoSpec, ctx: Context) -> None:
     # Identities may come from files, so duplicates are only visible once
     # resolved; check before any request.
@@ -161,8 +168,34 @@ def reconcile(spec: ForgejoSpec, ctx: Context) -> None:
     admin_name = ctx.value(admin.username, "admin username")
     admin_password = ctx.secret(admin.password_file, "admin passwordFile")
     _resolve_inputs(spec, ctx, admin)
+    # After every file is read, so a name from a file is already redacted.
+    ctx.kept(
+        "users",
+        "user",
+        (
+            (ctx.value(u.username, "username").casefold(), _ref_name(u.username, "username"))
+            for u in spec.users
+        ),
+        "users are never deleted",
+    )
+    ctx.kept(
+        "repositories",
+        "repository",
+        (
+            (
+                f"{ctx.value(r.owner, 'owner').casefold()}/{r.name.casefold()}",
+                f"{_ref_name(r.owner, 'owner')}/{r.name}",
+            )
+            for r in spec.repositories
+        ),
+        "repositories are never deleted",
+    )
 
-    if not _ensure_admin_user(spec, ctx, admin, admin_name, admin_password):
+    admin_ready = _ensure_admin_user(spec, ctx, admin, admin_name, admin_password)
+    if admin_ready is None:
+        _plan_fresh_instance(spec, ctx)
+        return
+    if not admin_ready:
         return
     api = _admin_client(spec, ctx, anon, admin_name, admin_password)
     if api is None:
@@ -199,6 +232,21 @@ def _resolve_inputs(spec: ForgejoSpec, ctx: Context, admin: User) -> None:
             gpg_key_id(ctx.text(user.gpg_key_file, "gpgKeyFile").strip(), user.gpg_key_file)
 
 
+def _plan_fresh_instance(spec: ForgejoSpec, ctx: Context) -> None:
+    """Dry run on an instance with no users: nothing exists, so deploy creates it all."""
+    if spec.token_file:
+        ctx.change("+ admin API token")
+    for user in (u for u in spec.users if not u.admin):
+        name = ctx.value(user.username, "username")
+        ctx.change(f"+ user {name}")
+        if user.token_file and not ctx.optional_secret(user.token_file, "tokenFile"):
+            ctx.change(f"+ access token for {name} -> {user.token_file}")
+        if user.gpg_key_file:
+            ctx.change(f"+ GPG key for {name}")
+    for repo in spec.repositories:
+        ctx.change(f"+ repository {ctx.value(repo.owner, 'owner')}/{repo.name}")
+
+
 def parse_user_list(out: str) -> Dict[str, bool]:
     """`forgejo admin user list` table -> {lowercased username: is_admin}."""
     lines = [ln for ln in out.strip().splitlines() if ln.strip()]
@@ -225,9 +273,12 @@ def parse_user_list(out: str) -> Dict[str, bool]:
     return {n: c[admin_col].lower() == "true" for n, c in users.items()}
 
 
-def _ensure_admin_user(spec, ctx, admin: User, name: str, password: str) -> bool:
+def _ensure_admin_user(spec, ctx, admin: User, name: str, password: str) -> Optional[bool]:
     """First admin via the forgejo CLI (works before any API auth), only while
-    the instance has no users, as in forgejo-mgmt."""
+    the instance has no users, as in forgejo-mgmt.
+
+    None: a dry run that would create the admin first.
+    """
     base = ["--config", spec.config_file, "--work-path", spec.work_path]
     try:
         rc, out, err = ctx.runner([spec.forgejo_bin, "admin", "user", "list", *base])
@@ -242,7 +293,7 @@ def _ensure_admin_user(spec, ctx, admin: User, name: str, password: str) -> bool
         return True
     ctx.change(f"+ admin user {name} (via forgejo CLI)")
     if not ctx.apply:
-        return False
+        return None
     email = ctx.secret(admin.email_file, "admin emailFile")
     # The forgejo CLI only takes the password as argv; it is briefly visible
     # in the process list while this runs.
@@ -320,11 +371,13 @@ def _rotate_token(
         if token_file:
             _write_private(token_file, token)
     except OSError as e:
+        msg = f"cannot write tokenFile {token_file}: {e.strerror or e}"
         try:
+            # Forgejo resolves {token} as an id, else as a token name.
             as_user.request("DELETE", f"/api/v1/users/{username}/tokens/{new_name}")
-        except ServiceError:
-            pass
-        raise ServiceError(f"cannot write tokenFile {token_file}: {e.strerror or e}") from None
+        except ServiceError as de:
+            msg += f"; the new token {new_name} could not be removed: {de}"
+        raise ServiceError(msg) from None
     ctx.applied += 1
     try:
         tokens = list_all(as_user, f"/api/v1/users/{username}/tokens", ("id", "name"))
