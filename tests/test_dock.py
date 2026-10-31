@@ -80,6 +80,26 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(os.path.isabs(folder.path))
         self.assertEqual((folder.view, folder.display, folder.sort), ("grid", "folder", "name"))
 
+    def test_parse_does_not_touch_the_filesystem(self):
+        def boom(*args, **kwargs):
+            raise AssertionError("parse touched the filesystem")
+
+        raw = {
+            "apps": ["/Applications/Safari.app", "spacer"],
+            "others": [{"path": "~/Downloads", "view": "grid"}, {"url": "https://example.com"}],
+        }
+        with (
+            mock.patch.object(os, "listdir", boom),
+            mock.patch.object(os, "stat", boom),
+            mock.patch.object(os, "lstat", boom),
+            mock.patch.object(os.path, "realpath", boom),
+            mock.patch.object(os.path, "exists", boom),
+            mock.patch.object(os.path, "isdir", boom),
+        ):
+            spec, errors = parse_dock(raw)
+        self.assertEqual(errors, [])
+        self.assertEqual(spec.sections["persistent-apps"][0].path, "/Applications/Safari.app")
+
     def test_errors(self):
         _, errors = parse_dock(
             {
@@ -422,14 +442,59 @@ class RestoreTest(DockTestBase):
         self.assertIn(("killall", "Dock"), self.fake.writes())
         self.assertNotIn("dock", self.state)
 
-    def test_absent_prior_leaves_layout(self):
-        self.deploy({"apps": [self.mail]})
-        self.assertIn("not set before tools; left as is", self.diff({})[0])
+    def test_absent_prior_deletes_section(self):
+        self.deploy({"apps": [self.mail], "restart": True})
+        self.assertEqual(self.diff({}), ["  - delete persistent-apps", "  ~ restart Dock"])
         self.fake.calls.clear()
-        self.deploy({})
-        self.assertEqual(self.fake.writes(), [])
-        self.assertEqual(len(self.live()), 1)
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(
+            self.fake.writes(),
+            [("delete", "com.apple.dock", "persistent-apps"), ("killall", "Dock")],
+        )
+        self.assertIsNone(self.live())
         self.assertNotIn("dock", self.state)
+
+    def test_absent_prior_rearranged_by_hand_is_left(self):
+        self.deploy({"apps": [self.mail, self.term]})
+        dom = self.fake.domain("com.apple.dock")
+        dom["persistent-apps"] = list(reversed(dom["persistent-apps"]))
+        self.assertEqual(
+            self.diff({}), ["  ~ forget persistent-apps (rearranged by hand; left as is)"]
+        )
+        self.fake.calls.clear()
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(len(self.live()), 2)
+        self.assertNotIn("dock", self.state)
+
+    def test_absent_prior_delete_failure_is_retried(self):
+        self.deploy({"apps": [self.mail]})
+        self.fake.fail["delete"] = "boom"
+        self.assertFalse(self.deploy({}))
+        self.assertIn("persistent-apps", self.state["dock"]["sections"])
+        del self.fake.fail["delete"]
+        self.assertTrue(self.deploy({}))
+        self.assertIsNone(self.live())
+        self.assertNotIn("dock", self.state)
+
+    def test_removed_item_is_removed_from_section(self):
+        self.deploy({"apps": [self.mail, self.term]})
+        self.assertEqual(
+            self.diff({"apps": [self.mail]}),
+            ["  ~ rewrite persistent-apps (1 items)", f"      - {self.term}"],
+        )
+        self.deploy({"apps": [self.mail]})
+        self.assertEqual([dock._tile_path(t) for t in self.live()], [self.mail])
+
+    def test_hand_added_tile_in_declared_section_shows_in_diff(self):
+        raw = {"apps": [self.mail]}
+        self.deploy(raw)
+        self.live().append(dock.build_tile(dock.DockItem("path", path=self.term), self.fs))
+        self.assertEqual(
+            self.diff(raw), ["  ~ rewrite persistent-apps (1 items)", f"      - {self.term}"]
+        )
+        self.deploy(raw)
+        self.assertEqual([dock._tile_path(t) for t in self.live()], [self.mail])
 
     def test_hand_rearranged_layout_is_released(self):
         self.prior_layout()
