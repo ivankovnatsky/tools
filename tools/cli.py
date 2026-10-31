@@ -14,6 +14,8 @@ from tools.user.files import install_files
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
 from tools.user.go import install_go_packages
+from tools.user.launchd import has_work as launchd_has_work
+from tools.user.launchd import install_launchd, status_rows
 from tools.user.links import has_work as links_has_work
 from tools.user.links import install_links
 from tools.user.mcp import install_mcp_servers
@@ -164,6 +166,10 @@ def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, activ
     if "flatpak" in active:
         success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state)
 
+    # After files, so restartOn hashes see files written in this run.
+    if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
+        success &= install_launchd(config.get("launchd") or {}, state)
+
     return success
 
 
@@ -231,6 +237,37 @@ def diff(config, scope):
 def plan(config, scope):
     """Alias for diff."""
     diff.callback(config, scope)
+
+
+@main.command()
+@click.option("--config", multiple=True, default=["."])
+def status(config):
+    """Show live status of managed launchd jobs (read-only)."""
+    from tools.state import find_state_file
+
+    merged = _load_merged_config(list(config))
+    state_file = os.path.expanduser(merged.get("stateFile") or "~/.local/state/tools/state.json")
+    state = migrate_state_schema(load_json(find_state_file(state_file)))
+    try:
+        rows = status_rows(merged.get("launchd") or {}, state)
+    except PermissionError as e:
+        log(f"launchd: {e}", Color.RED)
+        sys.exit(1)
+    if not rows:
+        log("No launchd jobs configured or tracked.", Color.BLUE)
+        return
+    for label, domain, st in rows:
+        if not st.loaded:
+            log(f"  {domain}/{label}: not loaded", Color.YELLOW)
+            continue
+        pid = st.pid if st.pid is not None else "-"
+        color = (
+            Color.GREEN if st.pid or st.last_exit in (None, "0", "(never exited)") else Color.RED
+        )
+        log(
+            f"  {domain}/{label}: {st.state or 'loaded'} pid={pid} last exit={st.last_exit or '-'}",
+            color,
+        )
 
 
 @main.command()
