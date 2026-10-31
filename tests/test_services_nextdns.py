@@ -175,7 +175,7 @@ class NextDnsTest(unittest.TestCase):
             self.assertTrue(any("prune: true" in r for r in rows), rows)
         self.assertEqual(self.h.server.writes(), [])
 
-    def test_invalid_entry_fails_before_any_request_and_others_continue(self):
+    def test_invalid_entry_in_any_profile_fails_before_any_request(self):
         bad = json.loads(FILES["/cfg/profile.json"])
         bad["data"]["denylist"] = [{"active": True}]
         self.h.files["/cfg/bad.json"] = json.dumps(bad)
@@ -189,8 +189,7 @@ class NextDnsTest(unittest.TestCase):
         rows, ok, _ = self.h.run(config)
         self.assertFalse(ok)
         self.assertTrue(any("denylist[0] needs a string id" in r for r in rows))
-        self.assertEqual(len(self.h.server.made("GET", "/profiles/abc123")), 1)
-        self.assertEqual(self.h.server.writes(), [])
+        self.assertEqual(self.h.server.calls, [])
 
     def test_null_profile_is_skipped(self):
         self.h.server.on("GET", "/profiles/abc123", remote())
@@ -368,6 +367,189 @@ class NextDnsTest(unittest.TestCase):
         self.assertTrue(any("invalid domain" in r for r in rows), rows)
         self.assertEqual(
             self.h.server.made("DELETE", "/profiles/abc123/denylist/old.example.com"), []
+        )
+
+    def two_profiles(self, later):
+        config = cfg()
+        good = config["nextdns"]["profiles"]["home"]
+        config["nextdns"]["profiles"] = {"home": good, "later": {**good, **later}}
+        return config
+
+    def test_bad_later_profile_input_aborts_before_any_write(self):
+        self.h.files["/cfg/broken.json"] = "{not json"
+        self.h.server.on("GET", "/profiles/abc123", remote(settings={"logs": {"enabled": True}}))
+        self.h.server.on("PATCH", "/profiles/abc123/settings", None)
+        for later in (
+            {"profileFile": "/cfg/broken.json"},
+            {"apiKeyFile": "/s/missing"},
+            {"profileIdFile": "/s/missing"},
+            {"varsFiles": {"DOMAIN": "/s/missing"}},
+        ):
+            self.h.server.calls.clear()
+            rows, ok, _ = self.h.run(self.two_profiles(later))
+            self.assertFalse(ok, later)
+            self.assertTrue(any("later" in r or "missing" in r for r in rows), rows)
+            self.assertEqual(self.h.server.calls, [], later)
+
+    def test_valid_profiles_still_sync_one_after_another(self):
+        self.h.server.on("GET", "/profiles/abc123", remote(settings={"logs": {"enabled": True}}))
+        self.h.server.on("PATCH", "/profiles/abc123/settings", None)
+        rows, ok, _ = self.h.run(self.two_profiles({}))
+        self.assertTrue(ok, rows)
+        self.assertEqual(len(self.h.server.made("PATCH", "/profiles/abc123/settings")), 2)
+
+    def test_profile_dropped_from_config_is_shown_as_kept_once(self):
+        self.h.server.on("GET", "/profiles/abc123", remote())
+        state = {"nextdns": {"managed": {"profiles": self.h.managed("profiles", "home", "old")}}}
+        rows, ok, _ = self.h.run(cfg(), state=state, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn(
+            "  = profile old removed from config, kept (profiles are never deleted)", rows
+        )
+        self.assertEqual(self.h.server.writes(), [])
+        rows, ok, state = self.h.run(cfg(), state=state)
+        self.assertTrue(any("profile old" in r for r in rows), rows)
+        self.assertEqual(list(state["nextdns"]["managed"]["profiles"].values()), ["home"])
+        rows, ok, _ = self.h.run(cfg(), state=state)
+        self.assertEqual(rows, [])
+
+    def test_null_profile_is_shown_as_no_longer_managed(self):
+        self.h.server.on("GET", "/profiles/abc123", remote())
+        config = cfg()
+        config["nextdns"]["profiles"]["other"] = None
+        state = {"nextdns": {"managed": {"profiles": self.h.managed("profiles", "home", "other")}}}
+        rows, ok, _ = self.h.run(config, state=state, apply=False)
+        self.assertTrue(any("= profile other" in r for r in rows), rows)
+
+    def test_dry_run_of_new_profile_lists_every_entry(self):
+        self.h.server.on("GET", "/profiles", {"data": []})
+        rows, ok, _ = self.h.run(cfg(profileIdFile=None), apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  + profile home", rows)
+        self.assertIn("  + home denylist bad.example.com", rows)
+        self.assertIn("  + home rewrite home.*** -> 192.0.2.1", rows)
+        self.assertIn("  ~ home settings", rows)
+
+    def test_removed_blocklist_and_categories_are_listed(self):
+        data = json.loads(FILES["/cfg/profile.json"])
+        data["data"]["parentalControl"] = {"categories": [{"id": "gambling"}]}
+        self.h.files["/cfg/profile.json"] = json.dumps(data)
+        self.h.server.on(
+            "GET",
+            "/profiles/abc123",
+            remote(
+                privacy={"blocklists": [{"id": "oisd"}, {"id": "stale"}]},
+                parentalControl={"categories": [{"id": "porn"}]},
+            ),
+        )
+        rows, ok, _ = self.h.run(cfg(), apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  ~ home privacy", rows)
+        self.assertIn("  - home privacy blocklist stale", rows)
+        self.assertIn("  ~ home parentalControl/categories", rows)
+        self.assertIn("  + home parentalControl/categories gambling", rows)
+        self.assertIn("  - home parentalControl/categories porn", rows)
+
+    def test_every_list_a_patch_replaces_lists_its_ids(self):
+        data = json.loads(FILES["/cfg/profile.json"])
+        data["data"]["security"] = {"tlds": [{"id": "ru"}]}
+        data["data"]["privacy"] = {"blocklists": [{"id": "oisd"}], "natives": [{"id": "apple"}]}
+        data["data"]["settings"] = {"logs": {"enabled": False}, "nested": {"ids": [{"id": "a"}]}}
+        self.h.files["/cfg/profile.json"] = json.dumps(data)
+        self.h.server.on(
+            "GET",
+            "/profiles/abc123",
+            remote(
+                security={"tlds": [{"id": "ru"}, {"id": "cn"}]},
+                privacy={
+                    "blocklists": [{"id": "oisd"}],
+                    "natives": [{"id": "apple"}, {"id": "alexa"}],
+                },
+                settings={"logs": {"enabled": False}, "nested": {"ids": [{"id": "b"}]}},
+            ),
+        )
+        rows, ok, _ = self.h.run(cfg(), apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  ~ home security", rows)
+        self.assertIn("  - home security tld cn", rows)
+        self.assertIn("  ~ home privacy", rows)
+        self.assertIn("  - home privacy native alexa", rows)
+        self.assertFalse(any("blocklist" in r for r in rows), rows)
+        self.assertIn("  ~ home settings", rows)
+        self.assertIn("  + home settings nested.ids a", rows)
+        self.assertIn("  - home settings nested.ids b", rows)
+
+    def test_list_rows_redact_secrets_whatever_their_escaping(self):
+        for secret in ("bücher.example", 'q"uote.example', "back\\slash.example"):
+            self.h.files["/s/domain"] = secret + "\n"
+            data = json.loads(FILES["/cfg/profile.json"])
+            data["data"]["settings"] = {
+                "logs": {
+                    "excludedDomains": ["@DOMAIN@", "x.@DOMAIN@"],
+                    "objects": [{"name": "@DOMAIN@"}],
+                },
+                "ids": [{"id": {"host": "@DOMAIN@"}}],
+            }
+            self.h.files["/cfg/profile.json"] = json.dumps(data)
+            self.h.server.on("GET", "/profiles/abc123", remote())
+            h = Harness(files=self.h.files)
+            h.server = self.h.server
+            rows, ok, _ = h.run(cfg(), apply=False)
+            self.assertTrue(ok, rows)
+            self.assertIn("  + home settings logs.excludedDomains ***", rows)
+            self.assertIn("  + home settings logs.excludedDomains x.***", rows)
+            self.assertIn('  + home settings logs.objects {"name": "***"}', rows)
+            self.assertIn('  + home settings ids {"host": "***"}', rows)
+            for r in rows:
+                for part in ("bücher", "uote.example", "slash.example"):
+                    self.assertNotIn(part, r, (secret, rows))
+
+    def test_vars_file_with_inner_newline_is_redacted_as_substituted(self):
+        self.h.files["/s/domain"] = "top\nsecret\n"
+        data = json.loads(FILES["/cfg/profile.json"])
+        data["data"]["privacy"] = {"blocklists": [{"id": "x-@DOMAIN@"}]}
+        data["data"]["denylist"] = [{"id": "d-@DOMAIN@.com"}]
+        self.h.files["/cfg/profile.json"] = json.dumps(data)
+        self.h.server.on("GET", "/profiles/abc123", remote(rewrites=[]))
+        rows, ok, _ = self.h.run(cfg(), apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  + home privacy blocklist x-***", rows)
+        self.assertIn("  + home denylist d-***.com", rows)
+        self.assertFalse(any("topsecret" in r for r in rows), rows)
+
+    def test_list_rows_compare_raw_values_not_masked_ones(self):
+        self.h.files["/s/domain"] = "new.example\n"
+        self.h.files["/s/old"] = "old.example\n"
+        data = json.loads(FILES["/cfg/profile.json"])
+        data["data"]["settings"] = {"logs": {"excluded": ["@DOMAIN@"], "other": "@OLD@"}}
+        self.h.files["/cfg/profile.json"] = json.dumps(data)
+        self.h.server.on(
+            "GET",
+            "/profiles/abc123",
+            remote(settings={"logs": {"excluded": ["old.example"], "other": "old.example"}}),
+        )
+        config = cfg()
+        config["nextdns"]["profiles"]["home"]["varsFiles"]["OLD"] = "/s/old"
+        rows, ok, _ = self.h.run(config, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  + home settings logs.excluded ***", rows)
+        self.assertIn("  - home settings logs.excluded ***", rows)
+        self.assertFalse(any("example" in r for r in rows if "settings" in r), rows)
+
+    def test_remote_rewrite_without_id_is_shown_as_unremovable(self):
+        self.h.server.on(
+            "GET",
+            "/profiles/abc123",
+            remote(
+                rewrites=[
+                    {"id": "r1", "name": "home.secret-domain.example.org", "content": "192.0.2.1"},
+                    {"id": "", "name": "stray.example.com", "content": "192.0.2.9"},
+                ]
+            ),
+        )
+        rows, ok, _ = self.h.run(cfg(), apply=False)
+        self.assertIn(
+            "  - home rewrite stray.example.com -> 192.0.2.9 (no id, cannot be removed)", rows
         )
 
 

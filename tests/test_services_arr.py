@@ -499,6 +499,66 @@ class ArrTest(unittest.TestCase):
         self.assertTrue(any("cannot read Radarr apiKeyFile" in r for r in rows), rows)
         self.assertEqual(self.h.server.writes(), [])
 
+    def test_bad_later_app_input_aborts_before_any_write(self):
+        self.h.server.on("GET", "/api/v3/rootfolder", [{"id": 1, "path": "/old"}])
+        self.h.server.on("POST", "/api/v3/rootfolder", {})
+        self.h.server.on("DELETE", "/api/v3/rootfolder/1", None)
+        self.h.server.on("GET", "/api/v1/indexer", [])
+        app = {"name": "Radarr", "baseUrl": "http://127.0.0.1:7878", "apiKeyFile": "/s/missing"}
+        for later in (
+            {"apiKeyFile": "/s/missing"},
+            {"applications": [app]},
+            {"baseUrl": "http://@HOST@", "baseUrlFiles": {"HOST": "/s/missing"}},
+            {"indexers": [{"name": "X", "username": "u", "passwordFile": "/s/missing"}]},
+        ):
+            self.h.server.calls.clear()
+            config = radarr(rootFolders=["/new"])
+            config["arr"]["prowlarr"] = {
+                "baseUrl": URL,
+                "apiKeyFile": "/s/prowlarr",
+                "indexers": [],
+                **later,
+            }
+            rows, ok, _ = self.h.run(config)
+            self.assertFalse(ok, later)
+            self.assertTrue(any("missing" in r for r in rows), rows)
+            self.assertEqual(self.h.server.calls, [], later)
+
+    def test_bad_earlier_app_input_aborts_later_app_writes(self):
+        self.h.server.on("GET", "/api/v1/indexer", [{"id": 7, "name": "Old"}])
+        self.h.server.on("DELETE", "/api/v1/indexer/7", None)
+        config = prowlarr(indexers=[], prune=True)
+        config["arr"]["radarr"] = {
+            "baseUrl": URL,
+            "apiKeyFile": "/s/radarr",
+            "downloadClients": [{**DC, "passwordFile": "/s/missing"}],
+        }
+        rows, ok, _ = self.h.run(config)
+        self.assertFalse(ok)
+        self.assertEqual(self.h.server.writes(), [])
+
+    def test_download_client_dropped_from_config_is_shown_as_kept_once(self):
+        self.h.server.on("GET", "/api/v3/downloadclient", [current_dc()])
+        kind = "radarr download clients"
+        state = {"arr": {"managed": {kind: self.h.managed(kind, "Old", "Transmission")}}}
+        rows, ok, state = self.h.run(radarr(downloadClients=[DC]), state=state)
+        self.assertIn(
+            "  = radarr download client Old removed from config, kept "
+            "(download clients are never deleted)",
+            rows,
+        )
+        self.assertEqual(list(state["arr"]["managed"][kind].values()), ["Transmission"])
+        self.assertFalse(any(m == "DELETE" for m, _ in self.h.server.writes()))
+
+    def test_dropped_app_download_clients_are_shown_as_kept(self):
+        self.h.server.on("GET", "/api/v1/indexer", [])
+        kind = "sonarr download clients"
+        state = {"arr": {"managed": {kind: self.h.managed(kind, "Transmission")}}}
+        rows, ok, state = self.h.run(prowlarr(indexers=[]), state=state)
+        self.assertTrue(ok, rows)
+        self.assertTrue(any("= sonarr download client Transmission" in r for r in rows), rows)
+        self.assertNotIn("managed", state["arr"])
+
 
 if __name__ == "__main__":
     unittest.main()

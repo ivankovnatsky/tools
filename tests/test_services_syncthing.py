@@ -532,6 +532,24 @@ class SyncthingTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(self.h.server.writes(), [])
 
+    def test_folder_device_changes_are_listed(self):
+        remote = {
+            "id": "n",
+            "label": "n",
+            "path": "/n",
+            "devices": [{"deviceID": LOCAL}, {"deviceID": OLD}],
+        }
+        self.devices([{"deviceID": LOCAL}, {"deviceID": BETA}, {"deviceID": OLD}])
+        self.h.server.on("GET", "/rest/config/folders", [remote])
+        folders = {"n": {"path": "/n", "devices": ["beta"]}}
+        rows, ok, _ = self.h.run(
+            cfg(deviceDefinitionsFile="/s/devices", folders=folders), apply=False
+        )
+        self.assertTrue(ok, rows)
+        self.assertIn("  ~ folder n (devices)", rows)
+        self.assertIn("  + folder n device BBBBBBB...", rows)
+        self.assertIn("  - folder n device CCCCCCC...", rows)
+
 
 if __name__ == "__main__":
     unittest.main()

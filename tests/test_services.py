@@ -51,6 +51,49 @@ class GatingTest(unittest.TestCase):
         self.assertTrue(ok, rows)
         self.assertEqual(rows, [])
 
+    def test_dropped_service_is_shown_once_and_released(self):
+        h = Harness(files={KEY: "k"})
+        h.server.on("GET", "/Library/VirtualFolders", [])
+        state = {"arr": {"fingerprints": {"x": "y"}}, "jellyfin": {}}
+        row = "  = arr removed from config; remote objects are kept"
+        rows, ok, _ = h.run(jellyfin(), state=state, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertEqual(rows, [row])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, ok, state = h.run(jellyfin(), state=state)
+        self.assertEqual(rows, [row])
+        self.assertNotIn("arr", state)
+        rows, _, _ = h.run(jellyfin(), state=state)
+        self.assertEqual(rows, [])
+
+    def test_absent_section_releases_state_without_network(self):
+        state = {"services": {"arr": {"fingerprints": {"x": "y"}}}}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._deploy({}, state).assert_not_called()
+        self.assertEqual(state["services"], {})
+        self.assertIn("arr removed from config", out.getvalue())
+
+    def test_diff_shows_dropped_service_without_network(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = os.path.join(tmp, "state.json")
+            with open(state_file, "w") as f:
+                json.dump({"services": {"beszel": {}}}, f)
+            out = io.StringIO()
+            with (
+                mock.patch.object(diff_mod, "diff_services") as d,
+                contextlib.redirect_stdout(out),
+            ):
+                clean = diff_mod.show_diff({"stateFile": state_file}, "/tmp")
+            d.assert_not_called()
+            self.assertFalse(clean)
+            self.assertIn("beszel removed from config", out.getvalue())
+            with open(state_file) as f:
+                self.assertEqual(json.load(f), {"services": {"beszel": {}}})
+
     def test_present_section_runs(self):
         self._deploy({"services": jellyfin()}, {}).assert_called_once()
 
@@ -367,6 +410,17 @@ class KeyFileErrorTest(unittest.TestCase):
             self.assertEqual(keys.load_key(self.key, create=True), b"w" * 64)
         self.assertEqual(os.listdir(self._tmp.name), ["services.key"])
         self.assertIs(os.link, real_link)
+
+
+class SubstitutionRedactionTest(unittest.TestCase):
+    def test_base_url_file_with_inner_newline_is_redacted(self):
+        h = Harness(files={KEY: "k", "/secrets/domain": "hid\nden.example.org\n"})
+        h.server.on("GET", "/Library/VirtualFolders", {"message": "x"}, status=500)
+        cfg = jellyfin(baseUrl="http://jf.@DOMAIN@/x", baseUrlFiles={"DOMAIN": "/secrets/domain"})
+        rows, ok, _ = h.run(cfg, apply=False)
+        self.assertFalse(ok)
+        self.assertTrue(h.server.urls[0].startswith("http://jf.hidden.example.org/"))
+        self.assertFalse(any("hidden.example" in r for r in rows), rows)
 
 
 if __name__ == "__main__":

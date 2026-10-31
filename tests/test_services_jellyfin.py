@@ -254,6 +254,31 @@ class JellyfinTest(unittest.TestCase):
         self.assertTrue(any("comma" in r for r in rows), rows)
         self.assertEqual(self.h.server.calls, [])
 
+    def test_library_dropped_from_config_is_shown_as_kept_once(self):
+        self.h.server.on(
+            "GET",
+            "/Library/VirtualFolders",
+            [{"Name": "Movies", "Locations": ["/media/movies"], "ItemId": "1"}],
+        )
+        state = {
+            "jellyfin": {"managed": {"libraries": self.h.managed("libraries", "Movies", "Shows")}}
+        }
+        rows, ok, _ = self.h.run(cfg(libraries=[MOVIES]), state=state, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertEqual(
+            rows, ["  = library Shows removed from config, kept (libraries are never deleted)"]
+        )
+        rows, ok, state = self.h.run(cfg(libraries=[MOVIES]), state=state)
+        self.assertEqual(self.h.server.writes(), [])
+        rows, ok, _ = self.h.run(cfg(libraries=[MOVIES]), state=state)
+        self.assertEqual(rows, [])
+
+    def test_absent_libraries_key_releases_tracked_libraries(self):
+        state = {"jellyfin": {"managed": {"libraries": self.h.managed("libraries", "Movies")}}}
+        rows, ok, state = self.h.run(cfg(), state=state)
+        self.assertTrue(any("= library Movies" in r for r in rows), rows)
+        self.assertEqual(self.h.server.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

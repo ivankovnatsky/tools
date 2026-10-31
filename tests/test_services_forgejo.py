@@ -325,6 +325,14 @@ class ForgejoTest(unittest.TestCase):
         self.assertTrue(any("tokenFile is not used on an admin" in r for r in rows), rows)
         self.assertEqual(self.h.server.calls, [])
 
+    def test_gpg_key_file_on_admin_user_rejected(self):
+        config = self.cfg()
+        config["forgejo"]["users"][0]["gpgKeyFile"] = "/s/gpg"
+        rows, ok, _ = self.h.run(config, apply=False)
+        self.assertFalse(ok)
+        self.assertTrue(any("gpgKeyFile is not used on an admin" in r for r in rows), rows)
+        self.assertEqual(self.h.server.calls, [])
+
     def test_unparseable_gpg_key_is_a_config_error_before_writes(self):
         self.runner.listing = HEADER
         self.h.files["/s/gpg"] = "not a key"
@@ -341,6 +349,92 @@ class ForgejoTest(unittest.TestCase):
     def test_missing_gpg_binary_keeps_original_fallback(self):
         with mock.patch.object(forgejo.subprocess, "run", side_effect=FileNotFoundError):
             self.assertEqual(forgejo.gpg_key_id("armored"), "")
+
+    def test_users_and_repos_dropped_from_config_are_shown_as_kept(self):
+        self.h.server.on("GET", "/api/v1/users/me", {"login": "me"})
+        self.h.server.on("GET", "/api/v1/repos/me/notes", {"description": "", "private": True})
+        state = {
+            "forgejo": {
+                "managed": {
+                    "users": self.h.managed(
+                        "users", "gone", "me", ("root", "usernameFile /s/admin-name")
+                    ),
+                    "repositories": self.h.managed("repositories", "me/notes", "me/old"),
+                }
+            }
+        }
+        rows, ok, _ = self.h.run(self.cfg(tokenFile=None), state=state, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertIn("  = user gone removed from config, kept (users are never deleted)", rows)
+        self.assertIn(
+            "  = repository me/old removed from config, kept (repositories are never deleted)",
+            rows,
+        )
+        self.assertEqual(len(rows), 2, rows)
+        self.h.server.on("POST", "/api/v1/users/root/tokens", {"sha1": "fresh-tok"})
+        _, _, state = self.h.run(self.cfg(tokenFile=None), state=state)
+        self.assertEqual(list(state["forgejo"]["managed"]["repositories"].values()), ["me/notes"])
+        self.assertFalse(any(m == "DELETE" for m, _ in self.h.server.writes()))
+        rows, _, _ = self.h.run(self.cfg(tokenFile=None), state=state, apply=False)
+        self.assertEqual(rows, [])
+
+    def test_fresh_instance_diff_lists_everything_deploy_creates(self):
+        self.runner.listing = HEADER
+        config = self.cfg()
+        config["forgejo"]["users"][1]["tokenFile"] = os.path.join(self._tmp.name, "user-token")
+        rows, ok, _ = self.h.run(config, apply=False)
+        self.assertIn("  + admin user *** (via forgejo CLI)", rows)
+        self.assertIn("  + admin API token", rows)
+        self.assertIn("  + user me", rows)
+        self.assertTrue(any(r.startswith("  + access token for me") for r in rows), rows)
+        self.assertIn("  + repository me/notes", rows)
+        self.assertEqual(self.h.server.writes(), [])
+
+    def test_username_moved_to_file_is_not_shown_as_removed(self):
+        self.h.files["/s/me-name"] = "me"
+        self.h.server.on("GET", "/api/v1/users/me", {"login": "me"})
+        self.h.server.on("GET", "/api/v1/repos/me/notes", {"description": "", "private": True})
+        self.h.server.on("POST", "/api/v1/users/root/tokens", {"sha1": "fresh-tok"})
+        _, ok, state = self.h.run(self.cfg(tokenFile=None))
+        self.assertTrue(ok)
+        moved = self.cfg(tokenFile=None)
+        moved["forgejo"]["users"][1].pop("username")
+        moved["forgejo"]["users"][1]["usernameFile"] = "/s/me-name"
+        moved["forgejo"]["repositories"][0].pop("owner")
+        moved["forgejo"]["repositories"][0]["ownerFile"] = "/s/me-name"
+        rows, ok, _ = self.h.run(moved, state=state, apply=False)
+        self.assertTrue(ok, rows)
+        self.assertEqual(rows, [])
+
+    def test_removed_file_sourced_user_never_prints_its_name(self):
+        self.h.files["/s/me-name"] = "hidden-user"
+        self.h.server.on("GET", "/api/v1/users/hidden-user", {"login": "hidden-user"})
+        self.h.server.on("GET", "/api/v1/users/me", {"login": "me"})
+        self.h.server.on("GET", "/api/v1/repos/me/notes", {"description": "", "private": True})
+        self.h.server.on("POST", "/api/v1/users/root/tokens", {"sha1": "fresh-tok"})
+        config = self.cfg(tokenFile=None)
+        config["forgejo"]["users"].append(
+            {
+                "usernameFile": "/s/me-name",
+                "emailFile": "/s/user-email",
+                "passwordFile": "/s/user-pass",
+            }
+        )
+        _, ok, state = self.h.run(config, state={})
+        rows, ok, _ = self.h.run(self.cfg(tokenFile=None), state=state, apply=False)
+        self.assertIn(
+            "  = user usernameFile /s/me-name removed from config, kept (users are never deleted)",
+            rows,
+        )
+        self.assertFalse(any("hidden-user" in r for r in rows), rows)
+
+    def test_failed_cleanup_of_unstored_token_is_reported(self):
+        self.h.server.on("POST", "/api/v1/users/root/tokens", {"sha1": "tok-secret"})
+        bad = os.path.join(self._tmp.name, "missing-dir", "token")
+        rows, ok, _ = self.h.run(self.cfg(tokenFile=bad))
+        self.assertFalse(ok)
+        self.assertTrue(any("cannot write tokenFile" in r for r in rows), rows)
+        self.assertTrue(any("could not be removed" in r for r in rows), rows)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,13 @@ class Harness:
             fingerprint_key=fingerprint_key or self.key,
         )
 
+    def managed(self, kind, *items):
+        """State for Context.kept(): items are names or (identity, name) pairs."""
+        ctx = self.factory("x", apply=True, state={})
+        pairs = [i if isinstance(i, tuple) else (i, i) for i in items]
+        ctx.kept(kind, "", pairs, "")
+        return ctx.state["managed"][kind]
+
     def run(self, config, state=None, apply=True):
         state = {} if state is None else state
         results, ok = run_services(config, state, apply=apply, context_factory=self.factory)
