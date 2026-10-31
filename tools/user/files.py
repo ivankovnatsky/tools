@@ -4,7 +4,7 @@ import stat
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
-from tools.fsutil import removal_blocked, respell, same_file_as
+from tools.fsutil import fingerprint, removal_blocked, respell, same_file_as, same_identity
 from tools.log import Color, debug, log
 from tools.util import format_diff_bytes, looks_like_secret
 
@@ -16,6 +16,33 @@ def _file_hash(path: str) -> Optional[str]:
             return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return None
+
+
+def _tracked(target: str, record) -> bool:
+    """Whether ``target`` is still the file ``record`` describes.
+
+    Records without an inode predate identity tracking; for those the
+    content hash stands in.
+    """
+    if not isinstance(record, dict):
+        return False
+    if "ino" in record:
+        return same_identity(target, record)
+    return bool(record.get("hash")) and _file_hash(target) == record["hash"]
+
+
+def _record(target: str, file_hash: str) -> Dict:
+    fp = fingerprint(target) or {}
+    return {"hash": file_hash, **{k: fp[k] for k in ("dev", "ino") if k in fp}}
+
+
+def _removable(target: str, record) -> bool:
+    """Only delete what still matches what we wrote."""
+    record = record or {}
+    if "ino" in record and not same_identity(target, record):
+        return False
+    stored_hash = record.get("hash")
+    return not stored_hash or _file_hash(target) == stored_hash
 
 
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
@@ -251,16 +278,16 @@ def install_files(
                 held[target] = state_files[target]
             continue
         result, source_hash = _copy_file(
-            source, target, mode, secrets=secrets, tracked=target in state_files
+            source, target, mode, secrets=secrets, tracked=_tracked(target, state_files.get(target))
         )
         if result is False:
             success = False
-            if not source_hash and target in state_files:
+            if target in state_files:
                 held[target] = state_files[target]
         elif result is True:
             changed = True
 
-        if source_hash and (result is not False or target in state_files):
+        if source_hash and result is not False:
             managed_targets[target] = source_hash
 
     # Only config errors hold removals: an unparsed entry looks undesired.
@@ -280,10 +307,8 @@ def install_files(
                     kept[target] = state_files[target]
                     continue
                 if os.path.exists(target):
-                    # Only delete what still matches what we wrote. A file
-                    # edited since then holds work this tool never authored.
-                    stored_hash = (state_files.get(target) or {}).get("hash")
-                    if stored_hash and _file_hash(target) != stored_hash:
+                    # A file edited since then holds work this tool never authored.
+                    if not _removable(target, state_files.get(target)):
                         log(
                             f"Keeping {target}: modified since we wrote it. "
                             "Delete it by hand if it is no longer wanted.",
@@ -302,13 +327,13 @@ def install_files(
                         kept[target] = state_files[target]
 
         state["files"] = {
-            target: {"hash": file_hash} for target, file_hash in managed_targets.items()
+            target: _record(target, file_hash) for target, file_hash in managed_targets.items()
         }
         state["files"].update(kept)
     else:
         merged = dict(state_files)
         merged.update(
-            {target: {"hash": file_hash} for target, file_hash in managed_targets.items()}
+            {target: _record(target, file_hash) for target, file_hash in managed_targets.items()}
         )
         state["files"] = merged
 
