@@ -7,7 +7,7 @@ from tools.config import ConfigError, deep_merge, load_config, load_config_dir, 
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
 from tools.services import has_work as services_has_work
-from tools.services import install_services
+from tools.services import install_services, release_services
 from tools.services.keys import key_path as services_key_path
 from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
 from tools.user import secrets_flow
@@ -240,6 +240,8 @@ def _run_sections(
             state,
             services_key_path(state_file) if state_file else None,
         )
+    elif "services" in active:
+        release_services(config.get("services"), state)
 
     # Last: dock entries point at apps brew casks may have just installed.
     # Restarts wait for both: a Dock killed mid-deploy can drop a later
