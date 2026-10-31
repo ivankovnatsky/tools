@@ -211,12 +211,21 @@ class Env:
         "/var/log",
         "/private/var/log",
     )
+    # Missing daemon workingDirectories are created as root only under one of these.
+    system_dir_roots: Tuple[str, ...] = (
+        "/var/lib",
+        "/private/var/lib",
+        "/usr/local/var",
+        "/opt/homebrew/var",
+        "/Library/Application Support",
+    )
     volumes_root: str = "/Volumes"
     run: Callable[[List[str]], Tuple[int, str, str]] = run_command
     sleep: Callable[[float], None] = time.sleep
     euid: int = field(default_factory=os.geteuid)
     uid: Optional[int] = None
     home: Optional[str] = None
+    login: Optional[str] = None  # login user name; default from uid
     ismount: Callable[[str], bool] = os.path.ismount
     allow_sudo: bool = False  # set from `launchd.sudo`; the only gate for escalation
     is_darwin: bool = field(default_factory=lambda: sys.platform == "darwin")
@@ -234,6 +243,11 @@ class Env:
                 self.home = pwd.getpwuid(self.uid).pw_dir
             except KeyError:
                 self.home = os.path.expanduser("~")
+        if self.login is None:
+            try:
+                self.login = pwd.getpwuid(self.uid).pw_name
+            except KeyError:
+                self.login = None
         if self.agents_dir is None:
             self.agents_dir = os.path.join(self.home, "Library", "LaunchAgents")
         if self.user_log_dir is None:
@@ -263,6 +277,54 @@ def expand_path(path: str, home: Optional[str] = None) -> str:
     else:
         p = os.path.expanduser(p)
     return os.path.normpath(p)
+
+
+_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _env_dependent(path) -> bool:
+    """Expanding path would read the environment ($VARS, `~`, `~/...`)."""
+    return isinstance(path, str) and ("$" in path or path == "~" or path.startswith("~/"))
+
+
+def shell_path(path: str) -> str:
+    """path as one shell word: literal parts quoted, `$NAME`/`${NAME}` expanded by the shell."""
+    out, pos = [], 0
+    for m in _VAR.finditer(path):
+        if m.start() > pos:
+            out.append(shlex.quote(path[pos : m.start()]))
+        out.append('"${%s}"' % (m.group(1) or m.group(2)))
+        pos = m.end()
+    if pos < len(path) or not out:
+        out.append(shlex.quote(path[pos:]))
+    return "".join(out)
+
+
+def _runtime_path(value, what: str, home: Optional[str] = None) -> str:
+    """A wrapper-only path, expanded by the job's shell like nix-config's starter.
+
+    `~` is `home` when given (agents), else the job's `$HOME`.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{what} must be a non-empty string")
+    if value == "~" or value.startswith("~/"):
+        value = (home or "$HOME") + value[1:]
+    elif value.startswith("~"):
+        value = os.path.expanduser(value)
+    if "$" not in value:
+        path = os.path.normpath(value)
+        if not os.path.isabs(path):
+            raise ValueError(f"{what}: {path!r} must be absolute (or start with ~ or $VAR)")
+        return path
+    if "$" in _VAR.sub("", value):
+        raise ValueError(f"{what}: {value!r}: only $NAME and ${{NAME}} are expanded")
+    if not (value.startswith("/") or _VAR.match(value)):
+        raise ValueError(f"{what}: {value!r} must be absolute (or start with ~ or $VAR)")
+    return value
+
+
+def _runtime_paths(value, what: str, home: Optional[str] = None) -> List[str]:
+    return [_runtime_path(p, what, home) for p in _str_list(value, what)]
 
 
 def _str_list(value, what: str) -> List[str]:
@@ -309,7 +371,9 @@ def _bool(value, what: str) -> bool:
     return value
 
 
-def _keep_alive(value, home: Optional[str] = None):
+def _keep_alive(
+    value, home: Optional[str] = None, check: Optional[Callable[[Any, str], None]] = None
+):
     if value is None or isinstance(value, bool):
         return value
     if not isinstance(value, dict) or not value:
@@ -324,6 +388,9 @@ def _keep_alive(value, home: Optional[str] = None):
         else:
             if not isinstance(v, dict) or not all(isinstance(b, bool) for b in v.values()):
                 raise ValueError(f"keepAlive.{key} must map names/paths to true/false")
+            if key == "pathState" and check:
+                for p in v:
+                    check(p, "keepAlive.pathState")
             out[plist_key] = (
                 {expand_path(p, home): b for p, b in v.items()} if key == "pathState" else dict(v)
             )
@@ -352,12 +419,13 @@ def _calendar(value):
 
 
 def _extra_dirs(value, home: Optional[str] = None) -> List[ExtraDir]:
+    """Paths are wrapper-only: see `_runtime_path`."""
     if not isinstance(value, list):
         raise ValueError("extraDirs must be a list")
     out = []
     for entry in value:
         if isinstance(entry, str):
-            out.append(ExtraDir(_opt_abs(entry, "extraDirs", home)))
+            out.append(ExtraDir(_runtime_path(entry, "extraDirs", home)))
             continue
         if not isinstance(entry, dict) or "path" not in entry:
             raise ValueError("extraDirs entries must be a path or {path, mode?, owner?, group?}")
@@ -375,7 +443,7 @@ def _extra_dirs(value, home: Optional[str] = None) -> List[ExtraDir]:
             raise ValueError(f"extraDirs.mode {entry['mode']!r} must be between 0000 and 7777")
         out.append(
             ExtraDir(
-                _opt_abs(entry["path"], "extraDirs.path", home),
+                _runtime_path(entry["path"], "extraDirs.path", home),
                 mode,
                 entry.get("owner"),
                 entry.get("group"),
@@ -393,8 +461,23 @@ def valid_label(label) -> bool:
     return isinstance(label, str) and bool(_SAFE_NAME.fullmatch(label)) and ".." not in label
 
 
+def runs_as_root(svc: Service) -> bool:
+    return svc.domain == "system" and log_account(svc)[0] in (None, "root")
+
+
+_ROOT_DIRS_ERROR = (
+    "extraDirs mode/owner/group need a root daemon (domain: system, no user): "
+    "the wrapper's chmod/chown would fail under `set -e` and the job would crash-loop"
+)
+
+
 def _parse_service(
-    name: str, raw: Dict, label_prefix: Optional[str], home: Optional[str] = None
+    name: str,
+    raw: Dict,
+    label_prefix: Optional[str],
+    home: Optional[str] = None,
+    login: Optional[str] = None,
+    section_log_dir=None,
 ) -> Service:
     if not isinstance(raw, dict):
         raise ValueError("must be a mapping")
@@ -417,7 +500,35 @@ def _parse_service(
         raise ValueError(f"domain must be one of {DOMAINS}, got {domain!r}")
 
     svc = Service(name=name, label=label, domain=domain)
-    h = home if domain == "user" else None
+    h = home
+    # Wrapper-only paths: `~` is the job's $HOME for daemons, expanded at runtime.
+    rh = home if domain == "user" else None
+    extra_raw = raw.get("extraServiceConfig")
+    account = raw.get("user") or (
+        extra_raw.get("UserName") if isinstance(extra_raw, dict) else None
+    )
+    other_user = domain == "system" and (account or "root") != login
+
+    def fixed(value, what: str) -> None:
+        """Paths launchd reads from the plist or tools reads at deploy: no runtime expansion."""
+        if other_user and _env_dependent(value):
+            raise ValueError(
+                f"{what}: {value!r} would be expanded at deploy from your environment, not "
+                f"{account or 'root'}'s (launchd never expands it); write the path out"
+            )
+
+    for key in ("workingDirectory", "logDir", "stdoutPath", "stderrPath"):
+        fixed(raw.get(key), key)
+    if raw.get("logDir") is None:
+        fixed(section_log_dir, "launchd.logDir")
+    if isinstance(raw.get("restartOn"), list):
+        for path in raw["restartOn"]:
+            fixed(path, "restartOn")
+    else:
+        fixed(raw.get("restartOn"), "restartOn")
+    if isinstance(extra_raw, dict):
+        for key in ("WorkingDirectory", "StandardOutPath", "StandardErrorPath"):
+            fixed(extra_raw.get(key), f"extraServiceConfig.{key}")
 
     command, args = raw.get("command"), raw.get("programArguments")
     if (command is None) == (args is None):
@@ -440,9 +551,10 @@ def _parse_service(
     svc.environment = {str(k): str(v) for k, v in env.items()}
 
     svc.working_directory = _opt_abs(raw.get("workingDirectory"), "workingDirectory", h)
-    svc.data_dir = _opt_abs(raw.get("dataDir"), "dataDir", h)
+    if raw.get("dataDir") is not None:
+        svc.data_dir = _runtime_path(raw["dataDir"], "dataDir", rh)
     if raw.get("extraDirs") is not None:
-        svc.extra_dirs = _extra_dirs(raw["extraDirs"], h)
+        svc.extra_dirs = _extra_dirs(raw["extraDirs"], rh)
     pre_start = raw.get("preStart") or ""
     if not isinstance(pre_start, str):
         raise ValueError("preStart must be a string")
@@ -450,14 +562,14 @@ def _parse_service(
     if raw.get("waitForPath") is not None:
         if not isinstance(raw["waitForPath"], str):
             raise ValueError("waitForPath must be a string (use waitForPaths for a list)")
-        svc.wait_for_paths = _abs_paths(raw["waitForPath"], "waitForPath", h)
+        svc.wait_for_paths = _runtime_paths(raw["waitForPath"], "waitForPath", rh)
     if raw.get("waitForPaths") is not None:
-        svc.wait_for_paths += _abs_paths(raw["waitForPaths"], "waitForPaths", h)
+        svc.wait_for_paths += _runtime_paths(raw["waitForPaths"], "waitForPaths", rh)
     if raw.get("restartOn") is not None:
         svc.restart_on = _abs_paths(raw["restartOn"], "restartOn", h)
 
     if raw.get("keepAlive") is not None:
-        svc.keep_alive = _keep_alive(raw["keepAlive"], h)
+        svc.keep_alive = _keep_alive(raw["keepAlive"], h, fixed)
     for key, attr in (
         ("waitForSecrets", "wait_for_secrets"),
         ("runAtLoad", "run_at_load"),
@@ -527,15 +639,28 @@ def _parse_service(
     except (TypeError, OverflowError) as e:
         raise ValueError(f"extraServiceConfig is not plist-serializable: {e}") from e
     svc.extra_service_config = dict(extra)
+    if any(d.mode is not None or d.owner or d.group for d in svc.extra_dirs) and not runs_as_root(
+        svc
+    ):
+        raise ValueError(_ROOT_DIRS_ERROR)
     return svc
 
 
-def parse_launchd(raw, home: Optional[str] = None) -> Tuple[Settings, List[Service], List[str]]:
+def parse_launchd(
+    raw, home: Optional[str] = None, login: Optional[str] = None
+) -> Tuple[Settings, List[Service], List[str]]:
     """Validate a plain `launchd:` mapping. Returns (settings, services, errors).
 
-    `home` is the login user's home for `~` in user-domain paths (see `Env.home`).
+    `home` is the login user's home for `~` (see `Env.home`); `login` is the login
+    user name (default: from the uid), which daemons running as anyone else are checked against.
     """
-    raw = raw or {}
+    if raw is None:
+        raw = {}
+    if login is None:
+        try:
+            login = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            login = None
     errors: List[str] = []
     if not isinstance(raw, dict):
         msg = f"launchd must be a mapping, got {type(raw).__name__}"
@@ -560,7 +685,9 @@ def parse_launchd(raw, home: Optional[str] = None) -> Tuple[Settings, List[Servi
         errors.append("labelPrefix must be a non-empty string")
         prefix = None
 
-    services_raw = raw.get("services") or {}
+    services_raw = raw.get("services")
+    if services_raw is None:
+        services_raw = {}
     if not isinstance(services_raw, dict):
         errors.append("services must be a mapping of name -> service")
         return settings, [], list(errors)
@@ -571,7 +698,9 @@ def parse_launchd(raw, home: Optional[str] = None) -> Tuple[Settings, List[Servi
     seen: Dict[str, str] = {}
     for name in sorted(services_raw):
         try:
-            svc = _parse_service(str(name), services_raw[name], prefix, home)
+            svc = _parse_service(
+                str(name), services_raw[name], prefix, home, login, raw.get("logDir")
+            )
         except ValueError as e:
             errors.append(f"{name}: {e}")
             continue
@@ -615,15 +744,20 @@ def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: str = SECR
             'echo "Sops secrets available."',
         ]
     for path in svc.wait_for_paths:
-        q = shlex.quote(path)
+        q = shell_path(path)
+        if _VAR.search(path):
+            waiting, available = f"'Waiting for '{q}...", f"{q}' available.'"
+        else:
+            waiting = shlex.quote(f"Waiting for {path}...")
+            available = shlex.quote(f"{path} available.")
         lines += [
-            f"echo {shlex.quote(f'Waiting for {path}...')}",
+            f"echo {waiting}",
             f"while [ ! -e {q} ]; do sleep 1; done",
-            f"echo {shlex.quote(f'{path} available.')}",
+            f"echo {available}",
         ]
     dirs = ([ExtraDir(svc.data_dir)] if svc.data_dir else []) + svc.extra_dirs
     for d in dirs:
-        q = shlex.quote(d.path)
+        q = shell_path(d.path)
         lines.append(f"/bin/mkdir -p {q}")
         if d.mode is not None:
             lines.append(f"/bin/chmod -h {d.mode:o} {q}")
@@ -710,6 +844,10 @@ def service_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
     for d in svc.extra_dirs:
         if d.mode is not None and not 0 <= d.mode <= 0o7777:
             errors.append(f"{svc.name}: extraDirs mode {d.mode:o} must be between 0000 and 7777")
+    if any(d.mode is not None or d.owner or d.group for d in svc.extra_dirs) and not runs_as_root(
+        svc
+    ):
+        errors.append(f"{svc.name}: {_ROOT_DIRS_ERROR}")
     if svc.domain == "system" and settings.bash and not _root_only(settings.bash, env):
         errors.append(
             f"{svc.name}: bash {settings.bash} must be root-owned and not group/world-writable "
@@ -1119,8 +1257,54 @@ def log_account(svc: Service) -> Tuple[Optional[str], Optional[str]]:
     return svc.user or extra.get("UserName"), svc.group or extra.get("GroupName")
 
 
+def _root_mkdir_ok(path: str, env: Env) -> bool:
+    """path may be created by root: inside an existing `Env.system_dir_roots` entry, with no
+    symlink or non-directory between that root and the first missing component."""
+    if _log_path_error(path, env.system_dir_roots):
+        return False
+    for root in env.system_dir_roots:
+        root = os.path.normpath(root)
+        if not path.startswith(root.rstrip(os.sep) + os.sep) or not os.path.isdir(root):
+            continue
+        current = root
+        for part in os.path.relpath(path, root).split(os.sep):
+            current = os.path.join(current, part)
+            if os.path.islink(current):
+                return False
+            if not os.path.lexists(current):
+                return True
+            if not os.path.isdir(current):
+                return False
+        return True
+    return False
+
+
+def _dir_exists(path: str, domain: str, env: Env) -> bool:
+    """isdir, asking root (`sudo -n test -d`) for a daemon path the user can't reach."""
+    if os.path.isdir(path):
+        return True
+    if not _needs_sudo(domain) or not env.allow_sudo:
+        return False
+    return _run_priv(["/bin/test", "-d", path], domain, env)[0] == 0
+
+
+def workdir_block(svc: Service, env: Env) -> Optional[str]:
+    """Why a daemon that will be started has a workingDirectory root can't create, or None."""
+    wd = svc.working_directory
+    if svc.domain != "system" or svc.disabled or wd is None or _dir_exists(wd, svc.domain, env):
+        return None
+    volume = volume_of(wd, env.volumes_root)
+    if (volume and not env.ismount(volume)) or _root_mkdir_ok(wd, env):
+        return None
+    return (
+        f"workingDirectory {wd} is missing and tools only creates it as root inside an "
+        f"existing {', '.join(env.system_dir_roots)}; create it yourself"
+    )
+
+
 def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> None:
-    """Create a missing workingDirectory: as the user for agents, `sudo -n mkdir -p` for daemons."""
+    """Create a missing workingDirectory: as the user for agents, `sudo -n mkdir -p` for daemons
+    (only where `_root_mkdir_ok`)."""
     wd = svc.working_directory
     if wd is None or os.path.isdir(wd) or not can_change(svc.domain, settings, env):
         return
@@ -1133,6 +1317,12 @@ def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> None:
             os.makedirs(wd, exist_ok=True)
         except OSError as e:
             log(f"launchd: {svc.label}: cannot create {wd}: {e}", Color.YELLOW)
+        return
+    if _dir_exists(wd, svc.domain, env):
+        return
+    if not _root_mkdir_ok(wd, env):
+        if not svc.disabled:
+            log(f"launchd: {svc.label}: {workdir_block(svc, env) or wd}", Color.YELLOW)
         return
     _run_log_cmd(["/bin/mkdir", "-p", wd], svc, env)
 
@@ -1352,6 +1542,10 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
         log_errors = service_errors(svc, settings, env)
         if log_errors:
             p.errors += log_errors
+            continue
+        blocked = workdir_block(svc, env)
+        if blocked:
+            p.blocked.append((svc.label, blocked))
             continue
         item = Item(
             svc=svc,
@@ -1821,7 +2015,7 @@ def install_launchd(raw, state: Dict, env: Optional[Env] = None) -> bool:
     if bad_state:
         log(f"launchd: {bad_state}; nothing done", Color.RED)
         return False
-    settings, services, errors = parse_launchd(raw, env.home)
+    settings, services, errors = parse_launchd(raw, env.home, env.login)
     env = _with_sudo(env, settings)
     p = plan(settings, services, state, env, errors)
     ok = apply(settings, p, state, env)
@@ -1847,7 +2041,7 @@ def diff_launchd(raw, state: Dict, env: Optional[Env] = None) -> List[str]:
     refusal = root_refusal(env) or state_error(state)
     if refusal:
         return [f"  ! {refusal}"]
-    settings, services, errors = parse_launchd(raw, env.home)
+    settings, services, errors = parse_launchd(raw, env.home, env.login)
     env = _with_sudo(env, settings)
     p = plan(settings, services, state, env, errors)
 
@@ -1863,18 +2057,22 @@ def diff_launchd(raw, state: Dict, env: Optional[Env] = None) -> List[str]:
     changes += [f"  ! skip {label}: {reason}" for label, reason in p.blocked]
     changes += [f"  ? {label}: unknown, {reason}" for label, reason in p.unknown]
     changes += [f"  ? {label}: {reason}" for label, reason in p.ignored]
-    if not p.errors:
-        for label, entry in p.remove:
-            changes.append(f"  - remove {name(label, entry.get('domain', 'user'))}")
-        for label, entry, reason in p.forget:
-            if reason not in ("already gone", "never written"):
-                changes.append(f"  ~ forget {label} ({reason})")
+    for label, entry in p.remove:
+        target = name(label, entry.get("domain", "user"))
+        changes.append(
+            f"  ! held: remove {target} (config has errors)" if p.errors else f"  - remove {target}"
+        )
+    for label, entry, reason in p.forget:
+        if reason not in ("already gone", "never written"):
+            held = "  ! held: forget" if p.errors else "  ~ forget"
+            changes.append(f"{held} {label} ({reason})")
     lists = (p.create, p.update, p.adopt, p.load, p.unload, p.enable, p.disable, p.restart)
     for item in [i for lst in lists + (p.retry, p.ok) for i in lst]:
         if item.retire is not None:
             changes.append(f"  - remove {name(item.svc.label, item.retire.get('domain', 'user'))}")
     for item in p.create:
         changes.append(f"  + create {name(item)} -> {item.path}")
+    changes += [f"  ~ adopt {name(i)} (identical plist)" for i in p.adopt]
     for item in p.update:
         note = ""
         if not item.svc.restart_on_change and not item.svc.disabled:
@@ -1909,18 +2107,22 @@ def status_rows(raw, state: Dict, env: Optional[Env] = None) -> List[Tuple[str, 
     refusal = root_refusal(env)
     if refusal:
         raise PermissionError(refusal)
-    _settings, services, _errors = parse_launchd(raw, env.home)
-    rows = {s.label: s.domain for s in services}
+    _settings, services, _errors = parse_launchd(raw, env.home, env.login)
+    rows = {(s.label, s.domain) for s in services}
     for label, entry in _tracked(state).items():
         domain, error = _tracked_domain(label, entry)
         if error is None:
-            rows.setdefault(label, domain)
-    return [(label, rows[label], status(label, rows[label], env)) for label in sorted(rows)]
+            rows.add((label, domain))
+    return [(label, domain, status(label, domain, env)) for label, domain in sorted(rows)]
 
 
 def has_work(raw, state: Dict) -> bool:
-    services = (raw or {}).get("services") if isinstance(raw, dict) else raw
     section = state.get("launchd")
     if section is not None and not isinstance(section, dict):
+        return True
+    if raw is not None and not isinstance(raw, dict):
+        return True
+    services = (raw or {}).get("services")
+    if services is not None and not isinstance(services, dict):
         return True
     return bool(services or (section or {}).get("services"))
