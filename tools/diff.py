@@ -9,6 +9,8 @@ from typing import Dict, List
 from tools.log import Color, log
 from tools.user.brew import _normalize_tap
 from tools.user.flatpak import diff_flatpak
+from tools.user.launchd import diff_launchd
+from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
 from tools.user.ollama_models import diff_ollama_models
@@ -36,6 +38,7 @@ ALL_SECTIONS = (
     "brew",
     "ollamaModels",
     "flatpak",
+    "launchd",
 )
 
 
@@ -458,6 +461,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = diff_flatpak(config.get("flatpak", {}) or {}, state)
         if changes:
             sections.append(("flatpak", changes))
+
+    if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
+        changes = diff_launchd(config.get("launchd") or {}, state)
+        if changes:
+            sections.append(("launchd", changes))
 
     if sections:
         has_changes = True
