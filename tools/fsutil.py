@@ -1,0 +1,341 @@
+"""Filesystem helpers shared by the file-producing providers (sops, templates)."""
+
+import errno
+import grp
+import os
+import pwd
+import stat
+import tempfile
+from dataclasses import dataclass
+from typing import Dict, Optional, Union
+
+_NO_LINK_ERRNOS = {
+    errno.EPERM,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+    errno.EXDEV,
+    errno.EMLINK,
+    errno.ENOSYS,
+}
+
+
+def parse_mode(value, section: str) -> Optional[int]:
+    """Quoted octal string -> int; None stays None. See files._parse_mode for why."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return int(value, 8)
+        except ValueError:
+            raise ValueError(f"{section}: invalid mode {value!r}") from None
+    raise TypeError(
+        f'{section}: mode must be a quoted octal string (e.g. "0600"), got {value!r} '
+        f"({type(value).__name__}); unquoted YAML ints are ambiguous"
+    )
+
+
+def check_owner(value, label: str) -> None:
+    """None, a non-empty name, or a non-negative int id; bools are rejected."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{label} must be a user/group name or a non-negative id, got {value!r}")
+    if isinstance(value, int) and value < 0 or isinstance(value, str) and not value:
+        raise ValueError(f"{label} must be a user/group name or a non-negative id, got {value!r}")
+
+
+def resolve_uid(owner: Union[str, int, None]) -> int:
+    if owner is None:
+        return -1
+    check_owner(owner, "owner")
+    if isinstance(owner, int) or owner.isdigit():
+        return int(owner)
+    return pwd.getpwnam(owner).pw_uid
+
+
+def resolve_gid(group: Union[str, int, None]) -> int:
+    if group is None:
+        return -1
+    check_owner(group, "group")
+    if isinstance(group, int) or group.isdigit():
+        return int(group)
+    return grp.getgrnam(group).gr_gid
+
+
+@dataclass(frozen=True)
+class Current:
+    """What is on disk at a path right now."""
+
+    exists: bool
+    content: Optional[bytes] = None
+    mode: Optional[int] = None
+    uid: Optional[int] = None
+    gid: Optional[int] = None
+    error: Optional[str] = None
+
+
+_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+SYMLINK_REFUSED = "is a symlink; refusing to follow it (tools writes regular files only)"
+
+
+def _open_regular(path: str) -> int:
+    """fd of the regular file at ``path``, never following a final symlink."""
+    try:
+        fd = os.open(path, _NOFOLLOW)
+    except OSError as e:
+        if os.path.islink(path):
+            raise OSError(errno.ELOOP, SYMLINK_REFUSED, path) from None
+        raise e
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(errno.EINVAL, "not a regular file", path)
+    return fd
+
+
+def read_current(path: str) -> Current:
+    if not os.path.lexists(path):
+        return Current(exists=False)
+    try:
+        fd = _open_regular(path)
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            content = f.read()
+    except OSError as e:
+        return Current(exists=True, error=e.strerror or str(e))
+    return Current(True, content, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+
+def attrs_match(current: Current, mode: int, uid: int, gid: int) -> bool:
+    return (
+        current.mode == mode
+        and (uid == -1 or current.uid == uid)
+        and (gid == -1 or current.gid == gid)
+    )
+
+
+def stat_mode(path: str) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def fingerprint(path: str) -> Optional[Dict[str, int]]:
+    """Identity of the file we wrote, without hashing its content.
+
+    Hashes of low-entropy secrets (a domain, a short password) are
+    brute-forceable, so ownership records for secret-bearing files keep
+    inode + mtime instead.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return {"ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
+
+
+def matches_fingerprint(path: str, record: Dict) -> bool:
+    fp = fingerprint(path)
+    return fp is not None and all(record.get(k) == v for k, v in fp.items())
+
+
+_CASE_INSENSITIVE: Dict[int, bool] = {}
+
+
+def _case_insensitive(existing_dir: str) -> bool:
+    """Whether the volume holding ``existing_dir``'s entries folds case.
+
+    Probed by stat-ing a case-swapped sibling name; cached per device.
+    """
+    try:
+        dev = os.stat(existing_dir).st_dev
+    except OSError:
+        return False
+    if dev in _CASE_INSENSITIVE:
+        return _CASE_INSENSITIVE[dev]
+    try:
+        names = os.listdir(existing_dir)[:64]
+    except OSError:
+        names = []
+    probes = [os.path.join(existing_dir, n) for n in names] + [existing_dir]
+    result = False
+    for probe in probes:
+        base = os.path.basename(probe)
+        if not base or base.swapcase() == base:
+            continue
+        try:
+            st = os.lstat(probe)
+        except OSError:
+            continue
+        try:
+            other = os.lstat(os.path.join(os.path.dirname(probe), base.swapcase()))
+        except OSError:
+            break
+        result = (other.st_ino, other.st_dev) == (st.st_ino, st.st_dev)
+        break
+    _CASE_INSENSITIVE[dev] = result
+    return result
+
+
+def _fold(path: str, start: str) -> str:
+    existing = start
+    while not os.path.isdir(existing):
+        parent = os.path.dirname(existing)
+        if parent == existing:
+            break
+        existing = parent
+    return path.casefold() if _case_insensitive(existing) else path
+
+
+def canonical_path(path: str) -> str:
+    """One spelling per file: parent fully resolved, the last component not
+    followed, case folded on case-insensitive volumes."""
+    n = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    parent = os.path.realpath(os.path.dirname(n))
+    return _fold(os.path.join(parent, os.path.basename(n)), parent)
+
+
+def canonical_real(path: str) -> str:
+    """Like ``canonical_path`` but the last component is resolved too."""
+    real = os.path.realpath(os.path.normpath(os.path.abspath(os.path.expanduser(path))))
+    return _fold(real, os.path.dirname(real))
+
+
+def respell(records: Dict, paths) -> Dict:
+    """Rename state keys that name the same file as a declared path (alias,
+    case variant) to the declared spelling, merging duplicates. In place."""
+    wanted = {}
+    for path in paths:
+        wanted.setdefault(canonical_path(path), path)
+    for key in list(records):
+        if not isinstance(key, str):
+            continue
+        spelling = wanted.get(canonical_path(key))
+        if spelling is not None and spelling != key:
+            record = records.pop(key)
+            records.setdefault(spelling, record)
+    return records
+
+
+def file_id(path: str) -> Optional[tuple]:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def same_file_as(path: str, paths) -> Optional[str]:
+    """The first of ``paths`` that is the same file as ``path``, if any."""
+    canon = canonical_path(path)
+    ident = file_id(path)
+    for other in paths:
+        if canonical_path(other) == canon or (ident is not None and file_id(other) == ident):
+            return other
+    return None
+
+
+def is_within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+SECRETS_DIR_MODE = 0o751  # as sops-nix's /run/secrets
+
+
+def fix_private_dirs(dirs) -> None:
+    """Re-assert SECRETS_DIR_MODE on directories tools created (never through a symlink)."""
+    for d in list(dirs):
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) != SECRETS_DIR_MODE:
+            os.chmod(d, SECRETS_DIR_MODE)
+
+
+def makedirs_secret(path: str, secrets_dir: Optional[str], created: Optional[list] = None) -> None:
+    """Create missing directories one level at a time.
+
+    Those inside ``secrets_dir`` (and it itself) get SECRETS_DIR_MODE and are
+    appended to ``created``; any outside it are made with the normal umask.
+    """
+    missing = []
+    current = os.path.abspath(path)
+    while not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    root = canonical_real(secrets_dir) if secrets_dir else None
+    for d in reversed(missing):
+        if root is not None and is_within(canonical_real(d), root):
+            os.mkdir(d, SECRETS_DIR_MODE)
+            # mkdir honours umask; force the bits.
+            os.chmod(d, SECRETS_DIR_MODE)
+            if created is not None and d not in created:
+                created.append(d)
+        else:
+            os.mkdir(d)
+
+
+def _publish_exclusive(tmp: str, path: str) -> None:
+    """Move ``tmp`` to ``path`` only if ``path`` does not exist yet."""
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        raise
+    except OSError as e:
+        # No hard links here (exFAT, some network mounts): check, then rename.
+        if e.errno not in _NO_LINK_ERRNOS:
+            raise
+        if os.path.lexists(path):
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path) from None
+        os.replace(tmp, path)
+        return
+    os.unlink(tmp)
+
+
+def atomic_write(
+    path: str, data: bytes, mode: int, uid: int = -1, gid: int = -1, *, exclusive: bool = False
+) -> None:
+    """Write via a temp file in the same dir. Mode/owner land before content.
+
+    ``exclusive`` refuses to replace an existing path (hard-link publish;
+    check-then-rename where hard links are unsupported), so a value that
+    must only ever be created once cannot be clobbered.
+    """
+    dirname = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".tools-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            if uid != -1 or gid != -1:
+                os.fchown(f.fileno(), uid, gid)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if exclusive:
+            _publish_exclusive(tmp, path)
+        else:
+            os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def removal_blocked(conflicts, path: str) -> Optional[str]:
+    """Reason a tracked ``path`` must not be removed (it is reached through,
+    or lies inside, something `links`/`skills` manage), else None."""
+    check = getattr(conflicts, "managed_reason", None)
+    return check(path) if check is not None else None
+
+
+def apply_attrs(path: str, mode: int, uid: int = -1, gid: int = -1) -> None:
+    """chown/chmod the regular file at ``path``; a symlink there is refused."""
+    fd = _open_regular(path)
+    try:
+        if uid != -1 or gid != -1:
+            os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
