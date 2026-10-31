@@ -12,13 +12,30 @@
       nixpkgs,
       flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      inherit (nixpkgs) lib;
+      programNames = builtins.attrNames (
+        lib.filterAttrs (
+          name: type: type == "directory" && builtins.pathExists (./packages + "/${name}/default.nix")
+        ) (builtins.readDir ./packages)
+      );
+    in
+    {
+      # Programs under packages/, built against the consumer's nixpkgs.
+      overlays.default =
+        _final: prev: lib.genAttrs programNames (name: prev.callPackage (./packages + "/${name}") { });
+    }
+    // flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ ];
+          overlays = [ self.overlays.default ];
         };
+
+        programs = lib.filterAttrs (_: lib.meta.availableOn pkgs.stdenv.hostPlatform) (
+          lib.genAttrs programNames (name: pkgs.${name})
+        );
 
         # Keep in sync with pyproject.toml
         pythonPackages =
@@ -27,13 +44,28 @@
             pyyaml
           ];
 
+        # Only the Python package: packages/ edits must not rebuild tools.
+        sourceWith =
+          extra:
+          lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions (
+              [
+                ./pyproject.toml
+                ./README.md
+                ./tools
+              ]
+              ++ extra
+            );
+          };
+
         toolsPackage = pkgs.python3Packages.buildPythonApplication {
           pname = "tools";
           # Read from pyproject.toml so `just bump` has one place to edit.
           version = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project.version;
           pyproject = true;
 
-          src = ./.;
+          src = sourceWith [ ];
 
           build-system = with pkgs.python3Packages; [
             poetry-core
@@ -54,12 +86,13 @@
         };
       in
       {
-        packages = {
+        packages = programs // {
           tools = toolsPackage;
           default = toolsPackage;
         };
 
         checks.default = toolsPackage.overridePythonAttrs (_: {
+          src = sourceWith [ ./tests ];
           doCheck = true;
           nativeCheckInputs = [ pkgs.git ];
           checkPhase = ''
