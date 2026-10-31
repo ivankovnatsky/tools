@@ -29,6 +29,9 @@ _DARWIN = {
     "perl": "/usr/bin/perl",
     "brew": "/opt/homebrew/bin/brew",
     "mas": "/opt/homebrew/bin/mas",
+    "defaults": "/usr/bin/defaults",
+    "killall": "/usr/bin/killall",
+    "sudo": "/usr/bin/sudo",
 }
 
 # Generic Linux (Debian, Arch, Ubuntu, Fedora, ...).
