@@ -2142,7 +2142,11 @@ class OpenBugsTest(LaunchdTestBase):
         for path, want in (("$HOME/ready", "/h/ready"), ("${DATA}/x y", "/d z/x y"),
                            ("/lit/$/x", "/lit/$/x"), ("/a'b/$DATA", "/a'b/d z")):  # fmt: skip
             out = subprocess.run(
-                ["/bin/bash", "-c", f"printf %s {launchd.shell_path(path)}"],
+                [
+                    shutil.which("bash") or "/bin/bash",
+                    "-c",
+                    f"printf %s {launchd.shell_path(path)}",
+                ],
                 env={"HOME": "/h", "DATA": "d z"} if "DATA}" not in path else {"DATA": "/d z"},
                 capture_output=True,
                 text=True,
