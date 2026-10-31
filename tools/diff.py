@@ -8,6 +8,10 @@ from typing import Dict, List
 
 from tools.log import Color, log
 from tools.user.brew import _normalize_tap
+from tools.user.defaults import diff_defaults
+from tools.user.defaults import has_work as defaults_has_work
+from tools.user.dock import diff_dock
+from tools.user.dock import has_work as dock_has_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
@@ -39,6 +43,8 @@ ALL_SECTIONS = (
     "ollamaModels",
     "flatpak",
     "launchd",
+    "defaults",
+    "dock",
 )
 
 
@@ -466,6 +472,20 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = diff_launchd(config.get("launchd") or {}, state)
         if changes:
             sections.append(("launchd", changes))
+
+    restarts: List[str] = []
+    if "defaults" in active and defaults_has_work(config.get("defaults"), state):
+        changes = diff_defaults(config.get("defaults"), state, restarts=restarts)
+        if changes:
+            sections.append(("defaults", changes))
+
+    if "dock" in active and dock_has_work(config.get("dock"), state):
+        changes = diff_dock(config.get("dock"), state, restarts=restarts)
+        if changes:
+            sections.append(("dock", changes))
+
+    if restarts:
+        sections.append(("restart", [f"  ~ restart {proc}" for proc in restarts]))
 
     if sections:
         has_changes = True
