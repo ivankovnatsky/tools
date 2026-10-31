@@ -8,6 +8,7 @@ from unittest import mock
 from fake_defaults import SUDO, FakeDefaults
 
 from tools import cli as cli_mod
+from tools import fsutil
 from tools.user import defaults
 from tools.user.defaults import DefaultsKey, parse_defaults, same
 
@@ -91,12 +92,59 @@ class ParseTest(unittest.TestCase):
         os.symlink(os.path.join(tmp, "Real"), os.path.join(tmp, "link"))
         real = os.path.join(tmp, "Real", "com.example.App")
         spellings = [os.path.join(tmp, "link", "com.example.App")]
-        if defaults._case_insensitive(tmp):
+        if fsutil._case_insensitive(tmp):
             spellings += [os.path.join(tmp, "real", "COM.example.app.plist")]
         for other in spellings:
             self.assertEqual(defaults.canonical_domain(other), real, other)
-            _, errors = parse_defaults({"user": {real: {"k": 1}, other: {"k": 2}}})
+            _, errors = defaults.identify(
+                *parse_defaults({"user": {real: {"k": 1}, other: {"k": 2}}})
+            )
             self.assertIn("declared more than once", "\n".join(errors), other)
+
+    def test_parse_does_not_touch_the_filesystem(self):
+        def boom(*args, **kwargs):
+            raise AssertionError("parse touched the filesystem")
+
+        raw = {
+            "user": {
+                "/Volumes/Data/Prefs/com.Example.App.plist": {"k": 1},
+                "~/Library/Preferences/ByHost/com.apple.controlcenter": {"W": 2},
+                "~/Library/Preferences/com.apple.finder.plist": {"k": 1},
+            },
+            "system": {"/Library/Preferences/com.example.sys": {"k": 1}},
+            "restart": {"/Volumes/Data/Prefs/com.Example.App": "Finder"},
+        }
+        with (
+            mock.patch.object(os, "listdir", boom),
+            mock.patch.object(os, "stat", boom),
+            mock.patch.object(os, "lstat", boom),
+            mock.patch.object(os.path, "realpath", boom),
+            mock.patch.object(os.path, "exists", boom),
+            mock.patch.object(os.path, "isdir", boom),
+        ):
+            spec, errors = parse_defaults(raw)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [k.domain for k in spec.keys],
+            [
+                "/Volumes/Data/Prefs/com.Example.App",
+                os.path.expanduser("~/Library/Preferences/ByHost/com.apple.controlcenter"),
+                "com.apple.finder",
+                "/Library/Preferences/com.example.sys",
+            ],
+        )
+
+    def test_dock_keys_are_reserved_through_symlinked_spellings(self):
+        tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        prefs = os.path.join(os.path.expanduser("~"), "Library", "Preferences")
+        link = os.path.join(tmp, "prefs")
+        os.symlink(prefs, link)
+        raw = {"user": {os.path.join(link, "com.apple.dock"): {"persistent-apps": []}}}
+        spec, errors = parse_defaults(raw)
+        if os.path.isdir(prefs):
+            _, errors = defaults.identify(spec, errors)
+            self.assertIn("managed by the dock section", "\n".join(errors))
 
     def test_home_preferences_path_is_the_domain_name(self):
         for path in (
@@ -189,6 +237,12 @@ class DefaultsTestBase(unittest.TestCase):
     def setUp(self):
         self.fake = FakeDefaults()
         self.state = {}
+        home = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home)
+        os.makedirs(os.path.join(home, "Library", "Preferences", "ByHost"))
+        patcher = mock.patch.dict(os.environ, {"HOME": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def deploy(self, raw):
         spec, errors = parse_defaults(raw)
@@ -275,6 +329,457 @@ class WriteTest(DefaultsTestBase):
         self.assertEqual(write[:4], ["/usr/bin/defaults", "write", path, "W"])
 
 
+class PathDomainCaseTest(DefaultsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        os.makedirs(os.path.join(self.tmp, "Real"))
+        patcher = mock.patch.object(fsutil, "_case_insensitive", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def written_domains(self):
+        return [c[2] for c in self.fake.calls if c[1] == "write"]
+
+    def test_new_domain_keeps_declared_case(self):
+        domain = os.path.join(self.tmp, "New", "Prefs", "com.Example.App")
+        raw = {"user": {domain + ".plist": {"k": 1}}}
+        self.assertEqual(self.diff(raw), [f"  + write {domain} k = 1"])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.written_domains(), [domain])
+        ident = defaults.domain_identity(domain)
+        self.assertEqual(ident, domain.casefold())
+        self.assertEqual(list(self.managed()["user"]), [ident])
+        self.assertEqual(self.managed()["user"][ident]["k"]["target"], domain)
+        self.fake.calls.clear()
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+
+    def test_new_domain_under_existing_dir_keeps_declared_case(self):
+        domain = os.path.join(self.tmp, "Real", "Sub", "com.Example.App")
+        self.assertTrue(self.deploy({"user": {domain: {"k": 1}}}))
+        self.assertEqual(self.written_domains(), [domain])
+
+    def test_case_variants_of_a_new_domain_are_one_domain(self):
+        a = os.path.join(self.tmp, "New", "com.Example.App")
+        b = os.path.join(self.tmp, "new", "COM.example.app.plist")
+        raw = {"user": {a: {"k": 1}, b: {"k": 2}}}
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertIn("declared more than once", "\n".join(self.diff(raw)))
+
+    def test_respelled_domain_keeps_its_state(self):
+        old = os.path.join(self.tmp, "New", "com.Example.App")
+        new = os.path.join(self.tmp, "new", "com.example.APP")
+        self.fake.domain(old)["k"] = 0
+        self.deploy({"user": {old: {"k": 1}}})
+        self.fake.store[("user", new)] = self.fake.store.pop(("user", old))
+        self.fake.calls.clear()
+        raw = {"user": {new: {"k": 1}}}
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(list(self.managed()["user"]), [defaults.domain_identity(old)])
+        self.assertEqual(self.managed()["user"][defaults.domain_identity(new)]["k"]["target"], new)
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.fake.writes(), [("write", new, "k")])
+        self.assertEqual(self.fake.domain(new), {"k": 0})
+
+    def test_restart_matches_another_spelling(self):
+        domain = os.path.join(self.tmp, "New", "com.Example.App")
+        raw = {
+            "user": {domain: {"k": 1}},
+            "restart": {os.path.join(self.tmp, "new", "com.example.app"): "Finder"},
+        }
+        self.assertTrue(self.deploy(raw))
+        self.assertIn(("killall", "Finder"), self.fake.writes())
+
+
+class SymlinkDomainTest(DefaultsTestBase):
+    def test_state_under_resolved_spelling_follows_declared_spelling(self):
+        tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        os.makedirs(os.path.join(tmp, "Real"))
+        os.symlink(os.path.join(tmp, "Real"), os.path.join(tmp, "link"))
+        resolved = os.path.join(tmp, "Real", "com.example.app")
+        declared = os.path.join(tmp, "link", "com.example.app")
+        self.state = {
+            "defaults": {
+                "managed": {
+                    "user": {
+                        resolved: {
+                            "k": {
+                                "prior": defaults.to_xml(0),
+                                "written": defaults.to_xml(1),
+                                "confirmed": defaults.to_xml(1),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.fake.domain(declared)["k"] = 1
+        raw = {"user": {declared: {"k": 1}}}
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        ident = defaults.domain_identity(declared)
+        self.assertEqual(ident, defaults.domain_identity(resolved))
+        self.assertEqual(list(self.managed()["user"]), [ident])
+        self.assertEqual(self.managed()["user"][ident]["k"]["target"], resolved)
+
+
+class FoldingDefaults(FakeDefaults):
+    """`defaults` on a case-insensitive volume: case variants are one plist."""
+
+    def domain(self, domain, scope="user"):
+        return self.store.setdefault((scope, domain.casefold()), {})
+
+
+class AliasDefaults(FakeDefaults):
+    """Path domains through a symlinked parent are one plist."""
+
+    def domain(self, domain, scope="user"):
+        if os.path.isabs(domain):
+            domain = os.path.realpath(domain)
+        return self.store.setdefault((scope, domain), {})
+
+
+class AliasIdentityTest(DefaultsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fake = AliasDefaults()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        os.makedirs(os.path.join(self.tmp, "Real"))
+        os.symlink(os.path.join(self.tmp, "Real"), os.path.join(self.tmp, "link"))
+        self.real = os.path.join(self.tmp, "Real", "com.example.app")
+        self.link = os.path.join(self.tmp, "link", "com.example.app")
+        self.fake.running |= {"OldProc", "NewProc"}
+
+    def kills(self):
+        return [v[1] for v in self.fake.writes() if v[0] == "killall"]
+
+    def test_restart_alias_for_removed_domain_wins_over_recorded(self):
+        self.fake.domain(self.real)["k"] = 0
+        self.deploy({"user": {self.real: {"k": 1}}, "restart": {self.real: "OldProc"}})
+        self.fake.calls.clear()
+        raw = {"restart": {self.link: "NewProc"}}
+        self.assertEqual(self.diff(raw)[-1], "  ~ restart NewProc")
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.kills(), ["NewProc"])
+
+    def test_restart_alias_for_removed_domain_is_saved(self):
+        self.fake.domain(self.real)["k"] = 0
+        self.deploy({"user": {self.real: {"k": 1}}, "restart": {self.real: "OldProc"}})
+        self.fake.fail["write"] = "boom"
+        self.assertFalse(self.deploy({"restart": {self.link: "NewProc"}}))
+        self.assertEqual(
+            self.state["defaults"]["restart"],
+            {"user": {defaults.domain_identity(self.real): ["NewProc"]}},
+        )
+
+    def test_two_spellings_of_one_plist_are_a_config_error(self):
+        self.fake.domain(self.real).update(x=0, y=0)
+        raw = {"user": {self.real: {"x": 1}, self.link: {"y": 2}}}
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertIn("declared more than once", "\n".join(self.diff(raw)))
+
+    def test_restart_applies_to_every_spelling_scope_of_a_plist(self):
+        raw = {
+            "user": {self.real: {"k": 1}},
+            "currentHost": {self.link: {"k": 1}},
+            "restart": {self.real: "Finder"},
+        }
+        self.deploy(raw)
+        self.fake.domain(self.link, "currentHost")["k"] = 5
+        self.fake.calls.clear()
+        self.assertEqual(self.diff(raw)[-1], "  ~ restart Finder")
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [("write", self.link, "k"), ("killall", "Finder")])
+
+
+class HomeNameCaseTest(DefaultsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fake = FoldingDefaults()
+        home = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home)
+        os.makedirs(os.path.join(home, "Library", "Preferences"))
+        for patcher in (
+            mock.patch.dict(os.environ, {"HOME": home}),
+            mock.patch.object(fsutil, "_case_insensitive", return_value=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def respelled(self, old, new):
+        self.fake.domain(defaults.normalize_domain(old))["k"] = 0
+        self.assertTrue(self.deploy({"user": {old: {"k": 1}}}))
+        self.fake.calls.clear()
+        raw = {"user": {new: {"k": 1}}}
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(self.fake.domain(defaults.normalize_domain(new)), {"k": 1})
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.fake.domain(defaults.normalize_domain(new)), {"k": 0})
+
+    def test_bare_name_case_change_keeps_state(self):
+        self.respelled("com.example.App", "com.example.app")
+
+    def test_home_path_case_change_keeps_state(self):
+        self.respelled(
+            "~/Library/Preferences/com.example.app", "~/Library/Preferences/COM.EXAMPLE.APP"
+        )
+
+    def test_case_variants_of_a_bare_name_are_one_domain(self):
+        _, errors = defaults.identify(
+            *parse_defaults({"user": {"com.example.App": {"k": 1}, "com.example.app": {"j": 1}}})
+        )
+        self.assertIn("declared more than once", "\n".join(errors))
+
+
+class GlobalAliasDefaults(FakeDefaults):
+    """`.GlobalPreferences` in any case is NSGlobalDomain's plist."""
+
+    def domain(self, domain, scope="user"):
+        if domain.casefold() == ".globalpreferences":
+            domain = "NSGlobalDomain"
+        return self.store.setdefault((scope, domain), {})
+
+
+class HomePrefsTestBase(DefaultsTestBase):
+    def make_home(self, prefs_is_link=False):
+        root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        home = os.path.join(root, "home")
+        os.makedirs(os.path.join(home, "Library"))
+        prefs = os.path.join(home, "Library", "Preferences")
+        if prefs_is_link:
+            os.makedirs(os.path.join(root, "real"))
+            os.symlink(os.path.join(root, "real"), prefs)
+        else:
+            os.makedirs(prefs)
+        patcher = mock.patch.dict(os.environ, {"HOME": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return root
+
+    def tracked(self, domain, prior=0, value=1):
+        self.state = {
+            "defaults": {
+                "managed": {
+                    "user": {
+                        domain: {
+                            "k": {
+                                "prior": defaults.to_xml(prior),
+                                "written": defaults.to_xml(value),
+                                "confirmed": defaults.to_xml(value),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+class SymlinkedPrefsTest(HomePrefsTestBase):
+    def test_bare_name_matches_state_under_resolved_prefs(self):
+        root = self.make_home(prefs_is_link=True)
+        resolved = os.path.join(root, "real", "com.foo")
+        self.tracked(resolved)
+        self.fake.domain("com.foo")["k"] = 1
+        raw = {"user": {"com.foo": {"k": 1}}}
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(list(self.managed()["user"]), ["com.foo"])
+
+    def test_bare_name_and_resolved_path_are_one_plist(self):
+        root = self.make_home(prefs_is_link=True)
+        raw = {"user": {"com.foo": {"a": 1}, os.path.join(root, "real", "com.foo"): {"b": 1}}}
+        _, errors = defaults.identify(*parse_defaults(raw))
+        self.assertIn("declared more than once", "\n".join(errors))
+
+
+class GlobalPreferencesCaseTest(HomePrefsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fake = GlobalAliasDefaults()
+        self.make_home()
+        patcher = mock.patch.object(fsutil, "_case_insensitive", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_case_variant_matches_global_domain_state(self):
+        for spelling in ("~/Library/Preferences/.globalpreferences.plist", ".GLOBALPREFERENCES"):
+            self.fake = GlobalAliasDefaults()
+            self.tracked("NSGlobalDomain")
+            self.fake.domain("NSGlobalDomain")["k"] = 1
+            raw = {"user": {spelling: {"k": 1}}}
+            self.assertEqual(self.diff(raw), [], spelling)
+            self.assertTrue(self.deploy(raw), spelling)
+            self.assertEqual(self.fake.writes(), [], spelling)
+            self.assertEqual(self.fake.domain("NSGlobalDomain"), {"k": 1}, spelling)
+
+    def test_case_variant_and_global_domain_are_one_plist(self):
+        raw = {"user": {"-g": {"a": 1}, "~/Library/Preferences/.GLOBALPREFERENCES": {"b": 1}}}
+        _, errors = defaults.identify(*parse_defaults(raw))
+        self.assertIn("declared more than once", "\n".join(errors))
+
+
+class RepointedSymlinkTest(DefaultsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fake = AliasDefaults()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        for d in ("A", "B"):
+            os.makedirs(os.path.join(self.tmp, d))
+        self.link = os.path.join(self.tmp, "link")
+        os.symlink(os.path.join(self.tmp, "A"), self.link)
+        self.a = os.path.join(self.tmp, "A", "x")
+        self.b = os.path.join(self.tmp, "B", "x")
+        self.declared = os.path.join(self.link, "x")
+
+    def repoint(self):
+        os.unlink(self.link)
+        os.symlink(os.path.join(self.tmp, "B"), self.link)
+
+    def test_repointed_link_is_a_new_plist(self):
+        self.fake.domain(self.a)["k"] = 10
+        raw = {"user": {self.declared: {"k": 1}}}
+        self.assertTrue(self.deploy(raw))
+        self.repoint()
+        self.fake.domain(self.b)["k"] = 20
+
+        self.assertEqual(
+            self.diff(raw),
+            [f"  ~ write {self.declared} k: 20 -> 1", f"  - restore {self.a} k -> 10"],
+        )
+        self.fake.calls.clear()
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(
+            self.fake.writes(), [("write", self.declared, "k"), ("write", self.a, "k")]
+        )
+        self.assertEqual(self.fake.domain(self.a), {"k": 10})
+        self.assertEqual(self.fake.domain(self.b), {"k": 1})
+        self.assertEqual(list(self.managed()["user"]), [defaults.domain_identity(self.b)])
+
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.fake.domain(self.b), {"k": 20})
+        self.assertEqual(self.fake.domain(self.a), {"k": 10})
+        self.assertEqual(self.managed(), {})
+
+    def test_repointed_link_without_prior_deletes_old_plist_key(self):
+        raw = {"user": {self.declared: {"k": 1}}}
+        self.assertTrue(self.deploy(raw))
+        self.repoint()
+        self.assertEqual(
+            self.diff(raw), [f"  + write {self.declared} k = 1", f"  - delete {self.a} k"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.domain(self.a), {})
+        self.assertEqual(self.fake.domain(self.b), {"k": 1})
+
+
+class ScopeIdentityTest(DefaultsTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fake = AliasDefaults()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.link = os.path.join(self.tmp, "prefs")
+        os.symlink(defaults._home_prefs(), self.link)
+
+    def test_current_host_bare_name_and_prefs_path_are_different_plists(self):
+        path = os.path.join(self.link, "com.foo")
+        raw = {"currentHost": {"com.foo": {"k": 1}, path: {"k": 2}}}
+        spec, errors = defaults.identify(*parse_defaults(raw))
+        self.assertEqual(errors, [])
+        self.assertNotEqual(spec.keys[0].identity, spec.keys[1].identity)
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(len(self.managed()["currentHost"]), 2)
+        self.fake.calls.clear()
+        self.assertTrue(self.deploy({"currentHost": {"com.foo": {"k": 1}}}))
+        resolved = os.path.join(defaults._home_prefs(), "com.foo")
+        self.assertEqual(self.fake.writes(), [("delete", resolved, "k")])
+        self.assertEqual(self.fake.domain(path, "currentHost"), {})
+        self.assertEqual(self.fake.domain("com.foo", "currentHost"), {"k": 1})
+
+    def test_user_bare_name_and_prefs_path_are_one_plist(self):
+        raw = {"user": {"com.foo": {"k": 1}, os.path.join(self.link, "com.foo"): {"j": 2}}}
+        _, errors = defaults.identify(*parse_defaults(raw))
+        self.assertIn("declared more than once", "\n".join(errors))
+
+    def test_current_host_byhost_path_and_bare_name_are_one_plist(self):
+        byhost = os.path.join(self.link, "ByHost", "com.foo")
+        raw = {"currentHost": {"com.foo": {"k": 1}, byhost: {"j": 2}}}
+        _, errors = defaults.identify(*parse_defaults(raw))
+        self.assertIn("declared more than once", "\n".join(errors))
+
+
+class LegacyStateTest(DefaultsTestBase):
+    def test_state_keyed_by_spelling_with_flat_restart_map_migrates(self):
+        self.state = {
+            "defaults": {
+                "managed": {
+                    "user": {
+                        "com.apple.dock": {
+                            "tilesize": {
+                                "prior": defaults.to_xml(48),
+                                "written": defaults.to_xml(64),
+                                "confirmed": defaults.to_xml(64),
+                            }
+                        }
+                    }
+                },
+                "restart": {"com.apple.dock": ["Dock"]},
+            }
+        }
+        self.fake.domain("com.apple.dock")["tilesize"] = 64
+        self.assertEqual(
+            self.diff({}), ["  - restore com.apple.dock tilesize -> 48", "  ~ restart Dock"]
+        )
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.fake.domain("com.apple.dock"), {"tilesize": 48})
+        self.assertIn(("killall", "Dock"), self.fake.writes())
+        self.assertEqual(self.managed(), {})
+        self.assertEqual(self.state["defaults"]["restart"], {})
+
+    def test_legacy_key_still_declared_is_kept(self):
+        self.state = {
+            "defaults": {
+                "managed": {
+                    "user": {
+                        "com.apple.dock": {
+                            "tilesize": {
+                                "prior": defaults.to_xml(48),
+                                "written": defaults.to_xml(64),
+                                "confirmed": defaults.to_xml(64),
+                            }
+                        }
+                    }
+                },
+                "restart": {"com.apple.dock": ["Dock"]},
+            }
+        }
+        self.fake.domain("com.apple.dock")["tilesize"] = 64
+        raw = {"user": {"com.apple.dock": {"tilesize": 64}}}
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.writes(), [])
+        entry = self.managed()["user"]["com.apple.dock"]["tilesize"]
+        self.assertEqual(defaults.from_xml(entry["prior"]), 48)
+        self.assertEqual(entry["target"], "com.apple.dock")
+
+
 class SystemScopeTest(DefaultsTestBase):
     DOMAIN = "/Library/Preferences/com.example.app"
     RAW = {"system": {DOMAIN: {"Mode": "Automatic"}}}
@@ -330,18 +835,88 @@ class RestoreTest(DefaultsTestBase):
         self.assertEqual(self.fake.domain("com.apple.dock")["tilesize"], 48)
         self.assertEqual(self.managed(), {})
 
-    def test_absent_prior_leaves_value_on_removal(self):
-        self.deploy(self.RAW)
+    def test_absent_prior_deletes_key_on_removal(self):
+        self.deploy({**self.RAW, "restart": {"com.apple.dock": "Dock"}})
         self.assertIsNone(self.managed()["user"]["com.apple.dock"]["tilesize"]["prior"])
 
+        self.assertEqual(self.diff({}), ["  - delete com.apple.dock tilesize", "  ~ restart Dock"])
+        self.fake.calls.clear()
+        self.assertTrue(self.deploy({}))
         self.assertEqual(
-            self.diff({}), ["  ~ forget com.apple.dock tilesize (not set before tools; left as is)"]
+            self.fake.writes(), [("delete", "com.apple.dock", "tilesize"), ("killall", "Dock")]
+        )
+        self.assertNotIn("tilesize", self.fake.domain("com.apple.dock"))
+        self.assertEqual(self.managed(), {})
+
+    def test_absent_prior_hand_changed_is_left(self):
+        self.deploy(self.RAW)
+        self.fake.domain("com.apple.dock")["tilesize"] = 99
+        self.assertEqual(
+            self.diff({}), ["  ~ forget com.apple.dock tilesize (changed by hand; left as is)"]
         )
         self.fake.calls.clear()
         self.assertTrue(self.deploy({}))
         self.assertEqual(self.fake.writes(), [])
-        self.assertEqual(self.fake.domain("com.apple.dock")["tilesize"], 64)
+        self.assertEqual(self.fake.domain("com.apple.dock")["tilesize"], 99)
         self.assertEqual(self.managed(), {})
+
+    def test_absent_prior_delete_failure_is_retried(self):
+        self.deploy(self.RAW)
+        self.fake.fail["delete"] = "boom"
+        self.assertFalse(self.deploy({}))
+        self.assertIn("tilesize", self.managed()["user"]["com.apple.dock"])
+        del self.fake.fail["delete"]
+        self.assertTrue(self.deploy({}))
+        self.assertNotIn("tilesize", self.fake.domain("com.apple.dock"))
+        self.assertEqual(self.managed(), {})
+
+    def test_absent_prior_current_host_and_system_delete(self):
+        raw = {
+            "currentHost": {"com.example.app": {"k": 1}},
+            "system": {"/Library/Preferences/com.example.sys": {"k": 1}},
+        }
+        self.deploy(raw)
+        self.assertEqual(
+            self.diff({}),
+            [
+                "  - delete currentHost:com.example.app k",
+                "  - delete system:/Library/Preferences/com.example.sys k (sudo)",
+            ],
+        )
+        self.fake.calls.clear()
+        self.assertTrue(self.deploy({}))
+        self.assertIn(
+            ["/usr/bin/defaults", "-currentHost", "delete", "com.example.app", "k"],
+            self.fake.calls,
+        )
+        self.assertIn(
+            [
+                SUDO,
+                "-n",
+                "/usr/bin/defaults",
+                "delete",
+                "/Library/Preferences/com.example.sys",
+                "k",
+            ],
+            self.fake.calls,
+        )
+        self.assertEqual(self.fake.domain("com.example.app", "currentHost"), {})
+        self.assertEqual(self.fake.domain("/Library/Preferences/com.example.sys", "system"), {})
+
+    def test_diff_shows_every_drift_in_declared_keys(self):
+        self.fake.domain("com.apple.dock").update(tilesize=48, autohide=False)
+        self.deploy({"user": {"com.apple.dock": {"tilesize": 64, "autohide": True, "new": 1}}})
+        self.fake.domain("com.apple.dock")["autohide"] = False
+        raw = {"user": {"com.apple.dock": {"autohide": True, "extra": "x"}}}
+        self.assertEqual(
+            self.diff(raw),
+            [
+                "  ~ write com.apple.dock autohide: false -> true",
+                '  + write com.apple.dock extra = "x"',
+                "  - restore com.apple.dock tilesize -> 48",
+                "  - delete com.apple.dock new",
+            ],
+        )
 
     def test_prior_kept_across_value_changes(self):
         self.fake.domain("com.apple.dock")["tilesize"] = 48
@@ -480,6 +1055,22 @@ class RestartTest(DefaultsTestBase):
         kills = [v for v in self.fake.writes() if v[0] == "killall"]
         self.assertEqual(kills, [("killall", "Finder"), ("killall", "Dock")])
 
+    def test_restart_entries_for_one_domain_merge(self):
+        raw = {
+            "user": {"com.example.app": {"k": 1}},
+            "restart": {
+                "com.example.app": ["Finder", "Dock"],
+                "~/Library/Preferences/com.example.app.plist": ["SystemUIServer", "Finder"],
+            },
+        }
+        spec, errors = parse_defaults(raw)
+        self.assertEqual(errors, [])
+        self.assertEqual(spec.restart, {"com.example.app": ["Finder", "Dock", "SystemUIServer"]})
+        self.fake.running.add("SystemUIServer")
+        self.deploy(raw)
+        kills = [v[1] for v in self.fake.writes() if v[0] == "killall"]
+        self.assertEqual(kills, ["Finder", "Dock", "SystemUIServer"])
+
     def test_invalid_restart_writes_and_kills_nothing(self):
         self.deploy(self.RAW)
         self.fake.calls.clear()
@@ -520,7 +1111,9 @@ class RestartTest(DefaultsTestBase):
         self.deploy(self.RAW)
         self.fake.fail["write"] = "boom"
         self.assertFalse(self.deploy({"restart": {"com.apple.dock": "Finder"}}))
-        self.assertEqual(self.state["defaults"]["restart"], {"com.apple.dock": ["Finder"]})
+        self.assertEqual(
+            self.state["defaults"]["restart"], {"user": {"com.apple.dock": ["Finder"]}}
+        )
 
     def test_process_not_running_is_a_warning(self):
         self.fake.running = set()
