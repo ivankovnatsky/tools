@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from tools import fsutil
-from tools.user import sops, templates
+from tools.user import git_repos, sops, templates
 
 
 @dataclass
@@ -46,19 +46,62 @@ class Ownership(dict):
     keep the paths as spelled.
     """
 
-    def __init__(self, exact=(), links: Optional[Dict[str, str]] = None, trees=None):
+    def __init__(
+        self,
+        exact=(),
+        links: Optional[Dict[str, str]] = None,
+        trees=None,
+        repos=(),
+        clone_pending: bool = False,
+    ):
         super().__init__(exact)
         self._exact = {_link_key(p): reason for p, reason in dict(exact).items()}
         self.links = {_link_key(p): (p, owner) for p, owner in (links or {}).items()}
         self.trees = {_tree_key(p): (p, owner) for p, owner in (trees or {}).items()}
+        self.repos = {_tree_key(p): p for p in repos}
+        self.clone_pending = clone_pending
 
     def __bool__(self) -> bool:
-        return bool(len(self) or self.links or self.trees)
+        return bool(len(self) or self.links or self.trees or self.repos)
 
     def reason(self, path: str) -> Optional[str]:
         n = _norm(path)
         exact = self._exact.get(_link_key(n))
-        return exact if exact is not None else self.managed_reason(n)
+        if exact is not None:
+            return exact
+        return self.managed_reason(n) or self.repo_reason(n)
+
+    def repo_reason(self, path: str) -> Optional[str]:
+        """Why a write to ``path`` would pre-empt or break a gitRepos clone.
+
+        Checked at write time; ``clone_pending`` means the clone is still to come.
+        """
+        if not self.repos:
+            return None
+        real = _tree_key(path)
+        for root, dest in self.repos.items():
+            if not fsutil.is_within(real, root):
+                continue
+            if real == root:
+                return f"the gitRepos checkout {dest}"
+            if git_repos.is_checkout(dest):
+                continue
+            if os.path.lexists(dest):
+                return f"inside gitRepos checkout {dest}, which is not a git checkout"
+            if not self.clone_pending:
+                return f"inside gitRepos checkout {dest}, which is not cloned yet"
+        return None
+
+    def awaiting_clone(self, path: str) -> Optional[str]:
+        """Why ``path`` may be missing now but present by the time it is
+        read: it lies in a gitRepos destination that is still to be cloned."""
+        if not self.clone_pending:
+            return None
+        real = _tree_key(path)
+        for root, dest in self.repos.items():
+            if fsutil.is_within(real, root) and not os.path.lexists(dest):
+                return f"arrives with the gitRepos clone of {dest}"
+        return None
 
     def managed_reason(self, path: str) -> Optional[str]:
         """Why ``path`` is under `links`/`skills` management, ignoring claims.
@@ -147,6 +190,8 @@ def ownership_conflicts(
     skills_raw=None,
     state: Optional[Dict] = None,
     config_dir: str = ".",
+    git_repos_raw=None,
+    clone_pending: bool = False,
 ) -> Ownership:
     """Paths every file-writing section (files, sops, templates) refuses.
 
@@ -154,7 +199,9 @@ def ownership_conflicts(
     state, is refused by all, so two owners never overwrite each other. A
     claim that exists only in state frees itself: its owner removes or
     forgets it on that deploy. Symlinks and directories that `links` and
-    `skills` manage are refused too, including writes through them.
+    `skills` manage are refused too, including writes through them, as
+    are paths inside a ``gitRepos`` destination that is not a checkout
+    (``clone_pending``: the clone happens before the write).
     """
     state = state or {}
     claims: Dict[str, Set[str]] = {}
@@ -202,7 +249,12 @@ def ownership_conflicts(
                 break
             child, anc = anc, os.path.dirname(anc)
     link_paths, trees = _link_owned_paths(links_raw, skills_raw, state, config_dir)
-    return Ownership(exact, link_paths, trees)
+    repos = [_norm(d) for d in _mapping(git_repos_raw) if isinstance(d, str) and d]
+    return Ownership(exact, link_paths, trees, repos, clone_pending)
+
+
+def _mapping(raw) -> Mapping:
+    return raw if isinstance(raw, Mapping) else {}
 
 
 def _private_dirs(state: Dict) -> list:
@@ -213,22 +265,75 @@ def _private_dirs(state: Dict) -> list:
     return dirs
 
 
+EARLY, LATE = "early", "late"
+
+
+def paths_in_repos(git_repos_raw, sops_raw, templates_raw) -> Set[str]:
+    """Declared sops/templates paths inside a ``gitRepos`` destination, plus
+    secrets decrypted from a ``sopsFile`` inside one, and templates using
+    such a secret, so each runs after what it needs exists.
+
+    Taken before any clone: a checkout may bring in symlinks that move them.
+    """
+    roots = [_tree_key(_norm(d)) for d in _mapping(git_repos_raw) if isinstance(d, str) and d]
+    if not roots:
+        return set()
+    parsed = sops.parse_sops(sops_raw)
+    tmpls, _errors = templates.parse_templates(templates_raw, *parsed.secrets_dir())
+    paths = [s.path for s in parsed.secrets] + [t.target for t in tmpls]
+
+    def in_repo(path: str) -> bool:
+        return any(fsutil.is_within(_tree_key(path), r) for r in roots)
+
+    inside = {p for p in paths if in_repo(p)}
+    inside |= {s.path for s in parsed.secrets if s.sops_file and in_repo(s.sops_file)}
+    late_secrets = {s.name for s in parsed.secrets if s.path in inside}
+    if late_secrets:
+        inside |= {t.target for t in tmpls if templates.secret_refs(t) & late_secrets}
+    return inside
+
+
+def _split(phase: Optional[str], inside) -> dict:
+    """plan() arguments: EARLY runs before gitRepos (paths outside every
+    destination), LATE after it (paths inside, plus errors and removals)."""
+    if phase is None:
+        return {}
+    if phase == EARLY:
+        return {"select": lambda p: p not in inside, "tail": False}
+    return {"select": lambda p: p in inside, "tail": True}
+
+
+def _merge(report: RunReport, section: str, names: List[str], phase) -> None:
+    if phase == LATE:
+        report.changed[section] = report.changed.get(section, []) + names
+    else:
+        report.changed[section] = names
+
+
 def deploy_sops(
     raw,
     state: Dict,
     report: RunReport,
     decryptor: Optional[sops.Decryptor] = None,
     conflicts: Optional[Mapping[str, str]] = None,
+    *,
+    phase: Optional[str] = None,
+    inside=frozenset(),
 ):
     parsed = sops.parse_sops(raw)
     installed = _installed(state, "sops")
     p = sops.plan(
-        parsed, installed, decryptor or sops.Decryptor(parsed.settings), conflicts=conflicts
+        parsed,
+        installed,
+        decryptor or sops.Decryptor(parsed.settings),
+        conflicts=conflicts,
+        **_split(phase, inside),
     )
     res = sops.apply(p, parsed.settings, installed, _private_dirs(state))
     state.setdefault("sops", {})["installed"] = installed
-    report.changed["sops"] = [s.name for s in res.changed]
-    report.failed_secrets = tuple(res.failed)
+    _merge(report, "sops", [s.name for s in res.changed], phase)
+    failed = tuple(res.failed)
+    report.failed_secrets = report.failed_secrets + failed if phase == LATE else failed
     report.notify += [(n, f"sops/{s.name}") for s in res.changed for n in s.notify]
     return res.success
 
@@ -240,6 +345,9 @@ def deploy_templates(
     report: RunReport,
     conflicts: Optional[Mapping[str, str]] = None,
     decryptor: Optional[sops.Decryptor] = None,
+    *,
+    phase: Optional[str] = None,
+    inside=frozenset(),
 ) -> bool:
     parsed_sops = sops.parse_sops(sops_raw)
     tmpls, errors = templates.parse_templates(raw, *parsed_sops.secrets_dir())
@@ -248,6 +356,7 @@ def deploy_templates(
         parsed_sops,
         decryptor=decryptor or sops.Decryptor(parsed_sops.settings),
         failed=report.failed_secrets,
+        installed=_installed(state, "sops"),
     )
     p = templates.plan(
         tmpls,
@@ -256,10 +365,11 @@ def deploy_templates(
         lookup,
         conflicts=conflicts,
         pending_errors=(sops.SecretUnavailable,),
+        **_split(phase, inside),
     )
     res = templates.apply(p, installed, parsed_sops.secrets_dir()[0], _private_dirs(state))
     state.setdefault("templates", {})["installed"] = installed
-    report.changed["templates"] = [t.name for t in res.changed]
+    _merge(report, "templates", [t.name for t in res.changed], phase)
     report.notify += [(n, f"templates/{t.name}") for t in res.changed for n in t.notify]
     return res.success
 
@@ -269,6 +379,9 @@ def plan_sops(
     state: Dict,
     decryptor: Optional[sops.Decryptor] = None,
     conflicts: Optional[Mapping[str, str]] = None,
+    *,
+    phase: Optional[str] = None,
+    inside=frozenset(),
 ) -> sops.Plan:
     parsed = sops.parse_sops(raw)
     return sops.plan(
@@ -276,6 +389,7 @@ def plan_sops(
         _installed(state, "sops"),
         decryptor or sops.Decryptor(parsed.settings),
         conflicts=conflicts,
+        **_split(phase, inside),
     )
 
 
@@ -300,12 +414,18 @@ def diff_templates(
     decryptor: Optional[sops.Decryptor] = None,
     conflicts: Optional[Mapping[str, str]] = None,
     failed: Tuple[str, ...] = (),
+    *,
+    phase: Optional[str] = None,
+    inside=frozenset(),
 ) -> List[str]:
     """``failed``: the sops plan's failed secrets when sops runs too, as in deploy."""
     parsed_sops = sops.parse_sops(sops_raw)
     tmpls, errors = templates.parse_templates(raw, *parsed_sops.secrets_dir())
     lookup = sops.make_lookup(
-        parsed_sops, decryptor=decryptor or sops.Decryptor(parsed_sops.settings), failed=failed
+        parsed_sops,
+        decryptor=decryptor or sops.Decryptor(parsed_sops.settings),
+        failed=failed,
+        installed=_installed(state, "sops"),
     )
     p = templates.plan(
         tmpls,
@@ -314,6 +434,7 @@ def diff_templates(
         lookup,
         conflicts=conflicts,
         pending_errors=(sops.SecretUnavailable,),
+        **_split(phase, inside),
     )
     return templates.describe(p)
 
