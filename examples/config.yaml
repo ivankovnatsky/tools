@@ -87,3 +87,20 @@ links: []
 flatpak:
   remotes: {}
   packages: []
+
+# macOS launchd jobs, like nix-config's local.launchd. See README "launchd".
+launchd:
+  labelPrefix: com.example
+  sudo: false # true for domain: system jobs; run tools as yourself, never via sudo
+  services:
+    web:
+      waitForPaths: [/Volumes/Storage]
+      dataDir: /Volumes/Storage/Data/.web
+      environment:
+        PORT: "8080"
+      command: /opt/homebrew/bin/web-server --data /Volumes/Storage/Data/.web
+      restartOn: [~/.config/web/config.toml]
+    cleanup:
+      command: /usr/bin/find /tmp/web -mtime +7 -delete
+      startCalendarInterval: { hour: 4, minute: 30 }
+      keepAlive: false # default true, as in nix-config
