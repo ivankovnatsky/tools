@@ -349,6 +349,46 @@ def resolve(
     return desired, links, errors, pending
 
 
+def pending_paths(skills_config: Dict, pending: List[str]) -> Tuple[List[str], List[str]]:
+    """Copy and link paths of enable entries whose git source is not cloned yet.
+
+    Only entries naming one skill are known before the clone; ``src/*``
+    expands to names nobody has seen yet.
+    """
+    copies: List[str] = []
+    link_paths: List[str] = []
+    default_targets, _ = _validate_targets(skills_config.get("targets") or [], "skills")
+    default_links, _ = _validate_targets(
+        skills_config.get("linkTargets") or [], "skills", "linkTargets"
+    )
+    enable = skills_config.get("enable") or []
+    for raw in enable if isinstance(enable, list) else []:
+        entry, err = _normalize_entry(raw)
+        if err or entry["skill"] not in pending:
+            continue
+        source_name, _, rel = entry["skill"].partition("/")
+        rel = rel or "."
+        if rel == "*":
+            continue
+        if "as" in entry:
+            name = str(entry["as"])
+        else:
+            name = source_name if rel == "." else rel.rsplit("/", 1)[-1]
+        if not name or "/" in name or name in (".", ".."):
+            continue
+        targets = (
+            _validate_targets(entry["targets"], "")[0] if "targets" in entry else default_targets
+        )
+        links = (
+            _validate_targets(entry["linkTargets"], "", "linkTargets")[0]
+            if "linkTargets" in entry
+            else default_links
+        )
+        copies += [os.path.join(t, name) for t in targets]
+        link_paths += [os.path.join(t, name) for t in links]
+    return copies, link_paths
+
+
 # --------------------------------------------------------------------------
 # Git sources
 # --------------------------------------------------------------------------
