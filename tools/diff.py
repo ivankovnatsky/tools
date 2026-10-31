@@ -9,6 +9,7 @@ from typing import Dict, List
 from tools.log import Color, log
 from tools.services import diff_services
 from tools.services import has_work as services_has_work
+from tools.services import released_rows as services_released_rows
 from tools.services.keys import key_path as services_key_path
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
@@ -550,8 +551,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
     if restarts:
         sections.append(("restart", [f"  ~ restart {proc}" for proc in restarts]))
 
-    if "services" in active and services_has_work(config.get("services")):
-        subsections = diff_services(config.get("services"), config_dir, state, services_key)
+    if "services" in active:
+        if services_has_work(config.get("services")):
+            subsections = diff_services(config.get("services"), config_dir, state, services_key)
+        else:
+            subsections = services_released_rows(config.get("services"), state)
         if subsections:
             sections.append(("services", subsections))
 
