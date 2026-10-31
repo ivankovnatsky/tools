@@ -27,7 +27,10 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`.
+`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`, `launchd`.
+
+`tools status [--config PATH]...` prints the live state of managed launchd jobs
+(loaded, pid, last exit code). It is read-only and never uses sudo.
 
 ## Config
 
@@ -120,6 +123,81 @@ links:
 - A missing source is skipped with a warning, so no dangling link is made.
 - A tracked link is repointed or removed only while it still points where
   tools left it, and removals are held while any entry is invalid.
+
+## launchd
+
+Agents (`domain: user`, `gui/<uid>`) and daemons (`domain: system`). macOS only.
+Agents mirror nix-config's home `local.launchd`, daemons its darwin one; see the differences below.
+
+```yaml
+launchd:
+  labelPrefix: com.example # label = <labelPrefix>.<name> unless `label:` is set
+  sudo: true # needed for domain: system (tools runs `sudo -n`; run `sudo -v` first)
+  services:
+    caddy:
+      domain: system
+      waitForSecrets: true
+      waitForPaths: [/Volumes/Storage]
+      dataDir: /var/lib/caddy
+      command: /opt/homebrew/bin/caddy run --config /var/lib/caddy/Caddyfile
+      restartOn: [/var/lib/caddy/Caddyfile]
+```
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `command` / `programArguments` | — | exactly one; wrapper ends `exec <command>` (as nix) or `exec "$@"` |
+| `waitForSecrets` | false | wait for `~/.config/sops-nix/secrets` (agents) or `/run/secrets` (daemons) |
+| `waitForPath` / `waitForPaths` | — | wait until each path exists |
+| `dataDir`, `extraDirs` | — | `mkdir -p` at start; `extraDirs` also takes `{path, mode, owner, group}` |
+| `preStart` | — | shell run before the command |
+| `keepAlive` | true | bool or `{successfulExit, crashed, pathState, ...}` |
+| `runAtLoad` / `throttleInterval` | true / 10 | |
+| `logDir` | `/tmp/agents/log/launchd` (agents), `/tmp/log/launchd` (daemons) | logs `<name>.log`, `<name>.error.log`; `stdoutPath`/`stderrPath` override |
+| `user` / `group` | — | daemons only; or `extraServiceConfig.UserName/GroupName`, not both |
+| `bash` (section) | `/bin/bash` | shell that runs the wrapper; for daemons every path component (symlinks too) and the target must be root-owned, not group/world-writable; the plist gets the resolved target |
+| `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; root-only daemon files are hashed via `sudo -n shasum` |
+| `restartOnChange` | true | false: write a changed plist but leave the running job |
+| `disabled` | false | keep the plist, `launchctl disable` and boot out |
+| `secrets` | false | plist `0600`, diff suppressed |
+| `environment`, `workingDirectory`, `processType`, `nice`, `startInterval`, `startCalendarInterval`, `extraServiceConfig` | — | plist keys |
+
+Behaviour:
+
+- Wrapper, always (also for `programArguments`), as nix: `set -e`, `PATH=/bin:/usr/bin:$PATH`, `mkdir -p` + `chmod 755` logDir, waits, dirs, `preStart`, `exec`.
+- A section-level error (e.g. `sudo: yes`) holds every create, update and removal.
+- A label loaded from another plist is never booted out: a conflict error on create, forgotten with a warning on removal.
+- Plists are compared parsed; a change is written atomically, then `bootout` + `bootstrap`. A job that isn't loaded gets loaded.
+- Agent logs are pre-created by tools. Every daemon gets `sudo -n mkdir -p <logDir>` (if missing); with a user also `touch -h` and `chown -h user:group` (group default `staff`). Symlinked log paths are skipped.
+- A missing `workingDirectory` is created at deploy (agents as the user, daemons via `sudo -n mkdir -p`), since launchd enters it before the wrapper runs.
+- `disabled` is compared with launchd's live override (`print-disabled`), so changes made outside tools are corrected.
+- Daemon log paths must be absolute, normalized, without `..`, under `/tmp/log`, `/Library/Logs` or `/var/log`.
+- State records only steps that succeeded; a failed activation shows as `retry` in `tools diff`.
+- A plist tools didn't write is never replaced (an identical one is adopted) and never removed.
+- Removal re-reads the plist and stops if it changed since tools wrote it; a disabled label is re-enabled first.
+- An unreadable plist or a malformed state entry for a configured job holds that job and fails the deploy, with a fix hint.
+- tools refuses to run as root. Daemons need `sudo: true`; every privileged call is a fixed `sudo -n` command (`install`, `launchctl`, `rm`, `plutil`, `shasum`, log `mkdir`/`touch`/`chown`) on paths derived from the label or the checked logDir.
+- Known limit (as nix): `/tmp/log` is world-writable, so a local user could plant symlinks or hard links there before root touches/chowns daemon logs.
+
+### Differences from nix-config
+
+| Option | nix-config | tools | Why |
+| --- | --- | --- | --- |
+| domain | daemons only | `user` (default) or `system` | tools also manages agents; set `domain: system` when migrating |
+| label | `com.ivankovnatsky.<name>` | `labelPrefix` required | no personal default in a public tool |
+| `enable` | per service, default false | listing a service enables it | YAML list is the switch |
+| `waitForPath` | one path | also `waitForPaths` list | several secrets/volumes |
+| bash | `pkgs.bash` | `/bin/bash`, or `bash:` | stable path; root-owned for daemons |
+| logDir `chmod 755` | can fail and kill the job | agents skip it if not owner; daemons `\|\| true` | avoids a crash loop |
+| extraServiceConfig | can override anything | log paths checked; `Label`/`Program*` reserved | log-path safety |
+| ownership | nix-darwin owns all plists | state; never touches foreign plists | safe migration |
+| errors | eval fails | bad entry holds removals, deploy fails | partial apply stays honest |
+| privilege | activation runs as root | refuses root; fixed `sudo -n` commands | no root process |
+| extras | — | `restartOn`, `restartOnChange`, `disabled`, `secrets`, `tools diff` | |
+| tools-only options | — | `programArguments`, `keepAlive` mapping, `stdoutPath`/`stderrPath`, `user`/`group`, `workingDirectory`, `processType`, `nice`, `startInterval`, `startCalendarInterval`, `extraDirs` mode/owner/group, numeric `environment` values (made strings) | plain plist keys or conveniences |
+| foreign loaded label | n/a | never booted out (create or removal) | ownership |
+| daemon logDir | `mkdir`/`touch`/`chown` only with `UserName` | `mkdir` for every daemon; `touch -h`/`chown -h` with a user | launchd opens logs before the wrapper |
+| `workingDirectory` | not created | created at deploy | launchd `chdir`s before the wrapper |
+| disabled override | not managed | compared with live `print-disabled` | outside changes corrected |
 
 ## State and ownership
 
