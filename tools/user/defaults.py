@@ -28,22 +28,32 @@ compared type-strictly: `true` is not `1` and `64` is not `64.0`.
 
 Ownership: the first write of a key records its prior value in state, and
 `written` is saved before every write (`confirmed` keeps the last value
-that landed). A key that leaves config gets its prior value back only if it
-existed before tools and still holds `written` or `confirmed`; otherwise it
-is left as is and forgotten.
+that landed). A key that leaves config while it still holds `written` or
+`confirmed` gets its prior value back, or is deleted if it did not exist
+before tools; a key changed by hand is left as is and forgotten.
 
-The provider takes resolved data (`parse_defaults`) and a `DefaultsCLI`
-runner, so any config frontend can drive it and tests can mock every call.
+`parse_defaults` is pure: it validates and spells domains lexically, and
+that spelling is what `defaults` is given. `identify` (run by the provider)
+resolves, per scope, the plist file each spelling touches (symlinks,
+on-disk case, case folded on case-insensitive volumes). That identity keys
+state, dedup and restart matching, never a write target; each state entry
+also keeps the resolved, case-kept `target` it was written through, so a
+symlink repointed elsewhere leaves the old plist restored or deleted there
+and the new one gets its own prior. The provider takes parsed data and a
+`DefaultsCLI` runner, so any config frontend can drive it and tests can
+mock every call.
 """
 
+import copy
 import json
 import os
 import plistlib
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
+from tools import fsutil
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin_optional
 from tools.util import run_command
@@ -78,13 +88,19 @@ class DefaultsError(Exception):
 @dataclass(frozen=True)
 class DefaultsKey:
     scope: str  # user | currentHost | system
-    domain: str
+    domain: str  # as passed to `defaults`
     key: str
     value: object
+    identity: Optional[str] = None  # set by `identify`: keys state
+    target: Optional[str] = None  # set by `identify`: resolved, case kept
 
     @property
     def id(self) -> Tuple[str, str, str]:
         return (self.scope, self.domain, self.key)
+
+    @property
+    def sid(self) -> Tuple[str, str, str]:
+        return (self.scope, self.identity or self.domain, self.key)
 
 
 @dataclass
@@ -172,44 +188,38 @@ def fmt_value(value) -> str:
 
 
 _GLOBAL_NAMES = {"-g", ".GlobalPreferences", "NSGlobalDomain"}
-_CASE_INSENSITIVE: Dict[int, bool] = {}
 
 
-def _case_insensitive(directory: str) -> bool:
-    """Whether the volume holding `directory` folds case; cached per device."""
-    try:
-        dev = os.stat(directory).st_dev
-    except OSError:
-        return False
-    if dev not in _CASE_INSENSITIVE:
-        result = False
-        try:
-            names = os.listdir(directory)[:64]
-        except OSError:
-            names = []
-        for name in names:
-            if name.swapcase() == name:
-                continue
-            try:
-                a = os.lstat(os.path.join(directory, name))
-                b = os.lstat(os.path.join(directory, name.swapcase()))
-                result = (a.st_ino, a.st_dev) == (b.st_ino, b.st_dev)
-            except OSError:
-                pass
-            break
-        _CASE_INSENSITIVE[dev] = result
-    return _CASE_INSENSITIVE[dev]
+def _home_prefs() -> str:
+    return os.path.normpath(os.path.join(os.path.expanduser("~"), "Library", "Preferences"))
+
+
+def normalize_domain(domain: str) -> str:
+    """Lexical spelling of a preferences domain, without touching the disk:
+    `~/Library/Preferences/<name>` is `<name>`, `-g` is `NSGlobalDomain`,
+    other paths are normalized and `.plist` is dropped."""
+    if domain in _GLOBAL_NAMES:
+        return "NSGlobalDomain"
+    path = os.path.expanduser(domain) if domain.startswith("~") else domain
+    if not os.path.isabs(path):
+        return domain
+    path = os.path.normpath(path)
+    if path.lower().endswith(".plist"):
+        path = path[: -len(".plist")]
+    if os.path.dirname(path) == _home_prefs():
+        name = os.path.basename(path)
+        return "NSGlobalDomain" if name in _GLOBAL_NAMES else name
+    return path
 
 
 def _disk_path(path: str) -> str:
-    """One spelling per file: parent symlinks resolved, each existing component
-    in its on-disk case."""
+    """Parent symlinks resolved, each existing component in its on-disk case."""
     path = os.path.normpath(path)
     full = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
     out = "/"
     parts = [p for p in full.split("/") if p]
     for i, comp in enumerate(parts):
-        insensitive = _case_insensitive(out)
+        insensitive = fsutil._case_insensitive(out)
         try:
             names = os.listdir(out)
         except OSError:
@@ -223,29 +233,72 @@ def _disk_path(path: str) -> str:
     return out
 
 
-def canonical_domain(domain: str) -> str:
-    """The id of a preferences domain: `~/Library/Preferences/<name>` is just
-    `<name>`, other paths are resolved by `_disk_path`, `.plist` is dropped."""
-    if domain in _GLOBAL_NAMES:
-        return "NSGlobalDomain"
-    path = os.path.expanduser(domain) if domain.startswith("~") else domain
-    if not os.path.isabs(path):
+def _disk_prefs(scope: str = "user") -> str:
+    """The dir a bare domain name lives in for `scope` (home Preferences, or
+    its ByHost for currentHost), fully resolved, symlinks included."""
+    prefs = _home_prefs()
+    if scope == "currentHost":
+        prefs = os.path.join(prefs, "ByHost")
+    return _disk_path(os.path.realpath(prefs))
+
+
+def canonical_domain(domain: str, scope: str = "user") -> str:
+    """The plist `defaults` touches for `domain` in `scope`, spelled on disk:
+    a path has its parents resolved by `_disk_path`; a file in the scope's
+    bare-name dir is its bare name (NSGlobalDomain for `.GlobalPreferences`).
+    For currentHost the `.<UUID>` suffix is implied. Case is not folded, so
+    this is safe to pass to `defaults`."""
+    domain = normalize_domain(domain)
+    if domain == "NSGlobalDomain" or (not os.path.isabs(domain) and scope == "system"):
         return domain
-    path = os.path.normpath(path)
-    if path.lower().endswith(".plist"):
-        path = path[: -len(".plist")]
-    path = _disk_path(path + ".plist")[: -len(".plist")]
-    prefs = _disk_path(os.path.join(os.path.expanduser("~"), "Library", "Preferences"))
-    if os.path.dirname(path) == prefs:
+    if os.path.isabs(domain):
+        path = _disk_path(domain + ".plist")
+    else:
+        path = _disk_path(os.path.join(_disk_prefs(scope), domain + ".plist"))
+    path = path[: -len(".plist")]
+    if scope != "system" and os.path.dirname(path) == _disk_prefs(scope):
         name = os.path.basename(path)
         return "NSGlobalDomain" if name in _GLOBAL_NAMES else name
     return path
 
 
+def domain_identity(domain: str, scope: str = "user") -> str:
+    """Which plist `domain` names in `scope`: `canonical_domain`, case folded
+    on case-insensitive volumes (where any case of `.GlobalPreferences` is
+    NSGlobalDomain). Keys state, dedup and restart matching; never a write
+    target."""
+    canon = canonical_domain(domain, scope)
+    if canon == "NSGlobalDomain":
+        return canon
+    if os.path.isabs(canon):
+        return fsutil._fold(canon, os.path.dirname(canon))
+    base = _disk_prefs(scope)
+    ident = fsutil._fold(os.path.join(base, canon), base)
+    if ident == fsutil._fold(os.path.join(base, ".GlobalPreferences"), base):
+        return "NSGlobalDomain"
+    return os.path.basename(ident)
+
+
+def _identity_cache() -> Callable[[str, str], str]:
+    cache: Dict[Tuple[str, str], str] = {}
+
+    def ident_of(scope: str, domain: str) -> str:
+        if (scope, domain) not in cache:
+            cache[(scope, domain)] = domain_identity(domain, scope)
+        return cache[(scope, domain)]
+
+    return ident_of
+
+
+def _merge_procs(into: List[str], procs) -> List[str]:
+    into += [p for p in procs if p not in into]
+    return into
+
+
 def _normalize_domain(scope: str, domain: str) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(domain, str) or not domain.strip():
         return None, f"{scope}: domain must be a non-empty string, got {domain!r}"
-    domain = canonical_domain(domain.strip())
+    domain = normalize_domain(domain.strip())
     if scope == "system" and not os.path.isabs(domain):
         return None, f"system: domain must be an absolute plist path, got {domain!r}"
     return domain, None
@@ -254,11 +307,12 @@ def _normalize_domain(scope: str, domain: str) -> Tuple[Optional[str], Optional[
 _BYHOST_DOCK = re.compile(r"com\.apple\.dock(\.[0-9a-f-]{8,})?")
 
 
-def is_dock_domain(domain: str) -> bool:
-    """True if a canonical user/currentHost domain is the Dock's own prefs."""
+def is_dock_domain(domain: str, prefs: Optional[str] = None) -> bool:
+    """True if a user/currentHost domain is the Dock's own prefs. `prefs` is
+    the home Preferences dir as `domain` spells it (lexical by default)."""
     if not os.path.isabs(domain):
         return domain.lower() == DOCK_DOMAIN
-    prefs = _disk_path(os.path.join(os.path.expanduser("~"), "Library", "Preferences"))
+    prefs = _home_prefs() if prefs is None else prefs
     parent, base = os.path.split(domain)
     return parent.lower() == os.path.join(prefs, "ByHost").lower() and (
         _BYHOST_DOCK.fullmatch(base.lower()) is not None
@@ -336,13 +390,122 @@ def parse_defaults(raw) -> Tuple[DefaultsSpec, List[str]]:
         if err:
             restart_errors.append(err)
             continue
-        spec.restart[normalized] = [p.strip() for p in procs]
+        _merge_procs(spec.restart.setdefault(normalized, []), [p.strip() for p in procs])
 
     errors += structural_errors + restart_errors
     # Any error holds the whole section: no writes, no restores, no kills.
     if errors:
         return DefaultsSpec(), errors
     return spec, errors
+
+
+# --------------------------------------------------------------------------
+# Identity: resources -> on-disk identities (reads the filesystem)
+# --------------------------------------------------------------------------
+
+
+def identify(spec: DefaultsSpec, errors: List[str]) -> Tuple[DefaultsSpec, List[str]]:
+    """Give each key its scope-aware plist identity and resolved target. Two
+    spellings of one plist in a scope, a key declared twice, or a Dock key
+    reached through a path are config errors that hold the whole section."""
+    if errors:
+        return DefaultsSpec(), list(errors)
+    errors = []
+    ident_of = _identity_cache()
+
+    keys: List[DefaultsKey] = []
+    seen = set()
+    spelled: Dict[Tuple[str, str], str] = {}
+    for res in spec.keys:
+        where = f"{res.scope}:{res.domain} {res.key}"
+        ident = ident_of(res.scope, res.domain)
+        target = canonical_domain(res.domain, res.scope)
+        first = spelled.setdefault((res.scope, ident), res.domain)
+        if first != res.domain:
+            errors.append(f"{where}: same plist as {first}; declared more than once")
+            continue
+        if res.scope != "system" and res.key in DOCK_KEYS and os.path.isabs(res.domain):
+            if is_dock_domain(target, _disk_prefs()):
+                errors.append(f"{where}: managed by the dock section")
+                continue
+        if (res.scope, ident, res.key) in seen:
+            errors.append(f"{where}: declared more than once")
+            continue
+        seen.add((res.scope, ident, res.key))
+        keys.append(replace(res, identity=ident, target=target))
+    if errors:
+        return DefaultsSpec(), errors
+    return DefaultsSpec(keys=keys, restart=dict(spec.restart)), errors
+
+
+def migrate_state(section: Dict) -> Dict:
+    """Re-key state recorded by domain spelling (before `target` was kept per
+    entry) by plist identity, the spelling becoming the entry's `target`, and
+    the flat `restart` map into {scope: {identity: procs}}. In place."""
+    ident_of = _identity_cache()
+    managed: Dict = {}
+    for scope, domains in (section.get("managed") or {}).items():
+        for domain, keys in (domains or {}).items():
+            for key, entry in (keys or {}).items():
+                entry = dict(entry or {})
+                ident = domain
+                if "target" not in entry:
+                    entry["target"] = domain
+                    ident = ident_of(scope, domain)
+                managed.setdefault(scope, {}).setdefault(ident, {}).setdefault(key, entry)
+    restart = section.get("restart") or {}
+    if any(isinstance(procs, list) for procs in restart.values()):
+        nested: Dict = {}
+        for scope, domains in managed.items():
+            for ident in domains:
+                for domain, procs in restart.items():
+                    if isinstance(procs, list) and ident_of(scope, domain) == ident:
+                        _merge_procs(nested.setdefault(scope, {}).setdefault(ident, []), procs)
+        restart = nested
+    section["managed"] = managed
+    section["restart"] = restart
+    return section
+
+
+@dataclass
+class _Restarts:
+    """Restart maps matched by scope-aware plist identity, so any spelling of
+    a domain in `restart:`, keys or state selects the same processes. The
+    current `restart:` entry wins; the last deploy's map only covers plists
+    that left config entirely."""
+
+    restart: Dict[str, List[str]]
+    fallback: Dict[str, Dict[str, List[str]]]
+    desired: set
+    ident_of: Callable[[str, str], str]
+
+    @classmethod
+    def build(cls, spec: DefaultsSpec, old_restart: Dict) -> "_Restarts":
+        return cls(
+            restart=spec.restart,
+            fallback=old_restart or {},
+            desired={(res.scope, res.identity) for res in spec.keys},
+            ident_of=_identity_cache(),
+        )
+
+    def entry(self, scope: str, ident: str) -> List[str]:
+        matched = [
+            procs for domain, procs in self.restart.items() if self.ident_of(scope, domain) == ident
+        ]
+        if matched:
+            out: List[str] = []
+            for procs in matched:
+                _merge_procs(out, procs)
+            return out
+        if (scope, ident) in self.desired:
+            return []
+        return list((self.fallback.get(scope) or {}).get(ident, []))
+
+    def for_plists(self, plists) -> List[str]:
+        out: List[str] = []
+        for scope, ident in plists:
+            _merge_procs(out, self.entry(scope, ident))
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -426,6 +589,9 @@ class DefaultsCLI:
             f"write {domain} {key}",
         )
 
+    def delete(self, scope: str, domain: str, key: str) -> None:
+        self._check(self._prefix(scope, True) + ["delete", domain, key], f"delete {domain} {key}")
+
     def restart(self, process: str) -> Optional[str]:
         """Kill process so it relaunches with new prefs. Returns a warning or None."""
         if not self.killall:
@@ -446,24 +612,29 @@ def _managed(state: Dict) -> Dict:
 
 
 def _tracked_entries(managed: Dict):
-    for scope, domains in managed.items():
-        for domain, keys in (domains or {}).items():
+    for scope, idents in managed.items():
+        for ident, keys in (idents or {}).items():
             for key, entry in (keys or {}).items():
-                yield (scope, domain, key), entry
+                yield (scope, ident, key), entry
 
 
 def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -> Dict[str, List]:
-    if errors:
-        spec = DefaultsSpec()
-    managed = _managed(state)
-    tracked = dict(_tracked_entries(managed))
-    result: Dict[str, List] = {
+    """Read-only; `result["spec"]` is the identified spec the plan refers to.
+    State ids are (scope, plist identity, key); removal targets are the
+    declared spelling of that plist if still declared, else the resolved
+    spelling recorded at write time."""
+    spec, errors = identify(spec, errors)
+    section = migrate_state(copy.deepcopy(state.get("defaults", {}) or {}))
+    tracked = dict(_tracked_entries(section["managed"]))
+    result: Dict = {
+        "spec": spec,
         "errors": list(errors),
         "read_errors": [],  # (scope, domain, message)
         "set": [],  # (DefaultsKey, current)
-        "refresh": [],  # DefaultsKey: already equal, state records a stale write
-        "restore": [],  # (id, prior)
-        "forget": [],  # (id, reason)
+        "refresh": [],  # DefaultsKey: already equal, state is stale or retargeted
+        "restore": [],  # (state id, (scope, target, key), prior)
+        "delete": [],  # (state id, (scope, target, key)): not set before tools
+        "forget": [],  # (state id, (scope, target, key), reason)
         "restart": [],  # process names
     }
 
@@ -485,10 +656,12 @@ def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -
             continue
         cur = values.get(res.key, MISSING)
         if same(cur, res.value):
-            entry = tracked.get(res.id)
+            entry = tracked.get(res.sid)
             want = to_xml(res.value)
             if entry is not None and (
-                entry.get("written") != want or entry.get("confirmed", want) != want
+                entry.get("written") != want
+                or entry.get("confirmed", want) != want
+                or entry.get("target") != res.target
             ):
                 result["refresh"].append(res)
         else:
@@ -496,27 +669,33 @@ def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -
 
     # Removals wait for a clean config: an invalid entry looks undesired when
     # it is merely unparsed.
-    desired = {res.id for res in spec.keys}
+    desired = {res.sid for res in spec.keys}
+    declared = {(res.scope, res.identity): res.domain for res in spec.keys}
     if not errors:
-        for ident in sorted(set(tracked) - desired):
-            entry = tracked[ident] or {}
-            values = read(ident[0], ident[1])
+        for sid in sorted(set(tracked) - desired):
+            entry = tracked[sid] or {}
+            scope, ident, key = sid
+            target = declared.get((scope, ident)) or entry.get("target") or ident
+            wid = (scope, target, key)
+            values = read(scope, target)
             if values is None:
                 continue
-            cur = values.get(ident[2], MISSING)
+            cur = values.get(key, MISSING)
             prior = from_xml(entry.get("prior"))
             ours = [from_xml(entry.get("written")), from_xml(entry.get("confirmed"))]
             reason = _removal(cur, prior, ours)
             if reason:
-                result["forget"].append((ident, reason))
+                result["forget"].append((sid, wid, reason))
+            elif prior is MISSING:
+                result["delete"].append((sid, wid))
             else:
-                result["restore"].append((ident, prior))
+                result["restore"].append((sid, wid, prior))
 
-    old_restart = state.get("defaults", {}).get("restart", {}) or {}
-    changed = [res.domain for res, _ in result["set"]]
-    changed += [ident[1] for ident, _ in result["restore"]]
-    desired_domains = {res.domain for res in spec.keys}
-    result["restart"] = restarts_for(changed, spec.restart, old_restart, desired_domains)
+    changed = [res.sid[:2] for res, _ in result["set"]]
+    changed += [sid[:2] for sid, _, _ in result["restore"]]
+    changed += [sid[:2] for sid, _ in result["delete"]]
+    restarts = _Restarts.build(spec, section["restart"])
+    result["restart"] = restarts.for_plists(changed)
     return result
 
 
@@ -525,35 +704,13 @@ def _eq(a, b) -> bool:
 
 
 def _removal(cur, prior, ours: List) -> Optional[str]:
-    """Why a key that left config is forgotten, or None to restore prior."""
+    """Why a key that left config is forgotten, or None to restore prior
+    (delete it, when prior is MISSING)."""
     if _eq(cur, prior):
         return "already gone"
-    if prior is MISSING:
-        return "not set before tools; left as is"
     if any(v is not MISSING and _eq(cur, v) for v in ours):
         return None
     return "changed by hand; left as is"
-
-
-def restarts_for(
-    domains: List[str], restart: Dict, fallback: Dict, desired_domains: set
-) -> List[str]:
-    """Processes to restart. The current `restart:` entry wins; the last
-    deploy's map only covers domains that left config entirely."""
-    procs: List[str] = []
-    for domain in domains:
-        for proc in _restart_entry(domain, restart, fallback, desired_domains):
-            if proc not in procs:
-                procs.append(proc)
-    return procs
-
-
-def _restart_entry(domain: str, restart: Dict, fallback: Dict, desired_domains: set) -> List[str]:
-    if domain in restart:
-        return restart[domain]
-    if domain in desired_domains:
-        return []
-    return fallback.get(domain, [])
 
 
 def _label(scope: str, domain: str, key: str) -> str:
@@ -626,11 +783,12 @@ def _apply_defaults(
     queue: List[str],
     persist: Callable[[], None],
 ) -> bool:
-    section = state.setdefault("defaults", {})
-    managed = section.setdefault("managed", {})
+    p = plan(spec, errors, state, cli)
+    spec = p["spec"]
+    section = migrate_state(state.setdefault("defaults", {}))
+    managed = section["managed"]
     success = True
 
-    p = plan(spec, errors, state, cli)
     for err in p["errors"]:
         log(f"defaults: {err}", Color.RED)
         success = False
@@ -638,29 +796,29 @@ def _apply_defaults(
         log(f"defaults: skipping {scope}:{domain}: {msg}", Color.RED)
         success = False
 
-    old_restart = section.get("restart", {}) or {}
-    desired_domains = {res.domain for res in spec.keys}
-    changed_domains: List[str] = []
+    restarts = _Restarts.build(spec, section["restart"])
+    changed_plists: List[Tuple[str, str]] = []
 
-    def changed(domain: str) -> None:
-        changed_domains.append(domain)
-        for proc in restarts_for([domain], spec.restart, old_restart, desired_domains):
+    def changed(sid) -> None:
+        changed_plists.append(sid[:2])
+        for proc in restarts.for_plists([sid[:2]]):
             queue_restart(queue, proc)
 
-    def failed(ident, e: BaseException) -> None:
+    def failed(sid, wid, e: BaseException) -> None:
         nonlocal success
         success = False
         if isinstance(e, DefaultsError):
             log(f"defaults: {e}", Color.RED)
         else:
-            log(f"defaults: {_label(*ident)}: {type(e).__name__}: {e}", Color.RED)
-            changed(ident[1])
+            log(f"defaults: {_label(*wid)}: {type(e).__name__}: {e}", Color.RED)
+            changed(sid)
 
     for res, cur in p["set"]:
-        slot = _entry_slot(managed, res.id)
+        slot = _entry_slot(managed, res.sid)
         fresh = res.key not in slot
         if fresh:
             slot[res.key] = {"prior": None if cur is MISSING else to_xml(cur), "written": None}
+        slot[res.key]["target"] = res.target
         before = slot[res.key]["written"]
         # `confirmed` is the last value known to have landed.
         if before is not None and _eq(cur, from_xml(before)):
@@ -671,50 +829,64 @@ def _apply_defaults(
         try:
             cli.write(res.scope, res.domain, res.key, res.value)
         except BaseException as e:
-            failed(res.id, e)
+            failed(res.sid, res.id, e)
             if isinstance(e, DefaultsError):
                 if fresh:
-                    _drop(managed, res.id)
+                    _drop(managed, res.sid)
                 else:
                     slot[res.key]["written"] = before
             elif not isinstance(e, Exception):
                 raise
             continue
         slot[res.key]["confirmed"] = slot[res.key]["written"]
-        changed(res.domain)
+        changed(res.sid)
         log(f"Wrote: {_label(*res.id)} = {fmt_value(res.value)}", Color.GREEN)
 
     for res in p["refresh"]:
-        slot = _entry_slot(managed, res.id)[res.key]
+        slot = _entry_slot(managed, res.sid)[res.key]
         slot["written"] = slot["confirmed"] = to_xml(res.value)
+        slot["target"] = res.target
 
-    for ident, prior in p["restore"]:
+    for sid, wid, prior in p["restore"]:
         try:
-            cli.write(ident[0], ident[1], ident[2], prior)
+            cli.write(wid[0], wid[1], wid[2], prior)
         except BaseException as e:
-            failed(ident, e)
+            failed(sid, wid, e)
             if not isinstance(e, Exception):
                 raise
             continue
-        _drop(managed, ident)
-        changed(ident[1])
-        log(f"Restored: {_label(*ident)} = {fmt_value(prior)}", Color.YELLOW)
+        _drop(managed, sid)
+        changed(sid)
+        log(f"Restored: {_label(*wid)} = {fmt_value(prior)}", Color.YELLOW)
 
-    for ident, reason in p["forget"]:
+    for sid, wid in p["delete"]:
+        try:
+            cli.delete(*wid)
+        except BaseException as e:
+            failed(sid, wid, e)
+            if not isinstance(e, Exception):
+                raise
+            continue
+        _drop(managed, sid)
+        changed(sid)
+        log(f"Deleted: {_label(*wid)}", Color.YELLOW)
+
+    for sid, wid, reason in p["forget"]:
         if reason != "already gone":
-            log(f"defaults: releasing {_label(*ident)}: {reason}", Color.YELLOW)
-        _drop(managed, ident)
+            log(f"defaults: releasing {_label(*wid)}: {reason}", Color.YELLOW)
+        _drop(managed, sid)
 
-    # Kept per tracked domain so a later restore still restarts the right
+    # Kept per tracked plist so a later restore still restarts the right
     # process after the whole section (and its restart map) left config.
-    new_restart = {}
-    for domain in sorted({d for domains in managed.values() for d in domains}):
-        procs = _restart_entry(domain, spec.restart, old_restart, desired_domains)
-        if procs:
-            new_restart[domain] = procs
+    new_restart: Dict = {}
+    for scope, idents in sorted(managed.items()):
+        for ident in sorted(idents):
+            procs = restarts.entry(scope, ident)
+            if procs:
+                new_restart.setdefault(scope, {})[ident] = procs
     section["restart"] = new_restart
 
-    if not changed_domains:
+    if not changed_plists:
         debug("All defaults up to date", Color.BLUE)
     return success
 
@@ -742,10 +914,11 @@ def preview_defaults(
             changes.append(f"  + write {label} = {fmt_value(res.value)}")
         else:
             changes.append(f"  ~ write {label}: {fmt_value(cur)} -> {fmt_value(res.value)}")
-    changes += [f"  - restore {_label(*i)} -> {fmt_value(v)}" for i, v in p["restore"]]
+    changes += [f"  - restore {_label(*w)} -> {fmt_value(v)}" for _, w, v in p["restore"]]
+    changes += [f"  - delete {_label(*w)}" for _, w in p["delete"]]
     changes += [
-        f"  ~ forget {_label(*i)} ({reason})"
-        for i, reason in p["forget"]
+        f"  ~ forget {_label(*w)} ({reason})"
+        for _, w, reason in p["forget"]
         if reason != "already gone"
     ]
     if restarts is None:
