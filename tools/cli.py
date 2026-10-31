@@ -123,35 +123,65 @@ def _run_sections(
 ) -> bool:
     success = True
 
-    # sops and templates first: later sections (mcp secretPaths, ${sopsPath:}
-    # consumers) read the files they write; a failed secret blocks its templates.
+    def registry():
+        return secrets_flow.ownership_conflicts(
+            files_entries=config.get("files"),
+            sops_raw=config.get("sops"),
+            templates_raw=config.get("templates"),
+            links_raw=config.get("links"),
+            skills_raw=config.get("skills"),
+            state=state,
+            config_dir=config_dir,
+            git_repos_raw=config.get("gitRepos"),
+        )
+
     # One registry for every file-writing section, taken before any of them runs.
-    conflicts = secrets_flow.ownership_conflicts(
-        files_entries=config.get("files"),
-        sops_raw=config.get("sops"),
-        templates_raw=config.get("templates"),
-        links_raw=config.get("links"),
-        skills_raw=config.get("skills"),
-        state=state,
-        config_dir=config_dir,
+    conflicts = registry()
+    # sops and templates first: later sections (mcp secretPaths, ${sopsPath:}
+    # consumers, private gitRepos clones) read the files they write; a failed
+    # secret blocks its templates. Paths inside a gitRepos destination wait
+    # for the clone, which would otherwise find the directory and skip it.
+    inside = secrets_flow.paths_in_repos(
+        config.get("gitRepos"), config.get("sops"), config.get("templates")
     )
     report = secrets_flow.RunReport()
     # One decryptor for both, so templates render the values sops just wrote.
     decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
-    if "sops" in active and sops_section.has_work(config.get("sops"), state):
-        success &= secrets_flow.deploy_sops(
-            config.get("sops"), state, report, decryptor, conflicts=conflicts
-        )
+    run_sops = "sops" in active and sops_section.has_work(config.get("sops"), state)
+    run_templates = "templates" in active and templates_section.has_work(
+        config.get("templates"), state
+    )
 
-    if "templates" in active and templates_section.has_work(config.get("templates"), state):
-        success &= secrets_flow.deploy_templates(
-            config.get("templates"),
-            config.get("sops"),
-            state,
-            report,
-            conflicts,
-            decryptor,
-        )
+    def secrets(owners, phase=None):
+        ok = True
+        split = {"phase": phase, "inside": inside} if phase else {}
+        if run_sops:
+            ok &= secrets_flow.deploy_sops(
+                config.get("sops"), state, report, decryptor, conflicts=owners, **split
+            )
+        if run_templates:
+            ok &= secrets_flow.deploy_templates(
+                config.get("templates"),
+                config.get("sops"),
+                state,
+                report,
+                owners,
+                decryptor,
+                **split,
+            )
+        return ok
+
+    success &= secrets(conflicts, secrets_flow.EARLY if inside else None)
+
+    if "gitRepos" in active and (
+        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
+    ):
+        success &= install_git_repos(config.get("gitRepos") or {}, state)
+        # A fresh checkout can bring in symlinks that make paths collide.
+        conflicts = registry()
+
+    if inside:
+        success &= secrets(conflicts, secrets_flow.LATE)
     for line in secrets_flow.format_notify(report):
         log(line, Color.YELLOW)
 
@@ -201,11 +231,6 @@ def _run_sections(
         config.get("curlShell") or state.get("curlShell", {}).get("installed")
     ):
         success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
-
-    if "gitRepos" in active and (
-        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
-    ):
-        success &= install_git_repos(config.get("gitRepos") or {}, state)
 
     if "files" in active:
         success &= install_files(config.get("files", []) or [], config_dir, state, conflicts)
