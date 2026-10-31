@@ -532,6 +532,13 @@ delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
   resolved secret is briefly visible in the process list while the command runs.
   Secrets are never logged or persisted to state.
 
+## Packages
+
+`packages/` holds standalone programs moved as is from nix-config (`*-mgmt`
+reconcilers, `rebuild`, `reposync`, `settingsctl` and other scripts). They are
+exposed through `overlays.default` and as `packages.<system>.<name>`, and are
+not part of the `tools` CLI. See [packages/README.md](packages/README.md).
+
 ## Development
 
 ```console
