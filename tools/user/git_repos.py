@@ -7,6 +7,19 @@ from tools.system_paths import system_bin, system_dir
 from tools.util import run_command
 
 
+def is_checkout(path: str) -> bool:
+    """A ``.git`` directory, or a ``.git`` file pointing at one (linked
+    worktrees, submodules, ``--separate-git-dir``)."""
+    dot_git = os.path.join(os.path.expanduser(path), ".git")
+    if os.path.isdir(dot_git):
+        return True
+    try:
+        with open(dot_git, "rb") as f:
+            return f.read(8) == b"gitdir: "
+    except OSError:
+        return False
+
+
 def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
     """True if the worktree has uncommitted changes or unpushed commits.
 
@@ -90,7 +103,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
             # Only a real checkout gets pulled and recorded. An arbitrary
             # directory at that path is not a repo we manage, and marking it
             # installed would make it an rmtree candidate later.
-            if not os.path.isdir(os.path.join(expanded_path, ".git")):
+            if not is_checkout(expanded_path):
                 log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
                 success = False
                 continue
