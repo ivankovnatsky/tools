@@ -10,6 +10,11 @@
 
 stateFile: ~/.local/state/tools/state.json
 
+# Placeholders: see README "Vars and placeholders".
+vars:
+  dataDir: ~/.local/share
+  appDir: ${dataDir}/example-app
+
 # The keys the reconcilers actually read. bun and npm index theirs directly,
 # so a section is only safe to enable once its keys are present.
 #
@@ -60,6 +65,13 @@ pi:
 
 mcp:
   servers: {}
+  # example:
+  #   servers:
+  #     search:
+  #       scope: user
+  #       transport: http
+  #       url: https://mcp.example.test/
+  #       headers: ["Authorization: Bearer ${API_KEY}"] # expanded by claude, not tools
 
 curlShell: {}
 
@@ -79,8 +91,40 @@ skills:
     - ~/.claude/skills
   enable: []
 
-# Symlinks: target is the link, source is what it points at. See README "Links".
+# sops-nix style secrets. See README "Sops".
+sops:
+  age:
+    keyFile: ~/.config/sops/age/keys.txt
+  defaultSopsFile: secrets/example.yaml # relative to this config dir
+  secrets:
+    externalDomain: {} # key defaults to the name
+    app/password:
+      restartUnits: [launchd:org.example.app]
+    example-jwt:
+      generate: { length: 64, charset: alnum }
+
+# sops-nix style templates. See README "Templates".
+templates:
+  example-app-settings:
+    path: ${appDir}/settings.json # default <secretsDir>/rendered/<name>
+    format: json # raw (default) | yaml | json | toml | ini | env
+    content:
+      port: 8080
+      domain: app.${sops:externalDomain}
+      password: ${sops:app/password}
+      jwtFile: ${sopsPath:example-jwt}
+    restartUnits: [launchd:org.example.app]
+  example-app-env:
+    path: ${appDir}/app.env
+    format: env
+    content:
+      LOG_LEVEL: info
+
+# Symlinks: target is the link, source is what it points at; `~` and $VARS
+# expand. See README "Links".
 links: []
+# - source: $HOME/.agents/skills/jira
+#   target: ~/.claude/skills/jira
 
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.
