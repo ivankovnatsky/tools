@@ -4,6 +4,7 @@ import stat
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
+from tools.fsutil import removal_blocked, respell, same_file_as
 from tools.log import Color, debug, log
 from tools.util import format_diff_bytes, looks_like_secret
 
@@ -44,7 +45,12 @@ def _parse_mode(value) -> Optional[int]:
 
 
 def _copy_file(
-    source: str, target: str, mode: Optional[int], *, secrets: bool = False
+    source: str,
+    target: str,
+    mode: Optional[int],
+    *,
+    secrets: bool = False,
+    tracked: bool = True,
 ) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
 
@@ -78,9 +84,10 @@ def _copy_file(
         existing_mode = stat.S_IMODE(os.stat(target).st_mode)
         if existing == desired and existing_mode == desired_mode:
             return None, source_hash
-        action = "Updated"
+        action = "Updated" if tracked else "Replaced untracked"
         is_secret = secrets or looks_like_secret(desired) or looks_like_secret(existing)
-        if is_secret:
+        # Content tools never wrote is never shown: it may hold hand-written secrets.
+        if is_secret or not tracked:
             diff_body = None
         else:
             diff_body = format_diff_bytes(desired, existing, target)
@@ -133,8 +140,15 @@ def _resolve_entries(
     file_pairs: List[Tuple[str, str, Optional[int], bool]] = []
     errors: List[str] = []
     home = os.path.expanduser("~")
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list):
+        return [], [f"files must be a list of entries, got {type(entries).__name__}"]
 
     for entry in entries:
+        if not isinstance(entry, dict):
+            errors.append(f"entry must be a mapping: {entry!r}")
+            continue
         try:
             entry_mode = _parse_mode(entry.get("mode"))
         except (TypeError, ValueError) as e:
@@ -194,7 +208,18 @@ def _resolve_entries(
     return resolved, errors
 
 
-def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict) -> bool:
+def _conflict(target: str, conflicts: Optional[Dict[str, str]]) -> Optional[str]:
+    if not conflicts:
+        return None
+    return conflicts.get(os.path.normpath(os.path.abspath(target)))
+
+
+def install_files(
+    entries: List[Dict[str, object]],
+    config_dir: str,
+    state: Dict,
+    conflicts: Optional[Dict[str, str]] = None,
+) -> bool:
     """Deploy files declared in the `files:` config section.
 
     See `_resolve_entries` for the supported entry shapes.
@@ -204,7 +229,6 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
     files are never deleted on upgrade. Users who want to retire an old
     target should re-declare it under ``files:`` then remove it.
     """
-    state_files = state.get("files", {})
     success = True
     changed = False
     managed_targets: Dict[str, str] = {}
@@ -213,21 +237,48 @@ def install_files(entries: List[Dict[str, object]], config_dir: str, state: Dict
     for err in errors:
         log(f"files: {err}", Color.RED)
         success = False
+    declared = [target for target, _source, _mode, _secrets in resolved]
+    # State keys match declared targets by file identity, not spelling.
+    state_files = respell(dict(state.get("files", {}) or {}), declared)
 
+    held: Dict[str, Dict] = {}
     for target, source, mode, secrets in resolved:
-        result, source_hash = _copy_file(source, target, mode, secrets=secrets)
+        reason = _conflict(target, conflicts)
+        if reason:
+            log(f"files: refusing {target}: {reason}", Color.RED)
+            success = False
+            if target in state_files:
+                held[target] = state_files[target]
+            continue
+        result, source_hash = _copy_file(
+            source, target, mode, secrets=secrets, tracked=target in state_files
+        )
         if result is False:
             success = False
+            if not source_hash and target in state_files:
+                held[target] = state_files[target]
         elif result is True:
             changed = True
 
-        if source_hash:
+        if source_hash and (result is not False or target in state_files):
             managed_targets[target] = source_hash
 
-    if success:
-        kept = {}
+    # Only config errors hold removals: an unparsed entry looks undesired.
+    if not errors:
+        kept = dict(held)
         for target in list(state_files.keys()):
-            if target not in managed_targets:
+            if target not in managed_targets and target not in held:
+                blocked = removal_blocked(conflicts, target)
+                twin = same_file_as(target, declared)
+                if twin:
+                    blocked = f"the same file as declared {twin}"
+                if blocked:
+                    log(
+                        f"files: not removing {target}: it is {blocked}; still tracked",
+                        Color.YELLOW,
+                    )
+                    kept[target] = state_files[target]
+                    continue
                 if os.path.exists(target):
                     # Only delete what still matches what we wrote. A file
                     # edited since then holds work this tool never authored.
