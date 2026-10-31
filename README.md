@@ -27,7 +27,8 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`, `launchd`.
+`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`, `launchd`,
+`defaults`, `dock`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
@@ -198,6 +199,99 @@ Behaviour:
 | daemon logDir | `mkdir`/`touch`/`chown` only with `UserName` | `mkdir` for every daemon; `touch -h`/`chown -h` with a user | launchd opens logs before the wrapper |
 | `workingDirectory` | not created | created at deploy | launchd `chdir`s before the wrapper |
 | disabled override | not managed | compared with live `print-disabled` | outside changes corrected |
+
+## Defaults
+
+`defaults:` reconciles macOS preference keys (skipped with a log line on other
+platforms):
+
+```yaml
+defaults:
+  user:                              # defaults write <domain> ...
+    NSGlobalDomain:
+      AppleKeyboardUIMode: 3
+    com.apple.dock:
+      autohide-delay: 1000.0         # float -> <real>; 1000 would be <integer>
+    com.apple.HIToolbox:
+      AppleEnabledInputSources:      # arrays and nested dicts are fine
+        - InputSourceKind: Keyboard Layout
+          KeyboardLayout ID: 252
+    ~/Library/Preferences/ByHost/com.apple.controlcenter:  # same file as nix-darwin
+      Weather: 2
+  currentHost:                       # defaults -currentHost (<domain>.<UUID>.plist)
+    com.example.app:
+      k: 1
+  system:                            # sudo -n defaults write <path> ...
+    /Library/Preferences/com.example.app:
+      Enabled: true
+  restart:                           # killall after a change in that domain
+    com.apple.dock: Dock
+    com.apple.finder: [Finder]
+```
+
+- Values are typed XML plists, compared type-strictly; equal keys are not
+  rewritten. A key set to `null` is unmanaged (as in nix-darwin).
+- One plist is one domain: `~/Library/Preferences/<name>` is `<name>`, `-g` is
+  `NSGlobalDomain`, other paths resolve symlinks and on-disk case. Two spellings
+  of the same plist are a config error.
+- `system` writes use `sudo -n` (run `sudo -v` first); `diff` never escalates.
+- `restart` processes are killed once, after `dock:` too, only if a key in
+  that domain changed.
+- Any config error holds the whole section: no writes, restores or restarts.
+- `persistent-apps`/`persistent-others` belong to `dock:`.
+
+## Dock
+
+`dock:` sets the Dock layout, like nix-config's dockutil module:
+
+```yaml
+dock:
+  apps:                              # persistent-apps, in order
+    - /System/Applications/Mail.app
+    - spacer                         # also small-spacer, flexible-spacer
+    - {spacer: small}
+    - /Applications/Safari.app
+  others:                            # persistent-others
+    - path: ~/Downloads
+      view: grid                     # auto | fan | grid | list
+      display: stack                 # stack | folder
+      sort: dateadded                # name | dateadded | datemodified | datecreated | kind
+    - {url: "https://example.com", label: Example}
+  restart: false                     # default, as dockutil --no-restart
+```
+
+- Only declared sections are managed; `apps: []` empties one, bare `apps:`
+  does not. Comparison is by resolved path, spacer kind and the folder options
+  you set. Tiles, folder defaults (auto, folder, date modified) and
+  `/Applications` path resolution follow dockutil.
+- A missing app keeps its live tile; a section with no existing paths is left
+  untouched.
+
+### Removal from config
+
+Prior values are recorded on first write; `written` is saved before every
+write and `confirmed` after it lands, so a crash always lands in one of these
+rows:
+
+| Live value on removal | Action |
+| --- | --- |
+| equals prior | forget |
+| no prior (key was unset before tools) | leave as is, forget |
+| equals `written` or `confirmed` | restore prior (retried next deploy if it fails) |
+| anything else (changed or deleted by hand) | leave as is, forget |
+
+### Differences from nix-config
+
+| | nix-config | tools |
+| --- | --- | --- |
+| Writes | every key, every activation | only differing keys |
+| Restart | nix-darwin `killall Dock` (wrapped to a no-op); dockutil `--no-restart` | none unless `restart` |
+| Dock sections | both rebuilt from scratch | only declared sections |
+| Missing app | dropped from Dock | live tile kept |
+| Folder option change | not detected | rewrites the section |
+| Removal | value left as is | table above |
+| Config error | eval fails | section held |
+| `diff` | none | per key, restarts listed once |
 
 ## State and ownership
 
