@@ -10,6 +10,10 @@ from tools.state import load_json, migrate_state_file, migrate_state_schema, sav
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
+from tools.user.defaults import has_work as defaults_has_work
+from tools.user.defaults import install_defaults, run_restarts
+from tools.user.dock import has_work as dock_has_work
+from tools.user.dock import install_dock
 from tools.user.files import install_files
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
@@ -84,13 +88,22 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
     # section crashes. Without it, packages installed earlier in the same run
     # become permanently unowned.
     try:
-        success = _run_sections(config, config_dir, state, paths, active)
+        success = _run_sections(
+            config, config_dir, state, paths, active, lambda: save_json(state_file, state)
+        )
     finally:
         save_json(state_file, state)
     return success
 
 
-def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, active: set) -> bool:
+def _run_sections(
+    config: dict,
+    config_dir: str,
+    state: dict,
+    paths: dict,
+    active: set,
+    persist=lambda: None,
+) -> bool:
     success = True
 
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
@@ -170,6 +183,20 @@ def _run_sections(config: dict, config_dir: str, state: dict, paths: dict, activ
     if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
         success &= install_launchd(config.get("launchd") or {}, state)
 
+    # Last: dock entries point at apps brew casks may have just installed.
+    # Restarts wait for both: a Dock killed mid-deploy can drop a later
+    # persistent-apps write.
+    restarts: list = []
+    try:
+        if "defaults" in active and defaults_has_work(config.get("defaults"), state):
+            success &= install_defaults(
+                config.get("defaults"), state, restarts=restarts, persist=persist
+            )
+
+        if "dock" in active and dock_has_work(config.get("dock"), state):
+            success &= install_dock(config.get("dock"), state, restarts=restarts, persist=persist)
+    finally:
+        run_restarts(restarts)
     return success
 
 
