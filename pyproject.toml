@@ -19,6 +19,9 @@ tools = "tools.cli:main"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Imported as is from nix-config; not yet held to this repo's lint rules.
+extend-exclude = ["packages"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
