@@ -366,9 +366,18 @@ defaults:
 
 - Values are typed XML plists, compared type-strictly; equal keys are not
   rewritten. A key set to `null` is unmanaged (as in nix-darwin).
-- One plist is one domain: `~/Library/Preferences/<name>` is `<name>`, `-g` is
-  `NSGlobalDomain`, other paths resolve symlinks and on-disk case. Two spellings
-  of the same plist are a config error.
+- One plist is one domain: `~/Library/Preferences/<name>` is `<name>`, `-g` and
+  `.GlobalPreferences` (any case on case-insensitive volumes) are
+  `NSGlobalDomain`, other paths resolve symlinks and on-disk case (folded on
+  case-insensitive volumes); a bare name is its file in
+  `~/Library/Preferences`. Two spellings of the same plist in one scope are a
+  config error. `defaults` is always given the declared spelling; the resolved
+  form only identifies the plist in config, state and `restart`, so a
+  `restart` entry applies to every spelling of its plist. Identity is per
+  scope: a currentHost bare name is its `ByHost` file, a currentHost path is
+  `<path>.<UUID>`. A path whose symlink now leads to another plist is a new
+  resource: the old plist is restored or deleted, the new one gets its own
+  prior.
 - `system` writes use `sudo -n` (run `sudo -v` first); `diff` never escalates.
 - `restart` processes are killed once, after `dock:` too, only if a key in
   that domain changed.
@@ -411,9 +420,13 @@ rows:
 | Live value on removal | Action |
 | --- | --- |
 | equals prior | forget |
-| no prior (key was unset before tools) | leave as is, forget |
-| equals `written` or `confirmed` | restore prior (retried next deploy if it fails) |
+| equals `written` or `confirmed`, prior recorded | restore prior (retried next deploy if it fails) |
+| equals `written` or `confirmed`, no prior (unset before tools) | `defaults delete` the key or Dock section (retried next deploy if it fails) |
 | anything else (changed or deleted by hand) | leave as is, forget |
+
+Inside declared sections, `diff` lists every change deploy makes: keys
+written, restored or deleted, and Dock tiles added, changed or removed
+(including tiles added by hand).
 
 ### Differences from nix-config
 
@@ -424,7 +437,7 @@ rows:
 | Dock sections | both rebuilt from scratch | only declared sections |
 | Missing app | dropped from Dock | live tile kept |
 | Folder option change | not detected | rewrites the section |
-| Removal | value left as is | table above |
+| Removal | value left as is | restored or deleted (table above) |
 | Config error | eval fails | section held |
 | `diff` | none | per key, restarts listed once |
 
