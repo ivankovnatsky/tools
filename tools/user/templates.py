@@ -161,6 +161,21 @@ def render(t: Template, secret_lookup: Optional[SecretLookup]) -> Tuple[bytes, b
     return text.encode("utf-8"), t.secrets or bool(resolver.used_secrets)
 
 
+def secret_refs(t: Template) -> set:
+    """Names of the ``${sops:NAME}`` secrets ``t`` uses."""
+    names: set = set()
+
+    def record(name: str) -> str:
+        names.add(name)
+        return ""
+
+    try:
+        render(t, record)
+    except (PlaceholderError, SerializeError):
+        pass
+    return names
+
+
 # --------------------------------------------------------------------------
 # Plan
 # --------------------------------------------------------------------------
@@ -187,6 +202,7 @@ class Plan:
     remove: List[str]
     forget: List[Tuple[str, str]]
     keep: List[Tuple[str, str]] = field(default_factory=list)  # (path, reason), still tracked
+    held: bool = False  # removals held by an invalid entry outside ``select``
 
 
 def plan(
@@ -197,18 +213,34 @@ def plan(
     *,
     conflicts: Optional[Mapping[str, str]] = None,
     pending_errors: Tuple[type, ...] = (),
+    select: Optional[Callable[[str], bool]] = None,
+    tail: bool = True,
 ) -> Plan:
     """``conflicts`` maps refused paths to a reason (see ``secrets_flow.Ownership``).
 
     Exceptions in ``pending_errors`` raised by ``secret_lookup`` mean the
     secret is not available yet (shown as pending, not as an error).
+    ``select``/``tail`` split the plan as in ``sops.plan``.
     """
     conflicts = {} if conflicts is None else conflicts
     installed = fsutil.respell(dict(installed), [t.target for t in templates])
-    errors = list(errors)
+    errors = list(errors) if tail else []
     changes: List[Change] = []
+    held = False
     for t in templates:
+        if select is not None and not select(t.target):
+            # Reported by the plan that selects it; here it only holds removals.
+            if tail and not held:
+                try:
+                    render(t, secret_lookup)
+                    fsutil.resolve_uid(t.owner), fsutil.resolve_gid(t.group)
+                except pending_errors:
+                    pass
+                except (PlaceholderError, SerializeError, KeyError, ValueError):
+                    held = True
+            continue
         record = installed.get(t.target) or {}
+        tracked = fsutil.same_identity(t.target, record)
         if t.target in conflicts:
             changes.append(
                 Change(t, "error", error=f"{t.name}: {t.target} is {conflicts[t.target]}")
@@ -235,7 +267,7 @@ def plan(
             ch.action, ch.error = "error", f"{t.name}: cannot read {t.target} ({current.error})"
         elif not current.exists:
             ch.action = "create"
-        elif current.content != desired and t.target not in installed and not t.force:
+        elif current.content != desired and not tracked and not t.force:
             ch.action = "error"
             ch.error = (
                 f"{t.name}: {t.target} exists and is not tracked by tools; "
@@ -243,7 +275,7 @@ def plan(
             )
         elif current.content != desired:
             ch.action = "update"
-            ch.untracked = t.target not in installed
+            ch.untracked = not tracked
             # The old content may hold a secret the new one no longer does.
             ch.masked = bool(
                 ch.untracked
@@ -258,7 +290,7 @@ def plan(
             ch.action = "chmod"
             # Same bytes as before: whatever made them secret still holds.
             ch.secret = secret or bool(record.get("secret"))
-        elif t.target not in installed:
+        elif not tracked:
             ch.action = "adopt"
         changes.append(ch)
 
@@ -280,7 +312,9 @@ def plan(
             remove.append(target)
         else:
             forget.append((target, "modified since tools wrote it; left in place"))
-    return Plan(errors, changes, remove, forget, keep)
+    if not tail:
+        return Plan(errors, changes, [], [])
+    return Plan(errors, changes, remove, forget, keep, held)
 
 
 # --------------------------------------------------------------------------
@@ -321,6 +355,9 @@ def apply(
             res.success = False
             continue
         if ch.action == "unchanged":
+            fsutil.refresh_dev(t.target, installed[t.target])
+            if ch.secret and not installed[t.target].get("secret"):
+                installed[t.target]["secret"] = True
             continue
         if ch.action == "adopt":
             installed[t.target] = _record(ch)
@@ -347,7 +384,7 @@ def apply(
 
     for kept, reason in p.keep:
         log(f"templates: not removing {kept}: it is {reason}; still tracked", Color.YELLOW)
-    if not p.errors:
+    if not p.errors and not p.held:
         for target, reason in p.forget:
             if reason != "already gone":
                 log(f"templates: releasing {target}: {reason}", Color.YELLOW)
@@ -393,10 +430,7 @@ def describe(p: Plan) -> List[str]:
             continue
         rows += [f"    notify: {n}" for n in t.notify]
     rows += [f"  ~ keep {target} (is {reason}; not removed)" for target, reason in p.keep]
-    if not p.errors:
-        rows += [f"  - remove {target}" for target in p.remove]
-        rows += [f"  ~ forget {target} ({reason})" for target, reason in p.forget]
-    return rows
+    return rows + fsutil.describe_removals(p.errors or p.held, p.remove, p.forget)
 
 
 def has_work(raw, state: Dict) -> bool:
