@@ -59,7 +59,10 @@ def save_json(path: str, data: Dict):
         # A bare relative filename has no parent to create.
         os.makedirs(dirname, exist_ok=True)
     tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w") as f:
+    # 0600: the state holds fingerprints of service secrets.
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
