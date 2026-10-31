@@ -531,8 +531,8 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if changes:
             sections.append(("flatpak", changes))
 
-    if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
-        changes = diff_launchd(config.get("launchd") or {}, state)
+    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+        changes = diff_launchd(config.get("launchd"), state)
         if changes:
             sections.append(("launchd", changes))
 
