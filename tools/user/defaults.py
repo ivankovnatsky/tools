@@ -202,8 +202,8 @@ def _case_insensitive(directory: str) -> bool:
 
 
 def _disk_path(path: str) -> str:
-    """One spelling per file: parent symlinks resolved, each component in its
-    on-disk case; a missing tail is case folded on case-insensitive volumes."""
+    """One spelling per file: parent symlinks resolved, each existing component
+    in its on-disk case."""
     path = os.path.normpath(path)
     full = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
     out = "/"
@@ -218,8 +218,7 @@ def _disk_path(path: str) -> str:
         if match is None and insensitive:
             match = next((n for n in names if n.casefold() == comp.casefold()), None)
         if match is None:
-            rest = "/".join(parts[i:])
-            return os.path.join(out, rest.casefold() if insensitive else rest)
+            return os.path.join(out, *parts[i:])
         out = os.path.join(out, match)
     return out
 
