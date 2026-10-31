@@ -212,3 +212,137 @@ def _load_flat_dir(path: str) -> Dict[str, Any]:
         merged = deep_merge(merged, loaded)
 
     return merged
+
+
+# --------------------------------------------------------------------------
+# Placeholders (`vars`, ${var}, ${env:NAME}, ${sopsPath:NAME})
+# --------------------------------------------------------------------------
+
+
+def _config_relative(path: Any, config_dir: Optional[str]) -> Any:
+    if not isinstance(path, str) or not path or not config_dir:
+        return path
+    expanded = os.path.expanduser(path)
+    return expanded if os.path.isabs(expanded) else os.path.join(config_dir, expanded)
+
+
+def _prepare_sops(raw: Any, config_dir: Optional[str]) -> Any:
+    if not isinstance(raw, dict):
+        return raw
+    out = dict(raw)
+    if "defaultSopsFile" in out:
+        out["defaultSopsFile"] = _config_relative(out["defaultSopsFile"], config_dir)
+    secrets = out.get("secrets")
+    if isinstance(secrets, dict):
+        out["secrets"] = {
+            name: (
+                {**spec, "sopsFile": _config_relative(spec["sopsFile"], config_dir)}
+                if isinstance(spec, dict) and "sopsFile" in spec
+                else spec
+            )
+            for name, spec in secrets.items()
+        }
+    return out
+
+
+def _prepare_templates(raw: Any, resolver, config_dir: Optional[str]) -> Any:
+    from tools.placeholders import PlaceholderError
+
+    if not isinstance(raw, dict):
+        return raw
+    out = {}
+    for name, spec in raw.items():
+        where = f"templates.{name}"
+        if not isinstance(spec, dict):
+            out[name] = spec
+            continue
+        spec = dict(spec)
+        if "file" in spec:
+            if "content" in spec:
+                raise ConfigError(f"{where}: set either file or content, not both")
+            try:
+                source = resolver.resolve(spec.pop("file"), f"{where}.file")
+            except PlaceholderError as exc:
+                raise ConfigError(str(exc)) from None
+            if not isinstance(source, str) or not source:
+                raise ConfigError(f"{where}.file must be a non-empty path string")
+            source = _config_relative(source, config_dir)
+            try:
+                with open(source, "r", encoding="utf-8") as f:
+                    spec["content"] = f.read()
+            except OSError as exc:
+                raise ConfigError(f"{where}.file: cannot read {source}: {exc}") from None
+            except UnicodeDecodeError:
+                raise ConfigError(f"{where}.file: {source} is not UTF-8 text") from None
+            spec.setdefault("format", "raw")
+        try:
+            out[name] = {
+                key: resolver.resolve(value, f"{where}.{key}", keep_secrets=key == "content")
+                for key, value in spec.items()
+            }
+        except PlaceholderError as exc:
+            raise ConfigError(str(exc)) from None
+    return out
+
+
+def _sops_path_lookup(sops_raw: Any):
+    from tools.placeholders import PlaceholderError
+    from tools.user.sops import parse_sops
+
+    parsed = parse_sops(sops_raw)
+    paths = {s.name: s.path for s in parsed.secrets}
+
+    def lookup(name: str) -> str:
+        if name in paths:
+            return paths[name]
+        if parsed.errors:
+            raise PlaceholderError(
+                f"${{sopsPath:{name}}}: sops config is invalid: {'; '.join(parsed.errors)}"
+            )
+        raise KeyError(name)
+
+    return lookup
+
+
+def resolve_config(
+    config: Dict[str, Any],
+    config_dir: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Resolve placeholders across a fully merged config.
+
+    Runs once after every file and ``--config`` path is merged, so a
+    per-host ``vars`` value overrides a shared one. ``${sops:...}`` is
+    only allowed inside ``templates`` content, where it stays verbatim
+    for the render-time pass. Relative ``sopsFile`` and template
+    ``source`` paths resolve against ``config_dir``. A ``${NAME}`` that
+    is not a var stays literal; the environment is read only through
+    ``${env:NAME}``.
+    """
+    from tools.placeholders import PlaceholderError, Resolver
+
+    env = dict(os.environ) if env is None else env
+    raw_vars = config.get("vars")
+    raw_vars = {} if raw_vars is None else raw_vars
+    if not isinstance(raw_vars, dict):
+        raise ConfigError(f"vars must be a mapping, got {type(raw_vars).__name__}")
+
+    out: Dict[str, Any] = {}
+    try:
+        # sops first, without ${sopsPath:}: the paths it defines come from here.
+        if "sops" in config:
+            sops_resolver = Resolver(raw_vars, env=env)
+            out["sops"] = _prepare_sops(sops_resolver.resolve(config["sops"], "sops"), config_dir)
+        resolver = Resolver(raw_vars, env=env, sops_path=_sops_path_lookup(out.get("sops")))
+        for key, value in config.items():
+            if key in ("vars", "sops"):
+                continue
+            if key == "templates":
+                out[key] = _prepare_templates(value, resolver, config_dir)
+            else:
+                out[key] = resolver.resolve(value, key)
+        if raw_vars:
+            out["vars"] = resolver.vars()
+    except PlaceholderError as exc:
+        raise ConfigError(str(exc)) from None
+    return out
