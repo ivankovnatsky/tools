@@ -10,6 +10,9 @@ from tools.log import Color, log
 from tools.services import diff_services
 from tools.services import has_work as services_has_work
 from tools.services.keys import key_path as services_key_path
+from tools.user import secrets_flow
+from tools.user import sops as sops_section
+from tools.user import templates as templates_section
 from tools.user.brew import _normalize_tap
 from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
@@ -39,6 +42,8 @@ ALL_SECTIONS = (
     "mcp",
     "curlShell",
     "gitRepos",
+    "sops",
+    "templates",
     "files",
     "skills",
     "links",
@@ -235,25 +240,31 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
     return changes
 
 
-def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
+def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, conflicts=None):
     """Dry-run for the unified `files:` section.
 
     Resolves entries via `_resolve_entries`, compares each desired
     (target, source, mode, secrets) against the live filesystem, and
     accounts for cleanup against state.
     """
-    from tools.user.files import _file_hash, _resolve_entries
+    from tools.fsutil import removal_blocked, respell, same_file_as
+    from tools.user.files import _conflict, _file_hash, _resolve_entries
 
-    state_files = state.get("files", {})
     changes: List[str] = []
 
     resolved, errors = _resolve_entries(entries, config_dir)
     for err in errors:
         changes.append(f"  ! {err}")
+    declared = [target for target, _source, _mode, _secrets in resolved]
+    state_files = respell(dict(state.get("files", {}) or {}), declared)
 
     managed_targets = set()
     for target, source, desired_mode, secrets in resolved:
         managed_targets.add(target)
+        reason = _conflict(target, conflicts)
+        if reason:
+            changes.append(f"  ! refusing {target}: {reason}")
+            continue
 
         if not os.path.exists(target):
             changes.append(f"  + create {target}")
@@ -281,7 +292,9 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
 
         if src_hash != tgt_hash:
             is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
-            if is_secret:
+            if target not in state_files:
+                changes.append(f"  ~ replace {target} (not tracked by tools; content not shown)")
+            elif is_secret:
                 changes.append(f"  ~ update {target} (secret, diff suppressed)")
             else:
                 changes.append(f"  ~ update {target}")
@@ -291,8 +304,16 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict):
         elif effective_mode != target_mode:
             changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
-    for target in state_files:
+    # Deploy holds removals on config errors; a refused target stays tracked.
+    for target in state_files if not errors else ():
         if target not in managed_targets:
+            blocked = removal_blocked(conflicts, target)
+            twin = same_file_as(target, declared)
+            if twin:
+                blocked = f"the same file as declared {twin}"
+            if blocked:
+                changes.append(f"  ~ keep {target} (is {blocked}; not removed)")
+                continue
             if os.path.exists(target):
                 # Deploy declines to delete files modified since we wrote
                 # them; claiming "remove" here would overstate what an
@@ -444,8 +465,44 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if changes:
             sections.append(("gitRepos", changes))
 
+    # One decryptor for both: each sops file is decrypted once, in memory.
+    decryptor = None
+    run_sops = "sops" in active and sops_section.has_work(config.get("sops"), state)
+    run_templates = "templates" in active and templates_section.has_work(
+        config.get("templates"), state
+    )
+    if run_sops or run_templates:
+        decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
+    conflicts = secrets_flow.ownership_conflicts(
+        files_entries=config.get("files"),
+        sops_raw=config.get("sops"),
+        templates_raw=config.get("templates"),
+        links_raw=config.get("links"),
+        skills_raw=config.get("skills"),
+        state=state,
+        config_dir=config_dir,
+    )
+    failed: tuple = ()
+    if run_sops:
+        sops_plan = secrets_flow.plan_sops(config.get("sops"), state, decryptor, conflicts)
+        failed = secrets_flow.failed_secrets(sops_plan)
+        changes = sops_section.describe(sops_plan)
+        if changes:
+            sections.append(("sops", changes))
+    if run_templates:
+        changes = secrets_flow.diff_templates(
+            config.get("templates"),
+            config.get("sops"),
+            state,
+            decryptor,
+            conflicts,
+            failed,
+        )
+        if changes:
+            sections.append(("templates", changes))
+
     if "files" in active:
-        changes = _diff_files(config.get("files", []) or [], config_dir, state)
+        changes = _diff_files(config.get("files", []) or [], config_dir, state, conflicts)
         if changes:
             sections.append(("files", changes))
 
