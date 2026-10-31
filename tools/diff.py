@@ -7,6 +7,9 @@ import sys
 from typing import Dict, List
 
 from tools.log import Color, log
+from tools.services import diff_services
+from tools.services import has_work as services_has_work
+from tools.services.keys import key_path as services_key_path
 from tools.user.brew import _normalize_tap
 from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
@@ -45,6 +48,7 @@ ALL_SECTIONS = (
     "launchd",
     "defaults",
     "dock",
+    "services",
 )
 
 
@@ -361,6 +365,8 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
+    # Deploy keeps the key beside the migrated state file, not a legacy one.
+    services_key = services_key_path(state_file)
     # Read the same state deploy would act on — including a not-yet-migrated
     # legacy location — but without copying anything: diff is a dry run and
     # must not modify the filesystem.
@@ -486,6 +492,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     if restarts:
         sections.append(("restart", [f"  ~ restart {proc}" for proc in restarts]))
+
+    if "services" in active and services_has_work(config.get("services")):
+        subsections = diff_services(config.get("services"), config_dir, state, services_key)
+        if subsections:
+            sections.append(("services", subsections))
 
     if sections:
         has_changes = True
