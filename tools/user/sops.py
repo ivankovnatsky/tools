@@ -4,6 +4,7 @@ Input is plain, already-resolved data (see ``parse_sops``)::
 
     {
       "binary": None,                     # else `sops` from PATH
+      "sshToAgeBinary": None,             # else `ssh-to-age` from PATH
       "age": {"keyFile": "...", "sshKeyPaths": ["..."]},
       "secretsDir": "~/.local/state/tools/secrets",
       "defaultSopsFile": "/abs/secrets.yaml",
@@ -27,6 +28,7 @@ import json
 import os
 import secrets as _secrets
 import shutil
+import stat
 import string
 import subprocess
 from dataclasses import dataclass, field
@@ -58,7 +60,15 @@ _SECRET_KEYS = {
     "restartUnits",
     "force",
 }
-_TOP_KEYS = {"binary", "age", "secretsDir", "defaultSopsFile", "defaultSopsFormat", "secrets"}
+_TOP_KEYS = {
+    "binary",
+    "sshToAgeBinary",
+    "age",
+    "secretsDir",
+    "defaultSopsFile",
+    "defaultSopsFormat",
+    "secrets",
+}
 FORMATS = ("yaml", "json", "dotenv", "ini", "binary")
 
 # (cmd, env) -> (returncode, stdout bytes, stderr text)
@@ -66,7 +76,7 @@ Runner = Callable[[List[str], Mapping[str, str]], Tuple[int, bytes, str]]
 
 
 def default_runner(cmd: List[str], env: Mapping[str, str]) -> Tuple[int, bytes, str]:
-    result = subprocess.run(cmd, capture_output=True, env=dict(env))
+    result = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, env=dict(env))
     return result.returncode, result.stdout, result.stderr.decode("utf-8", "replace")
 
 
@@ -94,8 +104,9 @@ class Secret:
 @dataclass(frozen=True)
 class Settings:
     binary: Optional[str] = None
+    ssh_to_age_binary: Optional[str] = None
     age_key_file: Optional[str] = None
-    age_ssh_key_file: Optional[str] = None
+    age_ssh_key_files: Tuple[str, ...] = ()
     secrets_dir: str = field(default_factory=lambda: os.path.expanduser(DEFAULT_SECRETS_DIR))
 
 
@@ -166,20 +177,18 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
             raise ValueError("age must be a mapping with keyFile and/or sshKeyPaths")
         ssh_paths = age.get("sshKeyPaths")
         ssh_paths = [] if ssh_paths is None else ssh_paths
-        if not isinstance(ssh_paths, list) or len(ssh_paths) > 1:
-            # sops reads a single SOPS_AGE_SSH_PRIVATE_KEY_FILE.
-            raise ValueError("sops.age.sshKeyPaths must be a list of at most one path")
-        ssh_key = (
-            _path_field({"p": ssh_paths[0]}, "p", "sops.age.sshKeyPaths") if ssh_paths else None
-        )
+        if not isinstance(ssh_paths, list) or not all(isinstance(p, str) and p for p in ssh_paths):
+            raise ValueError("sops.age.sshKeyPaths must be a list of non-empty path strings")
+        ssh_keys = tuple(_path_field({"p": p}, "p", "sops.age.sshKeyPaths") for p in ssh_paths)
         default_format = raw.get("defaultSopsFormat")
         default_format = "yaml" if default_format is None else default_format
         if default_format not in FORMATS:
             raise ValueError(f"sops.defaultSopsFormat must be one of {', '.join(FORMATS)}")
         settings = Settings(
             binary=_path_field(raw, "binary", "sops"),
+            ssh_to_age_binary=_path_field(raw, "sshToAgeBinary", "sops"),
             age_key_file=_path_field(age, "keyFile", "sops.age"),
-            age_ssh_key_file=ssh_key,
+            age_ssh_key_files=ssh_keys,
             secrets_dir=_path_field(raw, "secretsDir", "sops") or _expand(DEFAULT_SECRETS_DIR),
         )
         default_file = _path_field(raw, "defaultSopsFile", "sops")
@@ -326,12 +335,67 @@ class Decryptor:
         self._which = which
         self._env = dict(os.environ if env is None else env)
         self._cache: Dict[Tuple[str, bool, str], object] = {}
+        self._ssh_age_keys: Optional[List[str]] = None
+        self._usable: Dict[str, bool] = {}
 
     def _binary(self) -> str:
         binary = self._settings.binary or self._which("sops")
         if not binary:
             raise DecryptError("sops binary not found on PATH (set sops.binary)")
         return binary
+
+    def _convert_ssh_keys(self) -> List[str]:
+        """age identities from ``sshKeyPaths`` via ``ssh-to-age``, as sops-nix
+        converts them; kept in memory and handed to sops as SOPS_AGE_KEY.
+
+        Like sops-nix, a key that cannot be read or converted is skipped.
+        """
+        paths = [p for p in self._settings.age_ssh_key_files if self._usable_ssh_key(p)]
+        if not paths:
+            return []
+        tool = self._settings.ssh_to_age_binary or self._which("ssh-to-age")
+        if not tool:
+            log(
+                "sops: ssh-to-age not found on PATH (set sops.sshToAgeBinary); "
+                "sshKeyPaths are not converted to age keys",
+                Color.YELLOW,
+            )
+            return []
+        keys = []
+        for path in paths:
+            try:
+                rc, out, err = self._runner([tool, "-private-key", "-i", path], self._env)
+            except OSError as e:
+                log(f"sops: cannot convert ssh key {path}: {e}", Color.YELLOW)
+                continue
+            key = out.decode("utf-8", "replace").strip()
+            if rc != 0 or not key.startswith("AGE-SECRET-KEY-") or "\n" in key:
+                last = (err or "").strip().splitlines()[-1:] or [f"exit {rc}"]
+                log(f"sops: cannot convert ssh key {path}: {last[0][:200]}", Color.YELLOW)
+                continue
+            keys.append(key)
+        return keys
+
+    def _usable_ssh_key(self, path: str) -> bool:
+        """A regular file this process can open for reading (actually opened:
+        permission bits alone miss root and ACLs)."""
+        if path not in self._usable:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    self._usable[path] = stat.S_ISREG(os.fstat(fd).st_mode)
+                finally:
+                    os.close(fd)
+            except OSError:
+                self._usable[path] = False
+            if not self._usable[path]:
+                log(f"sops: skipping ssh key {path}: not a readable file", Color.YELLOW)
+        return self._usable[path]
+
+    def _age_keys(self) -> List[str]:
+        if self._ssh_age_keys is None:
+            self._ssh_age_keys = self._convert_ssh_keys()
+        return self._ssh_age_keys
 
     def _run(self, sops_file: str, whole: bool, fmt: str = "yaml"):
         cache_key = (sops_file, whole, fmt)
@@ -351,13 +415,20 @@ class Decryptor:
         env = dict(self._env)
         if self._settings.age_key_file:
             env["SOPS_AGE_KEY_FILE"] = self._settings.age_key_file
-        if self._settings.age_ssh_key_file:
-            env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"] = self._settings.age_ssh_key_file
-        cmd = [self._binary(), "--decrypt", "--input-type", fmt]
-        if not whole:
-            cmd += ["--output-type", "json"]
-        elif fmt == "binary":
-            cmd += ["--output-type", "binary"]
+        # sops reads one SSH key itself (for ssh-ed25519 recipients); the
+        # converted identities cover age1 recipients, as in sops-nix.
+        native = next(
+            (p for p in self._settings.age_ssh_key_files if self._usable_ssh_key(p)), None
+        )
+        if native:
+            env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"] = native
+        ssh_keys = self._age_keys()
+        if ssh_keys:
+            existing = env.get("SOPS_AGE_KEY")
+            env["SOPS_AGE_KEY"] = "\n".join(([existing] if existing else []) + ssh_keys)
+        # Without an explicit output type sops guesses it from the file extension.
+        out_type = fmt if whole else "json"
+        cmd = [self._binary(), "--decrypt", "--input-type", fmt, "--output-type", out_type]
         cmd.append(sops_file)
         try:
             rc, out, err = self._runner(cmd, env)
@@ -390,7 +461,7 @@ class Decryptor:
 @dataclass
 class Change:
     secret: Secret
-    # create | update | replace | chmod | generate | adopt | unchanged | error
+    # create | update | replace | chmod | generate | adopt | unchanged | pending | error
     action: str
     desired: Optional[bytes] = None
     error: Optional[str] = None
@@ -411,15 +482,21 @@ def plan(
     decryptor: Decryptor,
     *,
     conflicts: Optional[Mapping[str, str]] = None,
+    select: Optional[Callable[[str], bool]] = None,
+    tail: bool = True,
 ) -> Plan:
     """``conflicts`` maps refused paths to a reason (see ``secrets_flow.Ownership``).
 
     State keys are matched to declared paths by file identity, not spelling.
+    ``select`` limits the changes to some paths; ``tail`` adds the section's
+    config errors and removals (judged against every declared secret).
     """
     conflicts = {} if conflicts is None else conflicts
     installed = fsutil.respell(dict(installed), [s.path for s in parsed.secrets])
     changes: List[Change] = []
     for s in parsed.secrets:
+        if select is not None and not select(s.path):
+            continue
         if s.path in conflicts:
             changes.append(Change(s, "error", error=f"{s.name}: {s.path} is {conflicts[s.path]}"))
             continue
@@ -429,7 +506,7 @@ def plan(
             changes.append(Change(s, "error", error=f"{s.name}: unknown owner/group {e}"))
             continue
         current = fsutil.read_current(s.path)
-        tracked = s.path in installed
+        tracked = fsutil.same_identity(s.path, installed.get(s.path))
 
         if s.generate is not None:
             # The value is never rewritten; only mode/owner are reconciled.
@@ -457,7 +534,12 @@ def plan(
         try:
             desired = decryptor.value(s)
         except DecryptError as e:
-            changes.append(Change(s, "error", error=str(e)))
+            awaiting = getattr(conflicts, "awaiting_clone", None)
+            reason = awaiting(s.sops_file) if awaiting and s.sops_file else None
+            if reason and not os.path.exists(s.sops_file):
+                changes.append(Change(s, "pending", error=f"sopsFile {reason}"))
+            else:
+                changes.append(Change(s, "error", error=str(e)))
             continue
         if current.error:
             changes.append(
@@ -505,6 +587,8 @@ def plan(
             remove.append(path)
         else:
             forget.append((path, "modified since tools wrote it; left in place"))
+    if not tail:
+        return Plan([], changes, [], [])
     return Plan(parsed.errors, changes, remove, forget, keep)
 
 
@@ -557,12 +641,16 @@ def apply(
 
     for ch in p.changes:
         s = ch.secret
-        if ch.action == "error":
+        if ch.action in ("error", "pending"):
             log(f"sops: {ch.error}", Color.RED)
             res.success = False
             res.failed.append(s.name)
             continue
         if ch.action == "unchanged":
+            if s.path in installed:
+                fsutil.refresh_dev(s.path, installed[s.path])
+            if s.generate is not None and s.path in installed:
+                installed[s.path]["generated"] = True
             continue
         if ch.action == "adopt":
             installed[s.path] = _record(s)
@@ -632,16 +720,15 @@ def describe(p: Plan) -> List[str]:
         s = ch.secret
         if ch.action == "error":
             rows.append(f"  ! {ch.error}")
+        elif ch.action == "pending":
+            rows.append(f"  ~ decrypt {s.path} (pending: {ch.error})")
         elif ch.action in labels:
             suffix = {"chmod": f" -> {oct(s.mode)}", "replace": " (secret, not tracked by tools)"}
             suffix = suffix.get(ch.action, " (secret)")
             rows.append(f"  {labels[ch.action]} {s.path}{suffix}")
             rows += [f"    notify: {n}" for n in s.notify]
     rows += [f"  ~ keep {path} (is {reason}; not removed)" for path, reason in p.keep]
-    if not p.errors:
-        rows += [f"  - remove {path}" for path in p.remove]
-        rows += [f"  ~ forget {path} ({reason})" for path, reason in p.forget]
-    return rows
+    return rows + fsutil.describe_removals(p.errors, p.remove, p.forget)
 
 
 # --------------------------------------------------------------------------
@@ -658,14 +745,18 @@ def make_lookup(
     *,
     decryptor: Optional[Decryptor] = None,
     failed: Tuple[str, ...] = (),
+    installed: Optional[Mapping[str, Dict]] = None,
 ) -> Callable[[str], str]:
     """name -> secret text.
 
     With a decryptor, decrypted secrets come from memory; deploy and diff
     both pass one, so they render the same value. Generated secrets (and
-    every secret without a decryptor) are read from their file.
+    every secret without a decryptor) are read from their file; with
+    ``installed`` (sops state), only if it is still the file tools wrote.
     """
     by_name = {s.name: s for s in parsed.secrets}
+    if installed is not None:
+        installed = fsutil.respell(dict(installed), [s.path for s in parsed.secrets])
 
     def lookup(name: str) -> str:
         s = by_name.get(name)
@@ -686,6 +777,12 @@ def make_lookup(
                     raise SecretUnavailable(f"sops secret {name!r} is not on disk yet")
                 if current.error:
                     raise OSError(current.error)
+                if installed is not None and not fsutil.same_identity(
+                    s.path, installed.get(s.path)
+                ):
+                    raise SecretUnavailable(
+                        f"sops secret {name!r}: {s.path} is not the file tools wrote"
+                    )
                 data = current.content
         except (OSError, DecryptError) as e:
             raise SecretUnavailable(f"sops secret {name!r} unavailable: {e}") from None
