@@ -104,3 +104,34 @@ launchd:
       command: /usr/bin/find /tmp/web -mtime +7 -delete
       startCalendarInterval: { hour: 4, minute: 30 }
       keepAlive: false # default true, as in nix-config
+
+# macOS preferences. See README "Defaults".
+defaults:
+  user:
+    NSGlobalDomain:
+      AppleKeyboardUIMode: 3
+      KeyRepeat: 2
+    com.apple.dock:
+      tilesize: 64
+      autohide-delay: 0.0
+    com.apple.HIToolbox:
+      AppleEnabledInputSources:
+        - InputSourceKind: Keyboard Layout
+          KeyboardLayout ID: 252
+          KeyboardLayout Name: ABC
+    ~/Library/Preferences/ByHost/com.apple.controlcenter:
+      Weather: 2
+  system: {}
+
+# Dock layout. See README "Dock". Undeclared sections are left alone.
+dock:
+  apps:
+    - /System/Applications/Mail.app
+    - /Applications/Safari.app
+    - spacer
+    - /System/Applications/System Settings.app
+  others:
+    - path: ~/Downloads
+      view: grid
+      display: stack
+      sort: dateadded
