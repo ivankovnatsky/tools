@@ -476,16 +476,30 @@ Full shapes for `arr` (radarr/sonarr/lidarr/prowlarr), `beszel`, `forgejo`,
 - Only differences are written; updates merge into the full remote object.
 - `diff` reads only (no retries, no file changes); `deploy` retries reads but not writes.
 - A bad read shape, a duplicate identity, or an unresolved name aborts that service before any write.
+- Input files of every arr app and NextDNS profile are read before the first write; a bad one holds the whole service.
 - One failing service doesn't stop the others.
 
-| Service   | Deleted when not listed                                   | Never deleted                  |
-| --------- | --------------------------------------------------------- | ------------------------------ |
-| arr       | `rootFolders`; Prowlarr `indexers`, `applications`        | download clients               |
-| beszel    | `systems`                                                 | Discord webhook                |
-| forgejo   | older `tools-admin-*`/`tools-user-*` tokens on rotation   | users, repos, GPG keys         |
-| jellyfin  | media paths inside a listed library                       | libraries                      |
-| nextdns   | `denylist`, `allowlist`, `rewrites` in the profile file   | profiles                       |
-| syncthing | `devices` (plus folder-named devices), `folders`          | the local device               |
+Config is desired state: `diff` shows every create (`+`), change (`~`) and
+removal (`-`) deploy would make, including ids dropped by a replacing write
+(NextDNS blocklists and parental-control lists, Syncthing folder devices).
+Exceptions, each shown by `diff`:
+
+- Removing every remote object of a kind needs `prune: true`; without it the service fails with `! refusing to remove all ...`.
+- Dropping a whole service never deletes remote objects: `= <service> removed from config; remote objects are kept`, shown until the next deploy forgets its state.
+- Items of a never-deleted kind (table below) that leave the config are shown once as `= <item> removed from config, kept (...)`. State holds an HMAC of each identity, so a name moved into a `*File` is still the same item.
+
+| Service   | Deleted when not listed                                   | Never deleted (shown as `=`)          | Never deleted, not tracked                           |
+| --------- | --------------------------------------------------------- | ------------------------------------- | ---------------------------------------------------- |
+| arr       | `rootFolders`; Prowlarr `indexers`, `applications`        | download clients                      |                                                      |
+| beszel    | `systems`                                                 |                                       | Discord webhook (a replaced one stays)               |
+| forgejo   | older `tools-admin-*`/`tools-user-*` tokens on rotation   | users, repositories                   | GPG keys, tokens with other names                    |
+| jellyfin  | media paths inside a listed library                       | libraries                             |                                                      |
+| nextdns   | `denylist`, `allowlist`, `rewrites` in the profile file   | profiles                              |                                                      |
+| syncthing | `devices` (plus folder-named devices), `folders`          |                                       | the local device                                     |
+
+Set only on create, never diffed afterwards: arr download client
+`enable`/`priority`/`remove*`, Prowlarr application `enable`, Jellyfin library
+`type`, Forgejo repository `autoInit` and existing users' email and password.
 
 ### Differences from nix-config
 
@@ -501,6 +515,7 @@ All services:
 | Replacement order | remove, then add | add, then remove; skip removes if an add failed | never left with neither |
 | Unexpected read shape | treated as empty | aborts the service | no writes from a bad picture |
 | Input files | read as needed | all read before the first write | no half-applied run |
+| Item or service dropped from config | silent | `=` row in `diff` | nothing kept silently |
 | 2xx body with `errors` | success | failed write | no deletes after a rejected add |
 | Duplicate identities | last one wins | error before writes | ambiguous target |
 | Inline secrets | allowed | `*File` only | no secrets in config |
@@ -512,17 +527,20 @@ All services:
 | arr | Masked password/apiKey | pushed every run | pushed when the file changes | convergence |
 | arr | Update PUT fields | our fields only | merged into server fields | keeps unmanaged settings |
 | arr | Root folder paths | exact match | trailing slash ignored | convergence |
+| arr | Bad input file in one app | other apps still written | no app written | no half-applied run |
 | beszel | System listing | first page only | all pages | no duplicate creates |
 | forgejo | Token names | fixed `forgejo-mgmt` | `tools-admin-*`/`tools-user-*`, older ones deleted | a lost token can be recreated |
 | forgejo | Admin token without `tokenFile` | minted every run | same, but not shown as a diff | parity without noise |
 | forgejo | GPG key gpg can't parse | upload tried, 422 ignored | config error | 422 also means malformed |
 | forgejo | User token | printed to the log | written to `tokenFile` (0600) | no token in logs |
+| forgejo | `gpgKeyFile` on an admin | ignored | config error | not silently unmanaged |
 | jellyfin | Path compare | exact | trailing slash ignored | convergence |
 | jellyfin | Null lists from server | crash | empty | robustness |
 | jellyfin | Path containing a comma | split by Jellyfin | config error | query-string paths split on commas |
 | nextdns | `@NAME@` vars | `sed` on JSON text | replaced inside JSON strings | no JSON injection |
 | nextdns | Domain/rewrite match | case-sensitive | case-insensitive | no delete/re-add churn |
 | nextdns | Profile name matches several | first one | error | wrong-profile writes |
+| nextdns | Bad input file in one profile | other profiles still written | no profile written | no half-applied run |
 | nextdns | Id file without `profileIdFile` | fixed `~/.config/sops-nix/secrets` | `profileIdDir` (same default, null disables) | configurable |
 | syncthing | Local device | removable | never removed | keeps the node reachable |
 | syncthing | Local device name | `devices` rename after `localDeviceName` | `localDeviceName` wins when set | no rename loop |
