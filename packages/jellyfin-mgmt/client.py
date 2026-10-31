@@ -12,7 +12,8 @@ class JellyfinClient:
         self.timeout = timeout
         self.headers = {
             "User-Agent": USER_AGENT,
-            "X-Emby-Token": api_key,
+            # Jellyfin 12 rejects the legacy X-Emby-Token header.
+            "Authorization": f'MediaBrowser Token="{api_key}"',
         }
 
     def _api_call(self, method: str, endpoint: str, data=None, params=None):
