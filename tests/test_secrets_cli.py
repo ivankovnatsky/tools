@@ -136,6 +136,240 @@ class SecretsGatingTest(unittest.TestCase):
         dec.assert_not_called()
 
 
+class GitReposFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.realpath(self._tmp.name)
+        self.repo = os.path.join(self.tmp, "src", "repo")
+        sops_file = os.path.join(self.tmp, "secrets.yaml")
+        with open(sops_file, "w") as f:
+            f.write("ENC")
+        self.secret = os.path.join(self.repo, ".env")
+        self.rendered = os.path.join(self.repo, "conf.json")
+        self.config = {
+            "gitRepos": {self.repo: "https://example.invalid/r.git"},
+            "sops": {
+                "binary": "/fake/sops",
+                "secretsDir": os.path.join(self.tmp, "secrets"),
+                "defaultSopsFile": sops_file,
+                "secrets": {"tok": {"key": "token", "path": self.secret}},
+            },
+            "templates": {"c": {"path": self.rendered, "format": "json", "content": {"a": 1}}},
+        }
+        self.git = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def fake_git(self, cmd, env=None, cwd=None):
+        self.git.append(cmd)
+        if cmd[1] == "clone":
+            os.makedirs(os.path.join(cmd[-1], ".git"))
+        return 0, "", ""
+
+    def patches(self):
+        real = sops.Decryptor
+
+        def decryptor(settings):
+            return real(settings, runner=lambda c, e: (0, b'{"token": "tok-value"}', ""), env={})
+
+        from tools.user import git_repos
+
+        return [
+            mock.patch.object(sops, "Decryptor", decryptor),
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "run_command", self.fake_git),
+        ]
+
+    def run_sections(self, active):
+        state = {}
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for p in self.patches():
+                stack.enter_context(p)
+            stack.enter_context(contextlib.redirect_stdout(out))
+            ok = cli._run_sections(self.config, self.tmp, state, {}, set(active))
+        return ok, out.getvalue(), state
+
+    def show_diff(self, scope=()):
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for p in self.patches():
+                stack.enter_context(p)
+            stack.enter_context(
+                mock.patch("tools.state.find_state_file", return_value="/nonexistent")
+            )
+            stack.enter_context(contextlib.redirect_stdout(out))
+            diff.show_diff({**self.config, "stateFile": "/nonexistent"}, self.tmp, scope)
+        return out.getvalue()
+
+
+class GitReposDestinationTest(GitReposFixture):
+    def test_repo_cloned_before_secrets_and_templates_are_written(self):
+        out = self.show_diff()
+        self.assertIn(f"+ clone {self.repo}", out)
+        self.assertIn(f"+ decrypt {self.secret}", out)
+        self.assertIn(f"+ render {self.rendered}", out)
+        ok, out, state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertTrue(ok, out)
+        self.assertEqual([c[1] for c in self.git], ["clone"])
+        self.assertNotIn("Not a git repo", out)
+        self.assertEqual(state["gitRepos"]["installed"], [self.repo])
+        with open(self.secret) as f:
+            self.assertEqual(f.read(), "tok-value")
+        self.assertTrue(os.path.exists(self.rendered))
+
+    def test_paths_in_uncloned_repo_refused_when_gitrepos_not_run(self):
+        out = self.show_diff(("sops", "templates"))
+        self.assertIn("not cloned yet", out)
+        ok, out, _state = self.run_sections(("sops", "templates"))
+        self.assertFalse(ok)
+        self.assertIn(f"inside gitRepos checkout {self.repo}, which is not cloned yet", out)
+        self.assertFalse(os.path.exists(self.repo))
+
+    def test_paths_in_non_git_destination_refused(self):
+        os.makedirs(self.repo)
+        out = self.show_diff()
+        self.assertIn(f"! not a git repo: {self.repo}", out)
+        self.assertIn("which is not a git checkout", out)
+        ok, out, _state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(self.secret))
+        self.assertFalse(os.path.exists(self.rendered))
+
+
+class GitReposSplitOrderTest(GitReposDestinationTest):
+    def setUp(self):
+        super().setUp()
+        self.cred = os.path.join(self.tmp, "home", ".netrc")
+        self.config["sops"]["secrets"]["cred"] = {"key": "token", "path": self.cred}
+        self.config["templates"]["ssh"] = {
+            "path": os.path.join(self.tmp, "home", "ssh_config"),
+            "content": "Host x",
+        }
+        self.seen_at_clone = None
+
+    def fake_git(self, cmd, env=None, cwd=None):
+        if cmd[1] == "clone":
+            self.seen_at_clone = (
+                os.path.exists(self.cred),
+                os.path.exists(os.path.join(self.tmp, "home", "ssh_config")),
+                os.path.exists(self.secret),
+            )
+        return super().fake_git(cmd, env, cwd)
+
+    def test_credentials_outside_repos_written_before_clone(self):
+        ok, out, _state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertTrue(ok, out)
+        self.assertEqual(self.seen_at_clone, (True, True, False))
+        self.assertTrue(os.path.exists(self.secret))
+        self.assertTrue(os.path.exists(self.rendered))
+
+    def test_diff_follows_deploy_order(self):
+        out = self.show_diff()
+        cred = out.index(f"+ decrypt {self.cred}")
+        clone = out.index(f"+ clone {self.repo}")
+        inside = out.index(f"+ decrypt {self.secret}")
+        self.assertLess(cred, clone)
+        self.assertLess(clone, inside)
+        self.assertLess(clone, out.index(f"+ render {self.rendered}"))
+
+    def test_clone_bringing_parent_symlink_into_collision_is_refused(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(self.tmp, "src.txt"), "w") as f:
+            f.write("plain")
+        target = os.path.join(outside, "tok")
+        self.config["files"] = [{"source": "src.txt", "target": target}]
+        self.config["sops"]["secrets"]["tok"]["path"] = os.path.join(self.repo, "alias", "tok")
+        orig = self.fake_git
+
+        def clone_with_link(cmd, env=None, cwd=None):
+            rc = orig(cmd, env, cwd)
+            if cmd[1] == "clone":
+                os.symlink(outside, os.path.join(cmd[-1], "alias"))
+            return rc
+
+        self.fake_git = clone_with_link
+        ok, out, _state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertFalse(ok)
+        self.assertIn("claimed by files and sops", out)
+        self.assertFalse(os.path.exists(target))
+
+
+class TemplateUsingInRepoSecretTest(GitReposDestinationTest):
+    def setUp(self):
+        super().setUp()
+        self.out = os.path.join(self.tmp, "home", "app.env")
+        self.config["sops"]["secrets"]["jwt"] = {
+            "generate": {},
+            "path": os.path.join(self.repo, "jwt"),
+        }
+        self.config["templates"]["app"] = {
+            "path": self.out,
+            "content": "JWT=${sops:jwt}\nTOK=${sops:tok}\n",
+        }
+
+    def test_template_waits_for_in_repo_secret(self):
+        out = self.show_diff()
+        self.assertLess(out.index(f"+ clone {self.repo}"), out.index(f"render {self.out}"))
+        ok, out, _state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertTrue(ok, out)
+        with open(self.out) as f:
+            self.assertIn("TOK=tok-value", f.read())
+
+    def test_refused_in_repo_secret_blocks_outside_template(self):
+        self.config["templates"]["app"]["content"] = "TOK=${sops:tok}\n"
+        ok, out, _state = self.run_sections(("sops", "templates"))
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(self.out))
+
+
+class SopsFileInRepoTest(GitReposFixture):
+    def setUp(self):
+        super().setUp()
+        self.enc = os.path.join(self.repo, "secrets.yaml")
+        self.key = os.path.join(self.tmp, "home", "api-key")
+        self.out = os.path.join(self.tmp, "home", "app.env")
+        self.config["sops"]["secrets"] = {
+            "api": {"key": "token", "sopsFile": self.enc, "path": self.key}
+        }
+        self.config["templates"] = {"app": {"path": self.out, "content": "K=${sops:api}\n"}}
+
+    def fake_git(self, cmd, env=None, cwd=None):
+        rc = super().fake_git(cmd, env, cwd)
+        if cmd[1] == "clone":
+            with open(self.enc, "w") as f:
+                f.write("ENC")
+        return rc
+
+    def test_secret_from_repo_sops_file_decrypted_after_clone(self):
+        out = self.show_diff()
+        clone = out.index(f"+ clone {self.repo}")
+        self.assertLess(clone, out.index(f"{self.key}"))
+        self.assertLess(clone, out.index(f"render {self.out}"))
+        ok, out, _state = self.run_sections(diff.ALL_SECTIONS)
+        self.assertTrue(ok, out)
+        with open(self.key) as f:
+            self.assertEqual(f.read(), "tok-value")
+        with open(self.out) as f:
+            self.assertEqual(f.read(), "K=tok-value\n")
+
+
+class NestedReposOwnershipTest(unittest.TestCase):
+    def test_nested_destination_refused_in_any_config_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            outer = os.path.join(d, "outer")
+            inner = os.path.join(outer, "inner")
+            os.makedirs(os.path.join(outer, ".git"))
+            path = os.path.join(inner, "x")
+            for repos in ({outer: "u", inner: "u"}, {inner: "u", outer: "u"}):
+                c = secrets_flow.ownership_conflicts(git_repos_raw=repos)
+                self.assertIn("not cloned yet", c.get(path) or "", list(repos))
+
+
 @unittest.skipUnless(
     shutil.which("sops") and shutil.which("age-keygen"), "sops and age-keygen not on PATH"
 )

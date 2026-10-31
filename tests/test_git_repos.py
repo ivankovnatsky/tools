@@ -33,6 +33,27 @@ class FakeGit:
         return 0, "", ""
 
 
+class CheckoutTest(unittest.TestCase):
+    def test_git_file_counts_as_checkout(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(git_repos.is_checkout(d))
+            with open(os.path.join(d, ".git"), "w") as f:
+                f.write("gitdir: /elsewhere/.git/worktrees/x\n")
+            self.assertTrue(git_repos.is_checkout(d))
+            with open(os.path.join(d, ".git"), "w") as f:
+                f.write("not a pointer\n")
+            self.assertFalse(git_repos.is_checkout(d))
+
+    def test_writes_under_worktree_checkout_allowed(self):
+        from tools.user import secrets_flow
+
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".git"), "w") as f:
+                f.write("gitdir: /elsewhere\n")
+            c = secrets_flow.ownership_conflicts(git_repos_raw={d: "u"})
+            self.assertIsNone(c.get(os.path.join(d, "x")))
+
+
 class GitReposRemovalTest(unittest.TestCase):
     def _reconcile(self, repos, state, fake, removed):
         with (

@@ -722,5 +722,113 @@ class RemovalTest(TemplatesTestBase):
         self.assertTrue(os.path.exists(self.target))
 
 
+class FixesTest(TemplatesTestBase):
+    def test_unchanged_template_turning_secret_records_it(self):
+        self.deploy(self.tpl({"a": "plain-old-value"}))
+        self.assertFalse(self.state["templates"]["installed"][self.target]["secret"])
+        self.deploy(self.tpl({"a": "plain-old-value"}, secrets=True))
+        self.assertTrue(self.state["templates"]["installed"][self.target]["secret"])
+        rows = self.diff(self.tpl({"a": "plain-new-value"}))
+        self.assertEqual(rows, [f"  ~ update {self.target} (secret, diff suppressed)"])
+        ok, out = self.deploy(self.tpl({"a": "plain-new-value"}))
+        self.assertTrue(ok)
+        self.assertNotIn("plain-old-value", out)
+
+    def test_repointed_parent_symlink_is_untracked(self):
+        a = os.path.join(self.tmp, "a")
+        b = os.path.join(self.tmp, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(a, link)
+        self.target = os.path.join(link, "app.json")
+        self.deploy(self.tpl({"a": 1}))
+        os.remove(link)
+        os.symlink(b, link)
+        with open(os.path.join(b, "app.json"), "w") as f:
+            f.write("handwritten-content-here\n")
+        rows = self.diff(self.tpl({"a": 2}))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("exists and is not tracked by tools; set force: true", rows[0])
+        self.assertNotIn("handwritten-content-here", "\n".join(rows))
+        ok, out = self.deploy(self.tpl({"a": 2}))
+        self.assertFalse(ok)
+        self.assertNotIn("handwritten-content-here", out)
+        with open(os.path.join(b, "app.json")) as f:
+            self.assertEqual(f.read(), "handwritten-content-here\n")
+        rows = self.diff(self.tpl({"a": 2}, force=True))
+        self.assertEqual(
+            rows, [f"  ~ replace {self.target} (not tracked by tools; content not shown)"]
+        )
+
+    def test_generated_secret_behind_repointed_symlink_not_rendered(self):
+        a = os.path.join(self.tmp, "a")
+        b = os.path.join(self.tmp, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(a, link)
+        self.sops_raw["secrets"]["jwt"] = {"generate": {}, "path": os.path.join(link, "jwt")}
+        with contextlib.redirect_stdout(io.StringIO()):
+            secrets_flow.deploy_sops(self.sops_raw, self.state, self.report, self.decryptor())
+        raw = self.tpl({"jwt": "${sops:jwt}"})
+        ok, _ = self.deploy(raw)
+        self.assertTrue(ok)
+        os.remove(link)
+        os.symlink(b, link)
+        with open(os.path.join(b, "jwt"), "w") as f:
+            f.write("hand-written-value")
+        self.assertIn("pending", self.diff(self.tpl({"jwt": "${sops:jwt}", "x": 1}))[0])
+        ok, _ = self.deploy(self.tpl({"jwt": "${sops:jwt}", "x": 1}))
+        self.assertFalse(ok)
+        self.assertNotIn("hand-written-value", self.read())
+
+    def test_split_plan_holds_removals_for_invalid_unselected_entry(self):
+        self.deploy(self.tpl({"a": 1}))
+        stale = self.target
+        good = os.path.join(self.tmp, "repo", "good")
+        raw = {
+            "good": {"path": good, "content": "x"},
+            "bad": {"path": os.path.join(self.tmp, "bad"), "content": "${sops:x}"},
+        }
+        tmpls, errors = templates.parse_templates(raw)
+        installed = self.state["templates"]["installed"]
+        early = templates.plan(
+            tmpls, errors, installed, None, select=lambda p: p != good, tail=False
+        )
+        self.assertTrue(early.errors)
+        self.assertEqual((early.remove, early.forget), ([], []))
+        late = templates.plan(tmpls, errors, installed, None, select=lambda p: p == good)
+        self.assertEqual(late.errors, [])
+        self.assertTrue(late.held)
+        self.assertIn(
+            f"  ~ hold {stale} (would remove; held until config errors are fixed)",
+            templates.describe(late),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            templates.apply(late, dict(installed))
+        self.assertTrue(os.path.exists(stale))
+
+    def test_changed_device_number_keeps_tracking(self):
+        self.deploy(self.tpl({"a": 1}))
+        record = self.state["templates"]["installed"][self.target]
+        dev = record["dev"]
+        record["dev"] = dev + 1
+        self.assertEqual(self.diff(self.tpl({"a": 1})), [])
+        self.deploy(self.tpl({"a": 1}))
+        self.assertEqual(self.state["templates"]["installed"][self.target]["dev"], dev)
+        self.state["templates"]["installed"][self.target]["dev"] = dev + 1
+        rows = self.diff(self.tpl({"a": 2}))
+        self.assertTrue(rows[0].startswith(f"  ~ update {self.target}"), rows)
+        self.assertNotIn("not tracked", rows[0])
+
+    def test_held_removal_is_shown_in_diff(self):
+        self.deploy(self.tpl({"a": 1}))
+        rows = self.diff({"bad": {"path": "rel", "content": ""}})
+        self.assertIn(
+            f"  ~ hold {self.target} (would remove; held until config errors are fixed)", rows
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

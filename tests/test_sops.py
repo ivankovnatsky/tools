@@ -16,21 +16,26 @@ SECRET_VALUE = "hunter2-very-secret"
 
 
 class FakeSops:
-    """Stands in for the sops binary: {file: decrypted document}."""
+    """Stands in for the sops and ssh-to-age binaries: {file: decrypted document}."""
+
+    AGE_KEY = "AGE-SECRET-KEY-1FAKEFAKEFAKE"
 
     def __init__(self, docs, fail=()):
         self.docs = docs
         self.fail = set(fail)
         self.calls = []
+        self.ssh_fail = False
 
     def __call__(self, cmd, env):
         self.calls.append((list(cmd), dict(env)))
+        if cmd[0].endswith("ssh-to-age"):
+            if self.ssh_fail:
+                return 1, b"", "failed to convert: unsupported key type\n"
+            return 0, (self.AGE_KEY + "\n").encode(), ""
         path = cmd[-1]
         if path in self.fail:
             return 128, b"", "Failed to get the data key required to decrypt the SOPS file.\n"
         doc = self.docs[path]
-        if "--output-type" in cmd:
-            return 0, json.dumps(doc).encode(), ""
         return 0, doc if isinstance(doc, bytes) else json.dumps(doc).encode(), ""
 
 
@@ -76,7 +81,12 @@ class SopsTestBase(unittest.TestCase):
         }
 
     def decryptor(self, raw):
-        return sops.Decryptor(sops.parse_sops(raw).settings, runner=self.fake, env={})
+        return sops.Decryptor(
+            sops.parse_sops(raw).settings,
+            runner=self.fake,
+            which=lambda n: f"/fake/bin/{n}",
+            env={},
+        )
 
     def deploy(self, raw):
         out = io.StringIO()
@@ -218,8 +228,12 @@ class ParseTest(unittest.TestCase):
             p = sops.parse_sops({**base, **bad})
             self.assertEqual(p.secrets, [], bad)
             self.assertTrue(p.errors, bad)
-        p = sops.parse_sops({**base, "age": {"sshKeyPaths": ["/a", "/b"]}})
-        self.assertIn("at most one path", p.errors[0])
+        p = sops.parse_sops({**base, "age": {"sshKeyPaths": ["/a", "~/b"]}})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.settings.age_ssh_key_files, ("/a", os.path.expanduser("~/b")))
+        for bad in ("/a", ["/a", ""], [1]):
+            p = sops.parse_sops({**base, "age": {"sshKeyPaths": bad}})
+            self.assertIn("sshKeyPaths", p.errors[0], bad)
         p = sops.parse_sops({**base, "age": {"sshKeyFile": "/a"}})
         self.assertIn("sshKeyPaths", p.errors[0])
 
@@ -382,16 +396,19 @@ class DecryptTest(SopsTestBase):
         self.assertFalse(os.path.exists(os.path.join(self.secrets_dir, "port")))
 
     def test_age_key_and_binary_passed_to_sops(self):
+        ssh_key = os.path.join(self.tmp, "id")
+        with open(ssh_key, "w") as f:
+            f.write("k")
         raw = self.config(
-            {"t": {"key": "token"}}, age={"sshKeyPaths": ["/k/id"], "keyFile": "/k/age"}
+            {"t": {"key": "token"}}, age={"sshKeyPaths": [ssh_key], "keyFile": "/k/age"}
         )
         self.deploy(raw)
-        cmd, env = self.fake.calls[0]
+        cmd, env = [(c, e) for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
         self.assertEqual(
             cmd[:6], ["/fake/sops", "--decrypt", "--input-type", "yaml", "--output-type", "json"]
         )
         self.assertEqual(env["SOPS_AGE_KEY_FILE"], "/k/age")
-        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], "/k/id")
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], ssh_key)
 
     def test_missing_binary_is_clear_error(self):
         raw = self.config({"t": {"key": "token"}})
@@ -511,7 +528,7 @@ class DecryptTest(SopsTestBase):
     def test_state_has_no_value_or_hash(self):
         self.deploy(self.config({"t": {"key": "token"}}))
         record = self.state["sops"]["installed"][os.path.join(self.secrets_dir, "t")]
-        self.assertEqual(set(record), {"name", "ino", "mtime_ns"})
+        self.assertEqual(set(record), {"name", "dev", "ino", "mtime_ns"})
 
     def test_existing_identical_file_is_adopted(self):
         os.makedirs(self.secrets_dir)
@@ -733,6 +750,242 @@ class GenerateTest(SopsTestBase):
     def test_custom_chars(self):
         self.deploy(self.config({"p": {"generate": {"length": 16, "chars": "ab"}}}))
         self.assertTrue(set(self.read(os.path.join(self.secrets_dir, "p"))) <= {"a", "b"})
+
+
+class FixesTest(SopsTestBase):
+    def test_tracked_secret_switched_to_generate_records_generated(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        self.deploy(self.config({"t": {"generate": {}}}))
+        self.assertTrue(self.state["sops"]["installed"][path]["generated"])
+        _, out = self.deploy(self.config({}))
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("generated secret; kept on disk", out)
+
+    def test_whole_file_decrypt_passes_declared_output_type(self):
+        for fmt in ("yaml", "json", "dotenv", "ini"):
+            self.fake.calls = []
+            self.fake.docs[self.whole] = b"whole-" + fmt.encode()
+            raw = self.config(
+                {"w": {"key": "", "format": fmt, "sopsFile": self.whole}},
+            )
+            self.state = {}
+            ok, _ = self.deploy(raw)
+            self.assertTrue(ok, fmt)
+            cmd, _env = self.fake.calls[0]
+            self.assertEqual(
+                cmd[1:6], ["--decrypt", "--input-type", fmt, "--output-type", fmt], fmt
+            )
+            self.assertEqual(self.read(os.path.join(self.secrets_dir, "w")), "whole-" + fmt)
+            os.remove(os.path.join(self.secrets_dir, "w"))
+        self.fake.calls = []
+        self.state = {}
+        self.deploy(self.config({"b": {"format": "binary", "sopsFile": self.whole}}))
+        cmd, _env = self.fake.calls[0]
+        self.assertEqual(
+            cmd[1:6], ["--decrypt", "--input-type", "binary", "--output-type", "binary"]
+        )
+
+    def test_ssh_key_converted_with_ssh_to_age(self):
+        key = os.path.join(self.tmp, "id_ed25519")
+        with open(key, "w") as f:
+            f.write("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n")
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok, out)
+        conv = [c for c, _e in self.fake.calls if c[0].endswith("ssh-to-age")]
+        self.assertEqual(conv, [["/fake/bin/ssh-to-age", "-private-key", "-i", key]])
+        sops_env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(sops_env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], key)
+        self.assertEqual(sops_env["SOPS_AGE_KEY"], FakeSops.AGE_KEY)
+        self.assertNotIn(FakeSops.AGE_KEY, out)
+        self.assertEqual(os.listdir(self.tmp).count("age.txt"), 0)
+
+    def test_ssh_key_conversion_keeps_env_key_and_key_file(self):
+        key = os.path.join(self.tmp, "id_ed25519")
+        with open(key, "w") as f:
+            f.write("k")
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key], "keyFile": "/k/age"})
+        d = sops.Decryptor(
+            sops.parse_sops(raw).settings,
+            runner=self.fake,
+            which=lambda n: f"/fake/bin/{n}",
+            env={"SOPS_AGE_KEY": "AGE-SECRET-KEY-1EXISTING"},
+        )
+        d.value(sops.parse_sops(raw).secrets[0])
+        env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(env["SOPS_AGE_KEY"], "AGE-SECRET-KEY-1EXISTING\n" + FakeSops.AGE_KEY)
+        self.assertEqual(env["SOPS_AGE_KEY_FILE"], "/k/age")
+
+    def test_ssh_to_age_missing_skips_conversion_with_warning(self):
+        key = os.path.join(self.tmp, "id_ed25519")
+        with open(key, "w") as f:
+            f.write("k")
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
+        d = sops.Decryptor(
+            sops.parse_sops(raw).settings, runner=self.fake, which=lambda _n: None, env={}
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rows = secrets_flow.diff_sops(raw, self.state, d)
+        self.assertEqual(rows, [f"  + decrypt {os.path.join(self.secrets_dir, 't')} (secret)"])
+        self.assertIn("ssh-to-age not found", out.getvalue())
+        self.assertEqual(out.getvalue().count("ssh-to-age not found"), 1)
+        env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], key)
+        self.assertNotIn("SOPS_AGE_KEY", env)
+
+    def test_ssh_to_age_binary_override(self):
+        key = os.path.join(self.tmp, "id_ed25519")
+        with open(key, "w") as f:
+            f.write("k")
+        raw = self.config(
+            {"t": {"key": "token"}},
+            age={"sshKeyPaths": [key]},
+            sshToAgeBinary="/opt/bin/ssh-to-age",
+        )
+        d = sops.Decryptor(
+            sops.parse_sops(raw).settings, runner=self.fake, which=lambda _n: None, env={}
+        )
+        d.value(sops.parse_sops(raw).secrets[0])
+        self.assertEqual(self.fake.calls[0][0], ["/opt/bin/ssh-to-age", "-private-key", "-i", key])
+
+    def test_first_existing_ssh_key_passed_natively(self):
+        key = os.path.join(self.tmp, "id_ed25519")
+        with open(key, "w") as f:
+            f.write("k")
+        missing = os.path.join(self.tmp, "nope")
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [missing, key]})
+        self.deploy(raw)
+        env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], key)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 file")
+    def test_unreadable_ssh_key_skipped_for_next_readable_one(self):
+        bad = os.path.join(self.tmp, "id_unreadable")
+        good = os.path.join(self.tmp, "id_ed25519")
+        for p in (bad, good):
+            with open(p, "w") as f:
+                f.write("k")
+        os.chmod(bad, 0)
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [bad, good]})
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok, out)
+        self.assertIn(f"skipping ssh key {bad}", out)
+        env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], good)
+        conv = [c[-1] for c, _e in self.fake.calls if c[0].endswith("ssh-to-age")]
+        self.assertEqual(conv, [good])
+
+    def test_null_ssh_key_path_is_config_error(self):
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [None]})
+        p = sops.parse_sops(raw)
+        self.assertIn("sshKeyPaths", p.errors[0])
+        rows = self.diff(raw)
+        self.assertIn("sshKeyPaths", rows[0])
+        ok, _ = self.deploy(raw)
+        self.assertFalse(ok)
+
+    def test_lookup_of_generated_secret_checks_identity(self):
+        a = os.path.join(self.tmp, "a")
+        b = os.path.join(self.tmp, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(a, link)
+        path = os.path.join(link, "jwt")
+        raw = self.config({"jwt": {"generate": {}, "path": path}})
+        self.deploy(raw)
+        parsed = sops.parse_sops(raw)
+        installed = self.state["sops"]["installed"]
+        lookup = sops.make_lookup(parsed, decryptor=self.decryptor(raw), installed=installed)
+        self.assertEqual(len(lookup("jwt")), 64)
+        os.remove(link)
+        os.symlink(b, link)
+        with open(os.path.join(b, "jwt"), "w") as f:
+            f.write("hand-written")
+        with self.assertRaisesRegex(sops.SecretUnavailable, "not the file tools"):
+            lookup("jwt")
+
+    def test_ssh_key_conversion_failure_is_reported_without_output(self):
+        key = os.path.join(self.tmp, "id_rsa")
+        with open(key, "w") as f:
+            f.write("k")
+        self.fake.ssh_fail = True
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
+        ok, out = self.deploy(raw)
+        self.assertIn(f"cannot convert ssh key {key}", out)
+        self.assertNotIn(FakeSops.AGE_KEY, out)
+
+    def test_repointed_parent_symlink_is_untracked(self):
+        a = os.path.join(self.tmp, "a")
+        b = os.path.join(self.tmp, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(a, link)
+        path = os.path.join(link, "tok")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        self.deploy(raw)
+        self.assertEqual(self.read(os.path.join(a, "tok")), SECRET_VALUE)
+        self.assertEqual(self.state["sops"]["installed"][path]["dev"], os.lstat(path).st_dev)
+        os.remove(link)
+        os.symlink(b, link)
+        with open(os.path.join(b, "tok"), "w") as f:
+            f.write("hand-written")
+        rows = self.diff(raw)
+        self.assertIn("exists and is not tracked by tools; set force: true", rows[0])
+        ok, _ = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertEqual(self.read(os.path.join(b, "tok")), "hand-written")
+
+    def test_removed_same_inode_other_file_is_not_removed(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        record = self.state["sops"]["installed"][path]
+        record["dev"] = record["dev"] + 1
+        record["mtime_ns"] = record["mtime_ns"] + 1
+        rows = self.diff(self.config({}))
+        self.assertTrue(rows[0].startswith(f"  ~ forget {path}"), rows)
+        self.deploy(self.config({}))
+        self.assertTrue(os.path.exists(path))
+
+    def test_changed_device_number_keeps_tracking(self):
+        raw = self.config({"t": {"key": "token"}, "jwt": {"generate": {}}})
+        self.deploy(raw)
+        installed = self.state["sops"]["installed"]
+        real_dev = {}
+        for path, record in installed.items():
+            real_dev[path] = record["dev"]
+            record["dev"] = record["dev"] + 1
+        self.assertEqual(self.diff(raw), [])
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok, out)
+        for path, record in self.state["sops"]["installed"].items():
+            self.assertEqual(record["dev"], real_dev[path])
+        self.fake.docs[self.main]["token"] = SECRET_VALUE + "-new"
+        for record in self.state["sops"]["installed"].values():
+            record["dev"] = record["dev"] + 1
+        self.assertEqual(
+            self.diff(raw), [f"  ~ update {os.path.join(self.secrets_dir, 't')} (secret)"]
+        )
+        self.assertEqual(
+            self.diff(self.config({})),
+            [f"  - remove {os.path.join(self.secrets_dir, 't')}"]
+            + [
+                f"  ~ forget {os.path.join(self.secrets_dir, 'jwt')} "
+                "(generated secret; kept on disk, delete by hand if unwanted)"
+            ],
+        )
+
+    def test_held_removal_is_shown_in_diff(self):
+        raw = self.config({"t": {"key": "token"}})
+        self.deploy(raw)
+        path = os.path.join(self.secrets_dir, "t")
+        rows = self.diff(self.config({"bad": {"key": "x", "mode": 1}}))
+        self.assertIn(f"  ~ hold {path} (would remove; held until config errors are fixed)", rows)
 
 
 if __name__ == "__main__":

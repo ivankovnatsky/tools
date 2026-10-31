@@ -250,5 +250,79 @@ class FilesRespellTest(unittest.TestCase):
                 self.assertEqual(list(state["files"]), [second])
 
 
+class FilesIdentityTest(unittest.TestCase):
+    def test_repointed_parent_symlink_is_untracked(self):
+        from tools.diff import _diff_files
+
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            _write(os.path.join(d, "src"), "fresh = 1\n")
+            a, b = os.path.join(d, "a"), os.path.join(d, "b")
+            os.makedirs(a)
+            os.makedirs(b)
+            link = os.path.join(d, "link")
+            os.symlink(a, link)
+            target = os.path.join(link, "app.ini")
+            entries = [{"source": "src", "target": target}]
+            state = {}
+            with mock.patch("tools.user.files.log"):
+                files.install_files(entries, d, state)
+            self.assertEqual(state["files"][target]["ino"], os.lstat(target).st_ino)
+            os.remove(link)
+            os.symlink(b, link)
+            _write(os.path.join(b, "app.ini"), "fresh = 1\nhandwrittenvalue = 2\n")
+            rows = _diff_files(entries, d, state)
+            self.assertEqual(
+                rows, [f"  ~ replace {target} (not tracked by tools; content not shown)"]
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), mock.patch("tools.user.files.log") as log:
+                files.install_files(entries, d, state)
+            self.assertNotIn("handwrittenvalue", out.getvalue() + repr(log.call_args_list))
+
+    def test_identity_kept_for_unchanged_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "src"), "v")
+            target = os.path.join(d, "out")
+            entries = [{"source": "src", "target": target}]
+            state = {}
+            with mock.patch("tools.user.files.log"):
+                files.install_files(entries, d, state)
+                files.install_files(entries, d, state)
+            self.assertEqual(state["files"][target]["ino"], os.lstat(target).st_ino)
+
+    def test_changed_device_number_keeps_tracking(self):
+        from tools.diff import _diff_files
+
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "src"), "v = 1\n")
+            target = os.path.join(d, "out")
+            entries = [{"source": "src", "target": target}]
+            state = {}
+            with mock.patch("tools.user.files.log"):
+                files.install_files(entries, d, state)
+            dev = state["files"][target]["dev"]
+            state["files"][target]["dev"] = dev + 1
+            _write(os.path.join(d, "src"), "v = 2\n")
+            rows = _diff_files(entries, d, state)
+            self.assertEqual(rows[0], f"  ~ update {target}")
+            with mock.patch("tools.user.files.log"):
+                files.install_files(entries, d, state)
+            self.assertEqual(state["files"][target]["dev"], dev)
+
+    def test_modified_kept_file_is_shown_in_diff(self):
+        from tools.diff import _diff_files
+
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "managed.conf")
+            digest = _write(target, "ours\n")
+            _write(target, "hand edited\n")
+            state = {"files": {target: {"hash": digest}}}
+            rows = _diff_files([], d, state)
+            self.assertEqual(
+                rows, [f"  ~ keep {target} (modified since tools wrote it; not removed)"]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
