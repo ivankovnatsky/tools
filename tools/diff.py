@@ -20,6 +20,7 @@ from tools.user.defaults import has_work as defaults_has_work
 from tools.user.dock import diff_dock
 from tools.user.dock import has_work as dock_has_work
 from tools.user.flatpak import diff_flatpak
+from tools.user.git_repos import is_checkout
 from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
@@ -229,8 +230,10 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
     # They run on every deploy (the clean-diff path included).
     for dest, _url in git_repos.items():
         expanded = os.path.expanduser(dest)
-        if not os.path.isdir(expanded):
+        if not os.path.exists(expanded):
             changes.append(f"  + clone {dest}")
+        elif not is_checkout(expanded):
+            changes.append(f"  ! not a git repo: {dest} (deploy skips it)")
         elif dest not in installed:
             changes.append(f"  + track {dest}")
     # Removal is an rmtree of the whole checkout, so it must never reach the
@@ -249,7 +252,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
     accounts for cleanup against state.
     """
     from tools.fsutil import removal_blocked, respell, same_file_as
-    from tools.user.files import _conflict, _file_hash, _resolve_entries
+    from tools.user.files import _conflict, _removable, _resolve_entries, _tracked
 
     changes: List[str] = []
 
@@ -293,7 +296,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
 
         if src_hash != tgt_hash:
             is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
-            if target not in state_files:
+            if not _tracked(target, state_files.get(target)):
                 changes.append(f"  ~ replace {target} (not tracked by tools; content not shown)")
             elif is_secret:
                 changes.append(f"  ~ update {target} (secret, diff suppressed)")
@@ -316,11 +319,10 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
                 changes.append(f"  ~ keep {target} (is {blocked}; not removed)")
                 continue
             if os.path.exists(target):
-                # Deploy declines to delete files modified since we wrote
-                # them; claiming "remove" here would overstate what an
-                # approval actually does.
-                stored_hash = (state_files.get(target) or {}).get("hash")
-                if stored_hash and _file_hash(target) != stored_hash:
+                if not _removable(target, state_files.get(target)):
+                    changes.append(
+                        f"  ~ keep {target} (modified since tools wrote it; not removed)"
+                    )
                     continue
                 changes.append(f"  - remove {target}")
 
@@ -456,16 +458,6 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if changes:
             sections.append(("curlShell", changes))
 
-    # Gate on state too: dropping the whole gitRepos block is exactly the
-    # case where deploy rmtrees every tracked checkout — that must never be
-    # invisible in the preview.
-    if "gitRepos" in active and (
-        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
-    ):
-        changes = _diff_git_repos(config.get("gitRepos") or {}, state)
-        if changes:
-            sections.append(("gitRepos", changes))
-
     # One decryptor for both: each sops file is decrypted once, in memory.
     decryptor = None
     run_sops = "sops" in active and sops_section.has_work(config.get("sops"), state)
@@ -482,25 +474,53 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         skills_raw=config.get("skills"),
         state=state,
         config_dir=config_dir,
+        git_repos_raw=config.get("gitRepos"),
+        clone_pending="gitRepos" in active,
+    )
+    # Same order as deploy: paths inside a gitRepos destination after the clone.
+    inside = secrets_flow.paths_in_repos(
+        config.get("gitRepos"), config.get("sops"), config.get("templates")
     )
     failed: tuple = ()
-    if run_sops:
-        sops_plan = secrets_flow.plan_sops(config.get("sops"), state, decryptor, conflicts)
-        failed = secrets_flow.failed_secrets(sops_plan)
-        changes = sops_section.describe(sops_plan)
+
+    def secrets(phase, suffix=""):
+        nonlocal failed
+        split = {"phase": phase, "inside": inside} if phase else {}
+        if run_sops:
+            sops_plan = secrets_flow.plan_sops(
+                config.get("sops"), state, decryptor, conflicts, **split
+            )
+            failed += secrets_flow.failed_secrets(sops_plan)
+            changes = sops_section.describe(sops_plan)
+            if changes:
+                sections.append(("sops" + suffix, changes))
+        if run_templates:
+            changes = secrets_flow.diff_templates(
+                config.get("templates"),
+                config.get("sops"),
+                state,
+                decryptor,
+                conflicts,
+                failed,
+                **split,
+            )
+            if changes:
+                sections.append(("templates" + suffix, changes))
+
+    secrets(secrets_flow.EARLY if inside else None)
+
+    # Gate on state too: dropping the whole gitRepos block is exactly the
+    # case where deploy rmtrees every tracked checkout — that must never be
+    # invisible in the preview.
+    if "gitRepos" in active and (
+        config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
+    ):
+        changes = _diff_git_repos(config.get("gitRepos") or {}, state)
         if changes:
-            sections.append(("sops", changes))
-    if run_templates:
-        changes = secrets_flow.diff_templates(
-            config.get("templates"),
-            config.get("sops"),
-            state,
-            decryptor,
-            conflicts,
-            failed,
-        )
-        if changes:
-            sections.append(("templates", changes))
+            sections.append(("gitRepos", changes))
+
+    if inside:
+        secrets(secrets_flow.LATE, " (after gitRepos)")
 
     if "files" in active:
         changes = _diff_files(config.get("files", []) or [], config_dir, state, conflicts)
