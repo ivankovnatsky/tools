@@ -109,6 +109,15 @@ class ParseTest(unittest.TestCase):
             self.assertIn("declared more than once", "\n".join(errors), path)
         for name in ("-g", ".GlobalPreferences", "~/Library/Preferences/.GlobalPreferences"):
             self.assertEqual(defaults.canonical_domain(name), "NSGlobalDomain", name)
+        with mock.patch.dict(os.environ, {"HOME": "/homeless-shelter"}):
+            self.assertEqual(
+                defaults.canonical_domain("~/Library/Preferences/.GlobalPreferences"),
+                "NSGlobalDomain",
+            )
+            self.assertEqual(
+                defaults.canonical_domain("~/Library/Preferences/ByHost/com.apple.controlcenter"),
+                "/homeless-shelter/Library/Preferences/ByHost/com.apple.controlcenter",
+            )
 
     def test_dock_guard_uses_canonical_domain(self):
         for domain in ("~/Library/Preferences/com.apple.dock.plist", "com.apple.dock"):
