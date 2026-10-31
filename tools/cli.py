@@ -3,13 +3,16 @@ import sys
 
 import click
 
-from tools.config import ConfigError, deep_merge, load_config, load_config_dir
+from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
 from tools.services import has_work as services_has_work
 from tools.services import install_services
 from tools.services.keys import key_path as services_key_path
 from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
+from tools.user import secrets_flow
+from tools.user import sops as sops_section
+from tools.user import templates as templates_section
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
@@ -70,7 +73,11 @@ def _load_merged_config(config_paths: list[str]) -> dict:
             log(f"Config error in {config_path}: top level must be a mapping", Color.RED)
             sys.exit(1)
         config = deep_merge(config, loaded)
-    return config
+    try:
+        return resolve_config(config, _resolve_config_dir(config_paths))
+    except ConfigError as exc:
+        log(f"Config error: {exc}", Color.RED)
+        sys.exit(1)
 
 
 def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
@@ -115,6 +122,38 @@ def _run_sections(
     state_file: str = "",
 ) -> bool:
     success = True
+
+    # sops and templates first: later sections (mcp secretPaths, ${sopsPath:}
+    # consumers) read the files they write; a failed secret blocks its templates.
+    # One registry for every file-writing section, taken before any of them runs.
+    conflicts = secrets_flow.ownership_conflicts(
+        files_entries=config.get("files"),
+        sops_raw=config.get("sops"),
+        templates_raw=config.get("templates"),
+        links_raw=config.get("links"),
+        skills_raw=config.get("skills"),
+        state=state,
+        config_dir=config_dir,
+    )
+    report = secrets_flow.RunReport()
+    # One decryptor for both, so templates render the values sops just wrote.
+    decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
+    if "sops" in active and sops_section.has_work(config.get("sops"), state):
+        success &= secrets_flow.deploy_sops(
+            config.get("sops"), state, report, decryptor, conflicts=conflicts
+        )
+
+    if "templates" in active and templates_section.has_work(config.get("templates"), state):
+        success &= secrets_flow.deploy_templates(
+            config.get("templates"),
+            config.get("sops"),
+            state,
+            report,
+            conflicts,
+            decryptor,
+        )
+    for line in secrets_flow.format_notify(report):
+        log(line, Color.YELLOW)
 
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
     # with nothing configured raises KeyError on a machine show_diff calls
@@ -169,7 +208,7 @@ def _run_sections(
         success &= install_git_repos(config.get("gitRepos") or {}, state)
 
     if "files" in active:
-        success &= install_files(config.get("files", []) or [], config_dir, state)
+        success &= install_files(config.get("files", []) or [], config_dir, state, conflicts)
 
     # Gated on state too, like gitRepos: dropping the whole section must
     # still reach the reconciler so it can remove what it installed.
