@@ -30,9 +30,10 @@ and only the folder options the config sets, so Dock's own bookkeeping
 (GUIDs, bookmarks, labels) never forces a rewrite. A path that does not
 exist is skipped with a warning; the rest of the layout still applies.
 
-Ownership follows `defaults`: the prior array is restored when a section
-leaves config only if it existed and the live layout still matches
-`written` or `confirmed`; otherwise the layout is left as is and forgotten.
+Ownership follows `defaults`: when a section leaves config and the live
+layout still matches `written` or `confirmed`, the prior array is restored,
+or the key is deleted if it did not exist before tools; a layout rearranged
+by hand is left as is and forgotten.
 """
 
 import difflib
@@ -430,6 +431,7 @@ def plan(spec: DockSpec, errors: List[str], state: Dict, cli: DefaultsCLI, fs: F
         "rewrite": [],  # (section, items, current tiles or MISSING, {index: live tile})
         "refresh": [],  # (section, written, confirmed): live layout already matches
         "restore": [],  # (section, prior tiles)
+        "delete": [],  # section: not set before tools
         "forget": [],  # (section, reason)
         "restart": False,
     }
@@ -490,10 +492,11 @@ def plan(spec: DockSpec, errors: List[str], state: Dict, cli: DefaultsCLI, fs: F
             ours = [_recorded(entry.get("written")), _recorded(entry.get("confirmed"))]
             if _tiles_match(cur, prior, fs):
                 result["forget"].append((key, "already gone"))
-            elif prior is MISSING:
-                result["forget"].append((key, "not set before tools; left as is"))
             elif any(rec is not None and _tiles_match(rec, cur, fs) for rec in ours):
-                result["restore"].append((key, prior))
+                if prior is MISSING:
+                    result["delete"].append(key)
+                else:
+                    result["restore"].append((key, prior))
             else:
                 result["forget"].append((key, "rearranged by hand; left as is"))
 
@@ -503,7 +506,9 @@ def plan(spec: DockSpec, errors: List[str], state: Dict, cli: DefaultsCLI, fs: F
         restart = False
     else:
         restart = state.get("dock", {}).get("restart", False)
-    result["restart"] = bool(restart) and bool(result["rewrite"] or result["restore"])
+    result["restart"] = bool(restart) and bool(
+        result["rewrite"] or result["restore"] or result["delete"]
+    )
     return result
 
 
@@ -633,6 +638,18 @@ def _apply_dock(
         mark_changed()
         log(f"Dock: restored prior {key}", Color.YELLOW)
 
+    for key in p["delete"]:
+        try:
+            cli.delete("user", DOCK_DOMAIN, key)
+        except BaseException as e:
+            failed(key, e)
+            if not isinstance(e, Exception):
+                raise
+            continue
+        tracked.pop(key, None)
+        mark_changed()
+        log(f"Dock: deleted {key}", Color.YELLOW)
+
     for key, reason in p["forget"]:
         if reason != "already gone":
             log(f"dock: releasing {key}: {reason}", Color.YELLOW)
@@ -675,6 +692,7 @@ def preview_dock(
         changes.append(f"  ~ rewrite {key} ({len(items)} items)")
         changes += layout_changes(items, [] if cur is MISSING else cur, fs)
     changes += [f"  - restore prior {key}" for key, _ in p["restore"]]
+    changes += [f"  - delete {key}" for key in p["delete"]]
     changes += [
         f"  ~ forget {key} ({reason})" for key, reason in p["forget"] if reason != "already gone"
     ]
