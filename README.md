@@ -27,8 +27,8 @@ tools deploy [--config PATH]... [--scope SECTION]... [--approve]
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`files`, `skills`, `links`, `brew`, `ollamaModels`, `flatpak`, `launchd`,
-`defaults`, `dock`, `services`.
+`sops`, `templates`, `files`, `skills`, `links`, `brew`, `ollamaModels`,
+`flatpak`, `launchd`, `defaults`, `dock`, `services`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
@@ -59,7 +59,133 @@ Notable keys:
 - `files:` entries take `{source, target, mode?, secrets?}` or
   `{dir, mode?, secrets?}`. `mode` must be a **quoted octal string** (`"0644"`);
   bare YAML ints are rejected as ambiguous. `secrets: true` suppresses inline
-  content diffs for that entry.
+  content diffs for that entry. Removals wait while any entry is malformed; a
+  target refused by another owner stays tracked and does not hold others.
+- `vars` — placeholder values for every other section; see below.
+
+## Vars and placeholders
+
+Resolved once, after all files and `--config` paths merge (per-host `vars`
+win). String leaves only; mapping keys are never substituted.
+
+```yaml
+vars:
+  dataDir: /Volumes/Data
+  forgejoDir: ${dataDir}/forgejo # vars may reference vars
+npm:
+  packages:
+    x: { postInstall: "echo $${HOME}" } # $${ is a literal ${
+```
+
+| Placeholder        | Resolves to                                       |
+| ------------------ | ------------------------------------------------- |
+| `${name}`          | `vars.name`; otherwise left as written            |
+| `${env:NAME}`      | environment variable (unset is an error)          |
+| `${sopsPath:NAME}` | path of the decrypted `sops.secrets.NAME` file    |
+| `${sops:NAME}`     | the secret's value, only inside `templates` content |
+| `$${`              | a literal `${`                                    |
+
+- `name` is `[A-Za-z_][A-Za-z0-9_]*`; a string that is exactly `${name}` keeps the var's type.
+- Anything else (`${API_KEY}`, `${1}`, `${FOO:-x}`, ...) passes through for the shell, claude, etc.
+- The environment is read only via `${env:}`; its values are plain config, never secret.
+- `links:`/`skills:` paths also expand `$VAR` from the environment; `sops`/`templates` paths expand `~` only.
+- Unknown `${sops:}`/`${sopsPath:}` names are errors; an invalid `sops:` section is reported as such.
+
+## Sops
+
+One file per secret, decrypted with `sops` from `PATH` (or `binary:`).
+Options follow sops-nix.
+
+```yaml
+sops:
+  age:
+    keyFile: ~/.config/sops/age/keys.txt
+    sshKeyPaths: [~/.ssh/id_ed25519] # at most one
+  secretsDir: ~/.local/state/tools/secrets # default
+  defaultSopsFile: secrets/default.yaml # relative to the first --config path
+  defaultSopsFormat: yaml # default
+  secrets:
+    externalDomain: {} # key defaults to the name
+    aws/region: {} # nested key aws -> region; file <secretsDir>/aws/region
+    dns-ip-1:
+      key: nextDNS/IPs/0 # numeric segments index lists
+      sopsFile: secrets/dns.yaml
+      path: ~/.config/stubby/ip1
+      mode: "0440" # default "0400"
+      group: staff
+      restartUnits: [launchd:org.example.stubby]
+    ssh-key: { sopsFile: secrets/id.bin, format: binary } # whole file (or key: "")
+    forgejo-jwt:
+      generate: { length: 64, charset: alnum } # alnum | alpha | hex | urlsafe, or chars
+```
+
+- Each sops file is decrypted once per run, in memory; `tools diff` decrypts too and shows only path + action.
+- Writes are atomic, mode/owner set before content; unchanged files are not rewritten.
+- New dirs inside `secretsDir` are `0751` (as sops-nix); parents outside it use the normal umask.
+- One failing secret doesn't stop the rest; its templates are blocked; the run exits non-zero.
+- `generate` creates a value once and never overwrites; an existing untracked file needs `force: true` to be adopted.
+- Values must be strings (as sops-nix); quote numbers in the sops file. Numeric key segments index lists (`nextDNS/IPs/0`), as nix-config uses.
+- An existing untracked file with different content is refused unless the entry sets `force: true`.
+- One secret's path may not contain another's (`a` vs `a/b`).
+- `restartUnits` only prints `notify <unit> (changed: ...)` for now; there's no handler yet.
+
+## Templates
+
+Renders a file from YAML data or text. Options follow sops-nix templates.
+
+```yaml
+templates:
+  app.ini: # path defaults to <secretsDir>/rendered/app.ini
+    format: ini # raw (default) | yaml | json | toml | ini | env
+    content:
+      server: { DOMAIN: "git.${sops:externalDomain}", HTTP_PORT: 3000 }
+      security: { INTERNAL_TOKEN_URI: "file:${sopsPath:forgejo-jwt}" }
+    restartUnits: [launchd:org.example.forgejo]
+  transmission:
+    path: ~/.config/transmission/settings.json
+    format: json
+    content: { rpc-port: 9091, rpc-password: "${sops:transmission-password}" }
+  caddyfile:
+    path: ~/.config/caddy/Caddyfile
+    file: templates/Caddyfile # raw text, relative to the first --config path
+```
+
+- `content`: text for `raw`, mapping for `ini`/`env`/`toml`, mapping or list for `yaml`/`json`.
+- `env` values are shell single-quoted; `quote: false` writes `KEY=value`.
+- `${sops:}` renders from the same decryption as `sops`, so diff and deploy agree.
+- Default mode `0400`; `owner`/`group`/`force` and new dirs as in sops.
+- With an invalid `sops:` section, templates without `path` are errors; there's no fallback to the default directory.
+- Content is masked in diff/deploy output when it uses `${sops:}`, has `secrets: true`, was secret before, or looks like a key.
+
+## Ownership (files, sops, templates)
+
+- A path claimed by two of `files`/`sops`/`templates` is refused by all of them; moving a path between sections takes two deploys.
+- Refused as well: symlinks managed by `links`/`skills`, paths through them or inside their targets, skill copy dirs and the skills cache.
+- Symlinked parents and case (on case-insensitive volumes) are normalized before comparing, so aliases match.
+- A managed path may not be inside another one (for example, a secret named `rendered`).
+- An unmanaged symlink at a target is never followed.
+- Only tracked, unmodified files are removed; any invalid entry holds removals.
+- Nothing is removed through a managed link.
+- State keeps inode + mtime, never values or hashes.
+- An untracked existing file's content is never shown; sops/templates replace it only with `force: true`, `files:` as before.
+- State entries match declared paths by file identity, so a respelled path (alias, case) is the same entry.
+
+## Differences from nix-config/sops-nix
+
+| Option / behaviour | sops-nix | tools | Why |
+| --- | --- | --- | --- |
+| Secrets location | `/run/secrets`, `~/.config/sops-nix/secrets` | `secretsDir` (`~/.local/state/tools/secrets`) | runs beside sops-nix during migration |
+| `path` | symlink into the secrets dir | regular file written at `path` | no generation dirs to link into |
+| `sops.placeholder.NAME` | Nix placeholder string | `${sops:NAME}` | no Nix evaluation |
+| Template `content` | text only | text, or YAML data via `format` | services get their native format |
+| `restartUnits` | restarts systemd units | prints a notice (no handler yet) | launchd handler comes later |
+| `age.sshKeyPaths` | any number | at most one | `sops` reads a single key file |
+| Removal | old generations pruned | only tracked, unmodified files | never delete what tools didn't write |
+| Ownership | none | one owner per path; no writes through symlinks | safety |
+| Diff | n/a | path + action, content masked | no secrets in logs |
+| `generate` | n/a | create-once random secrets | first-run app secrets |
+| `owner` default | `root` (system module) | the user running tools | user-level tool |
+| Untracked file at `path`/template path | overwritten | refused unless `force: true` | never clobber hand-written files |
 
 ## Skills
 
@@ -399,6 +525,8 @@ delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
 
 - `curlShell` pipes remote scripts into a shell, and `brew` bootstrap runs the
   official Homebrew installer — both execute remote code you declared in config.
+- `sops` and `templates` never log, diff or persist secret values; see their
+  sections for exactly what is shown.
 - MCP servers with secret headers substitute secrets from `secretPaths` files at
   register time. The `claude mcp add` CLI only accepts headers as argv, so the
   resolved secret is briefly visible in the process list while the command runs.
