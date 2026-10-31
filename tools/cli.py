@@ -229,8 +229,8 @@ def _run_sections(
         success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state)
 
     # After files, so restartOn hashes see files written in this run.
-    if "launchd" in active and launchd_has_work(config.get("launchd") or {}, state):
-        success &= install_launchd(config.get("launchd") or {}, state)
+    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+        success &= install_launchd(config.get("launchd"), state)
 
     # Talks to service APIs; gated so an absent section makes no network calls.
     if "services" in active and services_has_work(config.get("services")):
@@ -334,7 +334,7 @@ def status(config):
     state_file = os.path.expanduser(merged.get("stateFile") or "~/.local/state/tools/state.json")
     state = migrate_state_schema(load_json(find_state_file(state_file)))
     try:
-        rows = status_rows(merged.get("launchd") or {}, state)
+        rows = status_rows(merged.get("launchd"), state)
     except PermissionError as e:
         log(f"launchd: {e}", Color.RED)
         sys.exit(1)
