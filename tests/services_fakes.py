@@ -103,8 +103,11 @@ class Harness:
         ctx.kept(kind, "", pairs, "")
         return ctx.state["managed"][kind]
 
-    def run(self, config, state=None, apply=True):
+    def run(self, config, state=None, apply=True, **secrets):
         state = {} if state is None else state
-        results, ok = run_services(config, state, apply=apply, context_factory=self.factory)
+        secrets = secrets or {"secrets_dir": "/secrets"}
+        results, ok = run_services(
+            config, state, apply=apply, context_factory=self.factory, **secrets
+        )
         rows = [row for _, rows in results for row in rows]
         return rows, ok, state

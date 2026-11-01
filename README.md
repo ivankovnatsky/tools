@@ -159,7 +159,7 @@ sops:
     keyFile: ~/.config/sops/age/keys.txt
     sshKeyPaths: [~/.ssh/id_ed25519] # age1 recipients via ssh-to-age; ssh-ed25519 only for the first readable key
   sshToAgeBinary: null # default: ssh-to-age from PATH
-  secretsDir: ~/.local/state/tools/secrets # default
+  secretsDir: ~/.local/state/tools/secrets # default; must be absolute after ~ expansion
   defaultSopsFile: secrets/default.yaml # relative to the first --config path
   defaultSopsFormat: yaml # default
   secrets:
@@ -410,7 +410,7 @@ launchd:
 | Option | Default | Notes |
 | --- | --- | --- |
 | `command` / `programArguments` | — | exactly one; wrapper ends `exec <command>` (as nix) or `exec "$@"` |
-| `waitForSecrets` | false | wait for `~/.config/sops-nix/secrets` (agents) or `/run/secrets` (daemons) |
+| `waitForSecrets` | false | wait until `sops.secretsDir` exists, for agents and daemons alike (tools' sops is user-scope; a daemon's `user` must be able to reach that dir); a config error when the sops section is invalid or declares no secrets |
 | `waitForPath` / `waitForPaths` | — | wait until each path exists |
 | `dataDir`, `extraDirs` | — | `mkdir -p` at start; `extraDirs` also takes `{path, mode, owner, group}` (root daemons only) |
 | `preStart` | — | shell run before the command |
@@ -455,6 +455,7 @@ Behaviour:
 | label | `com.ivankovnatsky.<name>` | `labelPrefix` required | no personal default in a public tool |
 | `enable` | per service, default false | listing a service enables it | YAML list is the switch |
 | `waitForPath` | one path | also `waitForPaths` list | several secrets/volumes |
+| `waitForSecrets` | `/run/secrets` (daemons), `~/.config/sops-nix/secrets` (agents) | `sops.secretsDir` for both | waits on the dir tools writes secrets to |
 | bash | `pkgs.bash` | `/bin/bash`, or `bash:` | stable path; root-owned for daemons |
 | logDir `chmod 755` | can fail and kill the job | agents skip it if not owner; daemons `\|\| true` | avoids a crash loop |
 | extraServiceConfig | can override anything | log paths checked; `Label`/`Program*` reserved | log-path safety |
@@ -678,7 +679,7 @@ All services:
 | nextdns | Domain/rewrite match | case-sensitive | case-insensitive | no delete/re-add churn |
 | nextdns | Profile name matches several | first one | error | wrong-profile writes |
 | nextdns | Bad input file in one profile | other profiles still written | no profile written | no half-applied run |
-| nextdns | Id file without `profileIdFile` | fixed `~/.config/sops-nix/secrets` | `profileIdDir` (same default, null disables) | configurable |
+| nextdns | Id file without `profileIdFile` | fixed `~/.config/sops-nix/secrets` | `profileIdDir` (default `sops.secretsDir`, which must be valid and hold secrets; null disables) | reads ids tools' sops wrote |
 | syncthing | Local device | removable | never removed | keeps the node reachable |
 | syncthing | Local device name | `devices` rename after `localDeviceName` | `localDeviceName` wins when set | no rename loop |
 | syncthing | Device IDs | exact string | canonical form | no delete/re-add |

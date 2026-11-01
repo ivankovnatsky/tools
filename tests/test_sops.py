@@ -149,6 +149,41 @@ class ParseTest(unittest.TestCase):
             self.assertEqual(p.secrets, [], extra)
             self.assertIn("non-empty path string", p.errors[-1])
 
+    def test_relative_secrets_dir_is_a_settings_error(self):
+        raw = {"secretsDir": "rel/secrets", "defaultSopsFile": "/f", "secrets": {"a": {"key": "k"}}}
+        p = sops.parse_sops(raw)
+        self.assertEqual(p.secrets, [])
+        self.assertEqual(p.secrets_dir()[0], None)
+        self.assertIn("sops.secretsDir must be an absolute path", p.secrets_dir()[1])
+
+    def test_secrets_dir_kwargs_need_declared_secrets(self):
+        with_secret = {"secretsDir": "/s", "defaultSopsFile": "/f", "secrets": {"a": {"key": "k"}}}
+        self.assertEqual(
+            sops.secrets_dir_kwargs(with_secret), {"secrets_dir": "/s", "secrets_dir_error": None}
+        )
+        for raw in (None, {}, {"secretsDir": "/s"}):
+            kw = sops.secrets_dir_kwargs(raw)
+            self.assertEqual(kw["secrets_dir"], None, raw)
+            self.assertEqual(kw["secrets_dir_error"], "no sops secrets are configured", raw)
+        outside = {**with_secret, "secrets": {"a": {"key": "k", "path": "/x/custom/a"}}}
+        self.assertEqual(
+            sops.secrets_dir_kwargs(outside),
+            {"secrets_dir": None, "secrets_dir_error": "no sops secret has its path inside /s"},
+        )
+        inside = {**with_secret, "secrets": {"a": {"key": "k", "path": "/s/sub/a"}}}
+        self.assertEqual(sops.secrets_dir_kwargs(inside)["secrets_dir"], "/s")
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real")
+            os.makedirs(real)
+            alias = os.path.join(tmp, "alias")
+            os.symlink(real, alias)
+            secret = {"a": {"key": "k", "path": f"{real}/a"}}
+            aliased = {**with_secret, "secretsDir": alias, "secrets": secret}
+            self.assertEqual(sops.secrets_dir_kwargs(aliased)["secrets_dir"], alias)
+        kw = sops.secrets_dir_kwargs({**with_secret, "secretsDir": "rel"})
+        self.assertEqual(kw["secrets_dir"], None)
+        self.assertIn("absolute path", kw["secrets_dir_error"])
+
     def test_missing_sops_file_is_error(self):
         p = sops.parse_sops({"secrets": {"a": {"key": "k"}}})
         self.assertIn("no sopsFile", p.errors[0])

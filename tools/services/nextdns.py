@@ -23,7 +23,6 @@ from tools.services.http import (
 )
 
 API_BASE = "https://api.nextdns.io"
-DEFAULT_PROFILE_ID_DIR = "~/.config/sops-nix/secrets"
 _BLOCKLIST_METADATA = ("name", "website", "description", "entries", "updatedOn")
 # Domains are case-insensitive: `Example.com` and `example.com` are one entry.
 REWRITE = identity.compound(identity.folded, identity.folded)
@@ -73,7 +72,13 @@ class NextDnsSpec:
     prune: bool = False
 
 
-def parse(raw, base_dir: Optional[str] = None) -> NextDnsSpec:
+def parse(
+    raw,
+    base_dir: Optional[str] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
+) -> NextDnsSpec:
+    """``profileIdDir`` defaults to ``secrets_dir`` (the sops section's ``secretsDir``)."""
     raw = s.mapping(raw, "nextdns")
     s.check_keys(raw, s.ENDPOINT_KEYS | {"profiles"}, "nextdns")
     profiles = []
@@ -96,6 +101,14 @@ def parse(raw, base_dir: Optional[str] = None) -> NextDnsSpec:
         vars_ = s.mapping(p.get("vars"), f"{where}.vars")
         if not all(isinstance(v, str) for v in vars_.values()):
             raise InvalidSpec(f"{where}.vars values must be strings")
+        id_file = s.path(p, "profileIdFile", where, base_dir)
+        if "profileIdDir" in p:
+            id_dir = s.path(p, "profileIdDir", where, base_dir)
+        elif secrets_dir or id_file:
+            id_dir = secrets_dir
+        else:
+            why = secrets_dir_error or "no sops section"
+            raise InvalidSpec(f"{where}: profileIdDir defaults to sops.secretsDir ({why})")
         vars_files = {
             k: s.path({"p": v}, "p", f"{where}.varsFiles.{k}", base_dir)
             for k, v in s.mapping(p.get("varsFiles"), f"{where}.varsFiles").items()
@@ -105,10 +118,8 @@ def parse(raw, base_dir: Optional[str] = None) -> NextDnsSpec:
                 name=name,
                 profile_file=profile_file,
                 api_key_file=api_key,
-                profile_id_file=s.path(p, "profileIdFile", where, base_dir),
-                profile_id_dir=s.path(
-                    {"d": p.get("profileIdDir", DEFAULT_PROFILE_ID_DIR)}, "d", where, base_dir
-                ),
+                profile_id_file=id_file,
+                profile_id_dir=id_dir,
                 vars=dict(vars_),
                 vars_files=vars_files,
             )

@@ -265,7 +265,11 @@ def _run_sections(
 
     # After files, so restartOn hashes see files written in this run.
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
-        success &= install_launchd(config.get("launchd"), state)
+        success &= install_launchd(
+            config.get("launchd"),
+            state,
+            **sops_section.secrets_dir_kwargs(config.get("sops")),
+        )
 
     # Talks to service APIs; gated so an absent section makes no network calls.
     if "services" in active and services_has_work(config.get("services")):
@@ -274,6 +278,7 @@ def _run_sections(
             config_dir,
             state,
             services_key_path(state_file) if state_file else None,
+            **sops_section.secrets_dir_kwargs(config.get("sops")),
         )
     elif "services" in active:
         release_services(config.get("services"), state)

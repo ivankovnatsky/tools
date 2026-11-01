@@ -553,7 +553,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
             sections.append(("flatpak", changes))
 
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
-        changes = diff_launchd(config.get("launchd"), state)
+        changes = diff_launchd(
+            config.get("launchd"),
+            state,
+            **sops_section.secrets_dir_kwargs(config.get("sops")),
+        )
         if changes:
             sections.append(("launchd", changes))
 
@@ -573,7 +577,13 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
 
     if "services" in active:
         if services_has_work(config.get("services")):
-            subsections = diff_services(config.get("services"), config_dir, state, services_key)
+            subsections = diff_services(
+                config.get("services"),
+                config_dir,
+                state,
+                services_key,
+                **sops_section.secrets_dir_kwargs(config.get("sops")),
+            )
         else:
             subsections = services_released_rows(config.get("services"), state)
         if subsections:

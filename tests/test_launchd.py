@@ -249,10 +249,10 @@ class ParseTest(unittest.TestCase):
 
 
 class PlistTest(LaunchdTestBase):
-    def plist(self, raw, **section):
+    def plist(self, raw, secrets_dir=None, **section):
         _s, svcs, errors = launchd.parse_launchd(self.cfg({"svc": raw}, **section))
         self.assertEqual(errors, [])
-        settings = launchd.parse_launchd(self.cfg({}, **section))[0]
+        settings = launchd.parse_launchd(self.cfg({}, **section), secrets_dir=secrets_dir)[0]
         return launchd.desired_plist(svcs[0], settings, self.env)
 
     def test_command_is_inlined_through_bash_c(self):
@@ -362,7 +362,8 @@ class PlistTest(LaunchdTestBase):
         script = self.plist(
             {"command": "srv", "waitForSecrets": True, "waitForPath": "/opt/ready",
              "waitForPaths": ["/opt/more"], "dataDir": "/opt/data", "extraDirs": ["/opt/x"],
-             "preStart": "prep"}
+             "preStart": "prep"},
+            secrets_dir=os.path.join(self.tmp, "secrets"),
         )["ProgramArguments"][2]  # fmt: skip
         self.assertEqual(
             script.splitlines(),
@@ -372,7 +373,7 @@ class PlistTest(LaunchdTestBase):
                 f"/bin/mkdir -p {logs}",
                 f"if [ -O {logs} ]; then /bin/chmod 755 {logs}; fi",
                 'echo "Waiting for sops secrets..."',
-                f"while [ ! -e {self.tmp}/.config/sops-nix/secrets ]; do sleep 1; done",
+                f"while [ ! -e {self.tmp}/secrets ]; do sleep 1; done",
                 'echo "Sops secrets available."',
                 "echo 'Waiting for /opt/ready...'",
                 "while [ ! -e /opt/ready ]; do sleep 1; done",
@@ -390,6 +391,30 @@ class PlistTest(LaunchdTestBase):
             self.cfg({"s": {"command": "x", "waitForPath": ["/a"]}})
         )
         self.assertIn("waitForPath must be a string", errors[0])
+
+    def test_daemon_waits_for_the_same_secrets_dir(self):
+        script = self.plist(
+            {"command": "srv", "domain": "system", "waitForSecrets": True},
+            secrets_dir="/state/secrets",
+            sudo=True,
+        )["ProgramArguments"][2]
+        self.assertIn("while [ ! -e /state/secrets ]; do sleep 1; done", script)
+
+    def test_wait_for_secrets_without_sops_secrets_dir_is_an_error(self):
+        raw = self.cfg({"s": {"command": "srv", "waitForSecrets": True}})
+        self.assertIn("  ! s: cannot build plist: waitForSecrets needs sops.secretsDir "
+                      "(no sops section)", self.diff(raw))  # fmt: skip
+        self.assertFalse(self.deploy(raw))
+        why = "no sops secrets are configured"
+        self.assertIn(
+            f"  ! s: cannot build plist: waitForSecrets needs sops.secretsDir ({why})",
+            launchd.diff_launchd(raw, self.state, self.env, secrets_dir_error=why),
+        )
+        self.assertTrue(
+            launchd.install_launchd(raw, self.state, self.env, secrets_dir="/state/secrets")
+        )
+        with open(self.agent_path("s"), "rb") as f:
+            self.assertIn("while [ ! -e /state/secrets ]", plistlib.load(f)["ProgramArguments"][2])
 
     def test_extra_service_config_user_owns_daemon_logs_like_nix(self):
         svc = {"command": "x", "domain": "system", "extraServiceConfig": {"UserName": "_dns"}}
@@ -1752,11 +1777,12 @@ class ParityReviewTest(LaunchdTestBase):
         env = launchd.Env(uid=UID, home="/Users/someone", bash="/bin/bash")
         svc = launchd.Service(name="web", label="org.example.web", command="srv",
                               wait_for_secrets=True)  # fmt: skip
-        pl = launchd.desired_plist(svc, launchd.Settings(), env)
+        settings = launchd.Settings(secrets_dir="/Users/someone/.local/state/tools/secrets")
+        pl = launchd.desired_plist(svc, settings, env)
         self.assertEqual(pl["StandardOutPath"], "/tmp/agents/log/launchd/web.log")
         self.assertEqual(pl["StandardErrorPath"], "/tmp/agents/log/launchd/web.error.log")
         script = pl["ProgramArguments"][2]
-        self.assertIn("while [ ! -e /Users/someone/.config/sops-nix/secrets ]", script)
+        self.assertIn("while [ ! -e /Users/someone/.local/state/tools/secrets ]", script)
         self.assertIn("if [ -O /tmp/agents/log/launchd ]; then /bin/chmod 755", script)
 
     def test_user_and_extra_user_name_conflict(self):

@@ -124,6 +124,24 @@ class Parsed:
         return self.settings.secrets_dir, None
 
 
+def secrets_dir_kwargs(raw) -> Dict[str, Optional[str]]:
+    """``secrets_dir``/``secrets_dir_error`` for sections that wait on or read
+    secretsDir: None when the section is invalid or no secret lives inside it,
+    since tools then never creates it."""
+    parsed = parse_sops(raw)
+    secrets_dir, why = parsed.secrets_dir()
+    if secrets_dir and not parsed.secrets:
+        secrets_dir, why = None, "no sops secrets are configured"
+    elif secrets_dir and not any(
+        fsutil.is_within(
+            fsutil.canonical_real(os.path.dirname(s.path)), fsutil.canonical_real(secrets_dir)
+        )
+        for s in parsed.secrets
+    ):
+        secrets_dir, why = None, f"no sops secret has its path inside {secrets_dir}"
+    return {"secrets_dir": secrets_dir, "secrets_dir_error": why}
+
+
 def _expand(path: str) -> str:
     return os.path.normpath(os.path.expanduser(str(path)))
 
@@ -191,6 +209,10 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
             age_ssh_key_files=ssh_keys,
             secrets_dir=_path_field(raw, "secretsDir", "sops") or _expand(DEFAULT_SECRETS_DIR),
         )
+        if not os.path.isabs(settings.secrets_dir):
+            raise ValueError(
+                f"sops.secretsDir must be an absolute path, got {settings.secrets_dir!r}"
+            )
         default_file = _path_field(raw, "defaultSopsFile", "sops")
     except ValueError as e:
         # Without valid settings no secret can be placed or decrypted safely.

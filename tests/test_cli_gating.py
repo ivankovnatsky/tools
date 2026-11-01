@@ -11,13 +11,13 @@ class DeployGatingTest(unittest.TestCase):
     them with nothing configured raised KeyError on a machine whose diff
     reported clean. Every section must be skippable the same way."""
 
-    def _deploy(self, config, state):
+    def _deploy(self, config, state, scope=()):
         with (
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
         ):
-            return cli._deploy(config, "/tmp")
+            return cli._deploy(config, "/tmp", scope)
 
     def test_empty_config_does_not_crash(self):
         # No paths at all: the pre-fix code raised KeyError: 'bun'.
@@ -70,6 +70,65 @@ class DeployGatingTest(unittest.TestCase):
             self._deploy({}, state)
 
         curl.assert_called_once()
+
+    def test_launchd_and_services_get_sops_secrets_dir(self):
+        config = {
+            "sops": {
+                "secretsDir": "/state/secrets",
+                "secrets": {"t": {"key": "a", "sopsFile": "/f"}},
+            },
+            "launchd": {"services": {"s": {"command": "x"}}},
+            "services": {"nextdns": {}},
+        }
+        with (
+            mock.patch.object(cli, "install_launchd", return_value=True) as ld,
+            mock.patch.object(cli, "install_services", return_value=True) as svc,
+        ):
+            self._deploy(config, {}, ("launchd", "services"))
+
+        for call in (ld, svc):
+            self.assertEqual(call.call_args.kwargs["secrets_dir"], "/state/secrets")
+
+    def test_invalid_sops_reaches_launchd_and_services_as_none(self):
+        config = {
+            "sops": {"secretsDir": "rel", "secrets": {"t": {"key": "a", "sopsFile": "/f"}}},
+            "launchd": {"services": {"s": {"command": "x"}}},
+            "services": {"nextdns": {}},
+        }
+        with (
+            mock.patch.object(cli, "install_launchd", return_value=True) as ld,
+            mock.patch.object(cli, "install_services", return_value=True) as svc,
+        ):
+            self._deploy(config, {}, ("launchd", "services"))
+
+        for call in (ld, svc):
+            self.assertIsNone(call.call_args.kwargs["secrets_dir"])
+            self.assertIn("absolute path", call.call_args.kwargs["secrets_dir_error"])
+
+    def test_show_diff_passes_secrets_dir(self):
+        import tempfile
+
+        from tools import diff
+
+        sops_raw = {
+            "secretsDir": "/state/secrets",
+            "secrets": {"t": {"key": "a", "sopsFile": "/f"}},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            config = {
+                "stateFile": f"{d}/state.json",
+                "sops": sops_raw,
+                "launchd": {"services": {"s": {"command": "x"}}},
+                "services": {"nextdns": {}},
+            }
+            with (
+                mock.patch.object(diff, "diff_launchd", return_value=[]) as ld,
+                mock.patch.object(diff, "diff_services", return_value=[]) as svc,
+            ):
+                diff.show_diff(config, d, ("launchd", "services"))
+
+        for call in (ld, svc):
+            self.assertEqual(call.call_args.kwargs["secrets_dir"], "/state/secrets")
 
     def test_section_failure_propagates(self):
         state = {"gitRepos": {"installed": ["~/repo"]}}

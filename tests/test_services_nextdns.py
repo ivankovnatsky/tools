@@ -232,7 +232,7 @@ class NextDnsTest(unittest.TestCase):
         from tools.services import nextdns
 
         spec = nextdns.parse(
-            {"profiles": {"p": {"profileFile": "nd/p.json", "apiKeyFile": "/k"}}}, "/cfg"
+            {"profiles": {"p": {"profileFile": "nd/p.json", "apiKeyFile": "/k"}}}, "/cfg", "/s"
         )
         self.assertEqual(spec.profiles[0].profile_file, "/cfg/nd/p.json")
 
@@ -347,15 +347,42 @@ class NextDnsTest(unittest.TestCase):
         self.assertTrue(ok, rows)
         self.assertEqual(len(self.h.server.made("GET", "/profiles")), 1)
 
-    def test_profile_id_dir_defaults_to_sops_nix_path(self):
-        import os
-
+    def test_profile_id_dir_defaults_to_sops_secrets_dir(self):
         from tools.services import nextdns
 
-        spec = nextdns.parse({"profiles": {"p": {"profileFile": "/p.json", "apiKeyFile": "/k"}}})
-        self.assertEqual(
-            spec.profiles[0].profile_id_dir, os.path.expanduser("~/.config/sops-nix/secrets")
-        )
+        raw = {"profiles": {"p": {"profileFile": "/p.json", "apiKeyFile": "/k"}}}
+        spec = nextdns.parse(raw, None, "/state/secrets")
+        self.assertEqual(spec.profiles[0].profile_id_dir, "/state/secrets")
+
+    def test_default_profile_id_dir_is_read_from_secrets_dir(self):
+        self.h.files["/sec/nextdns-profile-home"] = "abc123\n"
+        self.h.server.on("GET", "/profiles/abc123", remote())
+        rows, ok, _ = self.h.run(cfg(profileIdFile=None), secrets_dir="/sec")
+        self.assertTrue(ok, rows)
+        self.assertEqual(self.h.server.made("GET", "/profiles"), [])
+
+    def test_invalid_sops_fails_the_profile_through_run_services(self):
+        from tools.user import sops
+
+        secrets = sops.secrets_dir_kwargs({"secretsDir": "rel"})
+        rows, ok, _ = self.h.run(cfg(profileIdFile=None), **secrets)
+        self.assertFalse(ok)
+        self.assertTrue(any("must be an absolute path" in r for r in rows), rows)
+        self.assertEqual(self.h.server.calls, [])
+
+    def test_default_profile_id_dir_needs_valid_sops(self):
+        from tools.services import nextdns
+        from tools.services.http import InvalidSpec
+
+        raw = {"profiles": {"p": {"profileFile": "/p.json", "apiKeyFile": "/k"}}}
+        with self.assertRaisesRegex(InvalidSpec, r"sops.secretsDir \(no sops section\)"):
+            nextdns.parse(raw)
+        with self.assertRaisesRegex(InvalidSpec, r"sops.secretsDir \(bad sops\)"):
+            nextdns.parse(raw, None, None, "bad sops")
+        explicit = [{"profileIdFile": "/id"}, {"profileIdDir": None}, {"profileIdDir": "/ids"}]
+        for extra in explicit:
+            p = {**raw["profiles"]["p"], **extra}
+            nextdns.parse({"profiles": {"p": p}})
 
     def test_2xx_with_errors_is_a_failed_add_and_keeps_stale(self):
         self.h.server.on("GET", "/profiles/abc123", remote(denylist=[{"id": "old.example.com"}]))

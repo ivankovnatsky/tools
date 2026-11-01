@@ -76,11 +76,15 @@ def run_services(
     base_dir: Optional[str] = None,
     context_factory: Optional[Callable[..., Context]] = None,
     fingerprint_key: Optional[bytes] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, List[str]]], bool]:
     """Plan (apply=False) or apply every configured service.
 
     Returns per-service change rows and overall success. One service failing
-    (unreachable, auth, bad spec) never stops the others.
+    (unreachable, auth, bad spec) never stops the others. ``secrets_dir`` is
+    the sops section's ``secretsDir``; None, with ``secrets_dir_error`` saying
+    why, when that section is invalid or has no secrets.
     """
     make = context_factory or Context
     results: List[Tuple[str, List[str]]] = []
@@ -99,7 +103,10 @@ def run_services(
         section_state = state.setdefault(name, {})
         ctx = make(name, apply=apply, state=section_state, fingerprint_key=fingerprint_key)
         try:
-            spec = module.parse(config[name], base_dir)
+            if module is nextdns:
+                spec = module.parse(config[name], base_dir, secrets_dir, secrets_dir_error)
+            else:
+                spec = module.parse(config[name], base_dir)
             module.reconcile(spec, ctx)
         except ServiceError as e:
             ctx.fail(str(e))
@@ -113,7 +120,12 @@ def run_services(
 
 
 def diff_services(
-    config: Dict, config_dir: str, state: Dict, key_file: Optional[str] = None
+    config: Dict,
+    config_dir: str,
+    state: Dict,
+    key_file: Optional[str] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
 ) -> List[Tuple[str, List[str]]]:
     scratch = copy.deepcopy(state.get("services", {}))
     # diff never creates the key: without one every masked secret reads as changed.
@@ -122,7 +134,13 @@ def diff_services(
     except KeyFileError as e:
         return [("services", [f"    ! {e}"])]
     results, _ = run_services(
-        config, scratch, apply=False, base_dir=config_dir, fingerprint_key=key
+        config,
+        scratch,
+        apply=False,
+        base_dir=config_dir,
+        fingerprint_key=key,
+        secrets_dir=secrets_dir,
+        secrets_dir_error=secrets_dir_error,
     )
     out = [(name, [f"  {row}" for row in rows]) for name, rows in results]
     mode = loose_mode(key_file) if key and key_file else None
@@ -133,7 +151,12 @@ def diff_services(
 
 
 def install_services(
-    config: Dict, config_dir: str, state: Dict, key_file: Optional[str] = None
+    config: Dict,
+    config_dir: str,
+    state: Dict,
+    key_file: Optional[str] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
 ) -> bool:
     try:
         key = load_key(key_file, create=True) if key_file else None
@@ -147,6 +170,8 @@ def install_services(
         apply=True,
         base_dir=config_dir,
         fingerprint_key=key,
+        secrets_dir=secrets_dir,
+        secrets_dir_error=secrets_dir_error,
     )
     if not ok:
         log("services: one or more services failed (see ! rows above)", Color.RED)

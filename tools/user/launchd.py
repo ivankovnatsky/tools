@@ -144,7 +144,7 @@ class Service:
     extra_dirs: List[ExtraDir] = field(default_factory=list)
     pre_start: str = ""
     wait_for_paths: List[str] = field(default_factory=list)
-    wait_for_secrets: bool = False  # nix-config `waitForSecrets`: block until /run/secrets
+    wait_for_secrets: bool = False  # block until Settings.secrets_dir exists
     keep_alive: Any = True  # bool or plist dict
     run_at_load: bool = True
     start_interval: Optional[int] = None
@@ -169,6 +169,8 @@ class Settings:
     sudo: bool = False
     log_dir: Optional[str] = None
     bash: Optional[str] = None  # overrides Env.bash
+    secrets_dir: Optional[str] = None  # sops.secretsDir, for waitForSecrets
+    secrets_dir_error: Optional[str] = None  # why secrets_dir is None
     errors: List[str] = field(default_factory=list)  # section-level: hold every change
 
 
@@ -183,8 +185,6 @@ def _login_user() -> Tuple[int, str]:
 
 DEFAULT_LOG_DIR = "/tmp/log/launchd"
 DEFAULT_AGENT_LOG_DIR = "/tmp/agents/log/launchd"
-SECRETS_DIR = "/run/secrets"
-AGENT_SECRETS_DIR = ".config/sops-nix/secrets"  # under the user's home, as home-manager sops-nix
 
 
 @dataclass
@@ -647,12 +647,19 @@ def _parse_service(
 
 
 def parse_launchd(
-    raw, home: Optional[str] = None, login: Optional[str] = None
+    raw,
+    home: Optional[str] = None,
+    login: Optional[str] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
 ) -> Tuple[Settings, List[Service], List[str]]:
     """Validate a plain `launchd:` mapping. Returns (settings, services, errors).
 
     `home` is the login user's home for `~` (see `Env.home`); `login` is the login
     user name (default: from the uid), which daemons running as anyone else are checked against.
+    `secrets_dir` is the sops section's `secretsDir` that `waitForSecrets` waits on
+    (agents and daemons alike); None, with `secrets_dir_error` saying why, when
+    the sops section is invalid or has no secrets.
     """
     if raw is None:
         raw = {}
@@ -662,10 +669,11 @@ def parse_launchd(
         except KeyError:
             login = None
     errors: List[str] = []
+    sops = {"secrets_dir": secrets_dir, "secrets_dir_error": secrets_dir_error}
     if not isinstance(raw, dict):
         msg = f"launchd must be a mapping, got {type(raw).__name__}"
-        return Settings(errors=[msg]), [], [msg]
-    settings = Settings(errors=errors)
+        return Settings(errors=[msg], **sops), [], [msg]
+    settings = Settings(errors=errors, **sops)
     unknown = set(raw) - _SECTION_KEYS
     if unknown:
         errors.append(f"unknown keys {sorted(unknown)}")
@@ -725,7 +733,7 @@ def volume_of(path: str, volumes_root: str) -> Optional[str]:
     return os.path.join(volumes_root, rel.split(os.sep, 1)[0])
 
 
-def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: str = SECRETS_DIR) -> str:
+def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: Optional[str] = None) -> str:
     """The inline starter body, structured like nix-config's local.launchd starter."""
     lines = ["set -e", 'export PATH="/bin:/usr/bin:$PATH"']
     if log_dir:
@@ -737,6 +745,8 @@ def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: str = SECR
         else:
             lines.append(f"/bin/chmod 755 {q} || true")
     if svc.wait_for_secrets:
+        if not secrets_dir:
+            raise ValueError("waitForSecrets needs sops.secretsDir")
         q = shlex.quote(secrets_dir)
         lines += [
             'echo "Waiting for sops secrets..."',
@@ -931,10 +941,10 @@ def _open_regular(path: str, flags: int, mode: int = 0o644) -> int:
 
 
 def desired_plist(svc: Service, settings: Settings, env: Env) -> Dict[str, Any]:
-    secrets_dir = (
-        SECRETS_DIR if svc.domain == "system" else os.path.join(env.home, AGENT_SECRETS_DIR)
-    )
-    script = _script(svc, wrapper_log_dir(svc, settings, env), secrets_dir)
+    if svc.wait_for_secrets and not settings.secrets_dir:
+        why = settings.secrets_dir_error or "no sops section"
+        raise ValueError(f"waitForSecrets needs sops.secretsDir ({why})")
+    script = _script(svc, wrapper_log_dir(svc, settings, env), settings.secrets_dir)
     # Inline via `bash -c`: launchd children get EPERM opening scripts on external volumes.
     bash = settings.bash or env.bash
     if svc.domain == "system" and settings.bash:
@@ -2002,7 +2012,13 @@ def _with_sudo(env: Env, settings: Settings) -> Env:
     return env
 
 
-def install_launchd(raw, state: Dict, env: Optional[Env] = None) -> bool:
+def install_launchd(
+    raw,
+    state: Dict,
+    env: Optional[Env] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
+) -> bool:
     env = env or Env()
     if not env.is_darwin:
         log("launchd: skipping, not macOS", Color.YELLOW)
@@ -2015,7 +2031,9 @@ def install_launchd(raw, state: Dict, env: Optional[Env] = None) -> bool:
     if bad_state:
         log(f"launchd: {bad_state}; nothing done", Color.RED)
         return False
-    settings, services, errors = parse_launchd(raw, env.home, env.login)
+    settings, services, errors = parse_launchd(
+        raw, env.home, env.login, secrets_dir, secrets_dir_error
+    )
     env = _with_sudo(env, settings)
     p = plan(settings, services, state, env, errors)
     ok = apply(settings, p, state, env)
@@ -2034,14 +2052,22 @@ def _plist_diff(item: Item) -> List[str]:
     return [text] if text else []
 
 
-def diff_launchd(raw, state: Dict, env: Optional[Env] = None) -> List[str]:
+def diff_launchd(
+    raw,
+    state: Dict,
+    env: Optional[Env] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
+) -> List[str]:
     env = env or Env()
     if not env.is_darwin:
         return []
     refusal = root_refusal(env) or state_error(state)
     if refusal:
         return [f"  ! {refusal}"]
-    settings, services, errors = parse_launchd(raw, env.home, env.login)
+    settings, services, errors = parse_launchd(
+        raw, env.home, env.login, secrets_dir, secrets_dir_error
+    )
     env = _with_sudo(env, settings)
     p = plan(settings, services, state, env, errors)
 
