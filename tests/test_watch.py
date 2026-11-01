@@ -1,0 +1,361 @@
+import io
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
+from click.testing import CliRunner
+
+from tools import cli, watch
+
+
+class FakeTime:
+    def __init__(self):
+        self.now = 0.0
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def run_loop(scans, *, debounce=3.0, poll=1.0, run=None, initial_run=False):
+    """Drive watch_loop over a scripted list of snapshots; returns run() calls."""
+    calls = []
+    t = FakeTime()
+    it = iter(scans)
+    last = {"value": None}
+    exhausted = {"value": False}
+
+    def scan():
+        try:
+            last["value"] = next(it)
+        except StopIteration:
+            exhausted["value"] = True
+        return last["value"]
+
+    def record(files):
+        calls.append((t.now, files))
+        if run:
+            run(files)
+
+    with redirect_stdout(io.StringIO()):
+        watch.watch_loop(
+            scan,
+            record,
+            poll=poll,
+            debounce=debounce,
+            clock=t.clock,
+            sleep=t.sleep,
+            should_stop=lambda: exhausted["value"],
+            initial_run=initial_run,
+        )
+    return calls
+
+
+class ChangedPathsTest(unittest.TestCase):
+    def test_added_removed_modified(self):
+        old = {"a": (1, 1), "b": (1, 1), "c": (1, 1)}
+        new = {"a": (1, 1), "b": (2, 1), "d": (1, 1)}
+        self.assertEqual(watch.changed_paths(old, new), ["b", "c", "d"])
+
+    def test_identical(self):
+        self.assertEqual(watch.changed_paths({"a": (1, 1)}, {"a": (1, 1)}), [])
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_walks_dirs_skips_git_and_accepts_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            os.makedirs(os.path.join(d, "cfg", "machines"))
+            os.makedirs(os.path.join(d, "cfg", ".git"))
+            for rel in ("cfg/a.yaml", "cfg/machines/host.yaml", "cfg/.git/HEAD", "extra.yaml"):
+                with open(os.path.join(d, rel), "w") as f:
+                    f.write("x")
+            snap = watch.snapshot([os.path.join(d, "cfg"), os.path.join(d, "extra.yaml")])
+            names = sorted(os.path.relpath(p, d) for p in snap)
+        self.assertEqual(names, ["cfg/a.yaml", "cfg/machines/host.yaml", "extra.yaml"])
+
+    def test_skips_hidden_files_and_dirs(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".hidden"))
+            for rel in ("a.yaml", ".a.yaml.swp", ".#a.yaml", ".DS_Store", ".hidden/x.yaml"):
+                with open(os.path.join(d, rel), "w") as f:
+                    f.write("x")
+            snap = watch.snapshot([d])
+            names = sorted(os.path.basename(p) for p in snap)
+        self.assertEqual(names, ["a.yaml"])
+
+    def test_is_excluded_matches_path_and_dot_suffixed_siblings(self):
+        exclude = {"/s/state.json"}
+        self.assertTrue(watch.is_excluded("/s/state.json", exclude))
+        self.assertTrue(watch.is_excluded("/s/state.json.tmp", exclude))
+        self.assertFalse(watch.is_excluded("/s/state.jsonx", exclude))
+
+    def test_follows_symlinked_dirs_and_survives_loops(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            os.makedirs(os.path.join(d, "real"))
+            os.makedirs(os.path.join(d, "cfg"))
+            with open(os.path.join(d, "real", "host.yaml"), "w") as f:
+                f.write("x")
+            os.symlink(os.path.join(d, "real"), os.path.join(d, "cfg", "machines"))
+            os.symlink(os.path.join(d, "cfg"), os.path.join(d, "cfg", "loop"))
+            snap = watch.snapshot([os.path.join(d, "cfg")])
+            names = sorted(os.path.relpath(p, d) for p in snap)
+        self.assertEqual(names, ["cfg/machines/host.yaml"])
+
+    def test_repointed_symlink_with_same_size_and_mtime_is_a_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            for name in ("one", "two"):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("x")
+                os.utime(os.path.join(d, name), ns=(1_000_000_000, 1_000_000_000))
+            os.makedirs(os.path.join(d, "cfg"))
+            link = os.path.join(d, "cfg", "a.yaml")
+            os.symlink(os.path.join(d, "one"), link)
+            before = watch.snapshot([os.path.join(d, "cfg")])
+            os.remove(link)
+            os.symlink(os.path.join(d, "two"), link)
+            after = watch.snapshot([os.path.join(d, "cfg")])
+        self.assertEqual(watch.changed_paths(before, after), [link])
+
+    def test_mode_change_is_a_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            path = os.path.join(d, "run.sh")
+            with open(path, "w") as f:
+                f.write("x")
+            os.chmod(path, 0o644)
+            before = watch.snapshot([d])
+            os.chmod(path, 0o755)
+            os.utime(path, ns=(before[path][1], before[path][1]))
+            after = watch.snapshot([d])
+        self.assertEqual(watch.changed_paths(before, after), [path])
+
+    def test_dangling_symlink_is_recorded_and_repointing_it_is_a_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            link = os.path.join(d, "a.yaml")
+            os.symlink(os.path.join(d, "missing-one"), link)
+            before = watch.snapshot([d])
+            os.remove(link)
+            os.symlink(os.path.join(d, "missing-two"), link)
+            after = watch.snapshot([d])
+        self.assertIn(link, before)
+        self.assertEqual(watch.changed_paths(before, after), [link])
+
+    def test_missing_path_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            self.assertEqual(watch.snapshot([os.path.join(d, "nope")]), {})
+
+
+class WatchLoopTest(unittest.TestCase):
+    A = {"f": (1, 1)}
+    B = {"f": (2, 1)}
+    C = {"f": (3, 1)}
+
+    def test_no_changes_never_runs(self):
+        self.assertEqual(run_loop([self.A] * 10), [])
+
+    def test_runs_once_after_debounce(self):
+        calls = run_loop([self.A, self.B] + [self.B] * 6, debounce=3.0)
+        self.assertEqual(calls, [(4.0, ["f"])])
+
+    def test_burst_is_coalesced_and_extends_deadline(self):
+        # Changes at t=1 and t=2: one run, 3s after the last change.
+        calls = run_loop([self.A, self.B, self.C] + [self.C] * 6, debounce=3.0)
+        self.assertEqual(calls, [(5.0, ["f"])])
+
+    def test_collects_every_changed_file(self):
+        scans = [{}, {"a": (1, 1)}, {"a": (1, 1), "b": (1, 1)}] + [{"a": (1, 1), "b": (1, 1)}] * 5
+        calls = run_loop(scans, debounce=2.0)
+        self.assertEqual([files for _, files in calls], [["a", "b"]])
+
+    def test_change_during_run_triggers_follow_up(self):
+        scans = [self.A, self.B] + [self.B] * 3 + [self.C] * 5
+        calls = run_loop(scans, debounce=2.0)
+        self.assertEqual(len(calls), 2)
+
+    def test_initial_run_happens_after_baseline(self):
+        # The file changes while the initial run is in progress (before the
+        # first poll): the baseline predates it, so a follow-up run happens.
+        scans = [self.A] + [self.B] * 5
+        calls = run_loop(scans, debounce=2.0, initial_run=True)
+        self.assertEqual([files for _, files in calls], [[], ["f"]])
+
+    def test_ignored_changes_never_run(self):
+        scans = [{"s": (1, 1)}] + [{"s": (2, 1)}] * 5
+        calls = []
+        with redirect_stdout(io.StringIO()):
+            t = FakeTime()
+            it = iter(scans)
+            watch.watch_loop(
+                lambda: next(it, scans[-1]),
+                calls.append,
+                poll=1.0,
+                debounce=1.0,
+                clock=t.clock,
+                sleep=t.sleep,
+                should_stop=lambda: t.now > 8,
+                initial_run=False,
+                ignore=lambda p: p == "s",
+            )
+        self.assertEqual(calls, [])
+
+    def test_run_failure_keeps_watching(self):
+        def boom(files):
+            raise RuntimeError("deploy blew up")
+
+        scans = [self.A, self.B] + [self.B] * 3 + [self.C] * 5
+        calls = run_loop(scans, debounce=2.0, run=boom)
+        self.assertEqual(len(calls), 2)
+
+
+class WatchRunTest(unittest.TestCase):
+    def _run(self, approve, *, deploy=True, diff=True, load=None):
+        load = load or mock.Mock(return_value={})
+        with (
+            mock.patch.object(cli, "_load_merged_config", load),
+            mock.patch.object(cli, "_deploy", return_value=deploy) as deploy_mock,
+            mock.patch.object(cli, "show_diff", return_value=diff) as diff_mock,
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            cli._watch_run(["/cfg"], ("brew",), approve, ["/cfg/a.yaml"])
+        return deploy_mock, diff_mock, out.getvalue()
+
+    def test_approve_deploys_without_prompt(self):
+        deploy_mock, diff_mock, out = self._run(True)
+        deploy_mock.assert_called_once_with({}, "/", ("brew",))
+        diff_mock.assert_not_called()
+        self.assertIn("Deploy successful", out)
+
+    def test_without_approve_only_diffs(self):
+        deploy_mock, diff_mock, out = self._run(False, diff=False)
+        deploy_mock.assert_not_called()
+        diff_mock.assert_called_once()
+        self.assertIn("not deploying without --approve", out)
+
+    def test_failed_deploy_is_reported(self):
+        _, _, out = self._run(True, deploy=False)
+        self.assertIn("Deploy failed", out)
+
+    def test_config_error_does_not_exit(self):
+        deploy_mock, _, out = self._run(True, load=mock.Mock(side_effect=SystemExit(1)))
+        deploy_mock.assert_not_called()
+        self.assertIn("Config failed to load", out)
+
+
+class TmuxTargetTest(unittest.TestCase):
+    def test_window_is_matched_exactly(self):
+        self.assertEqual(watch.tmux_target("mini"), "=mini:=tools-watch")
+
+
+class WatchCommandTest(unittest.TestCase):
+    def test_config_is_required(self):
+        result = CliRunner().invoke(cli.main, ["watch", "--approve"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--config", result.output)
+
+    def test_tmux_validates_paths_first(self):
+        with mock.patch.object(cli, "run_in_tmux") as tmux:
+            result = CliRunner().invoke(
+                cli.main, ["watch", "--config", "/nonexistent/tools-cfg", "--tmux"]
+            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("does not exist", result.output)
+        tmux.assert_not_called()
+
+    def test_missing_config_path_exits(self):
+        result = CliRunner().invoke(cli.main, ["watch", "--config", "/nonexistent/tools-cfg"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("does not exist", result.output)
+
+    def _watch(self, d, deploy=None, polls=8):
+        """Run `tools watch --approve` on `d` with a fake clock for `polls` polls."""
+        t = FakeTime()
+        real_loop = cli.watch_loop
+
+        def loop(scan, run, **kwargs):
+            kwargs.update(clock=t.clock, sleep=t.sleep, should_stop=lambda: t.now >= polls)
+            real_loop(scan, run, **kwargs)
+
+        with (
+            mock.patch.object(cli, "watch_loop", side_effect=loop),
+            mock.patch.object(cli, "_deploy", side_effect=deploy or (lambda *a: True)) as dep,
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["watch", "--config", d, "--approve", "--debounce", "1"]
+            )
+        return result, dep
+
+    def _state_config(self, d):
+        os.makedirs(os.path.join(d, "state"))
+        state = os.path.join(d, "state", "state.json")
+        with open(os.path.join(d, "config.yaml"), "w") as f:
+            f.write(f"stateFile: {state}\n")
+        return state
+
+    def test_state_writes_under_watched_dir_do_not_retrigger(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            state = self._state_config(d)
+
+            def deploy(*_):
+                for path in (state, state + ".tmp", os.path.join(d, "state", "services.key")):
+                    with open(path, "a") as f:
+                        f.write("x")
+                return True
+
+            result, dep = self._watch(d, deploy)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(dep.call_count, 1, result.output)
+
+    def test_config_edit_during_run_still_retriggers(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            state = self._state_config(d)
+            edits = []
+
+            def deploy(*_):
+                with open(state, "a") as f:
+                    f.write("x")
+                if not edits:
+                    edits.append(1)
+                    with open(os.path.join(d, "extra.yaml"), "w") as f:
+                        f.write("a: 1\n")
+                return True
+
+            result, dep = self._watch(d, deploy)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(dep.call_count, 2, result.output)
+
+    def test_malformed_yaml_keeps_watching(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            with open(os.path.join(d, "config.yaml"), "w") as f:
+                f.write("a: [\n")
+            result, dep = self._watch(d)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIsNone(result.exception)
+        self.assertIn("Config failed to load", result.output)
+        dep.assert_not_called()
+
+    def test_watch_run_refreshes_exclusions(self):
+        excluded = {"/old"}
+        with (
+            mock.patch.object(cli, "_load_merged_config", return_value={"stateFile": "/s/st.json"}),
+            mock.patch.object(cli, "show_diff", return_value=True),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._watch_run(["/cfg"], (), False, [], excluded)
+        self.assertNotIn("/old", excluded)
+        self.assertIn(os.path.realpath("/s/st.json"), excluded)
+
+
+if __name__ == "__main__":
+    unittest.main()

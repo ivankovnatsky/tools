@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import click
 
@@ -35,6 +36,7 @@ from tools.user.pi import install_pi_packages
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
 from tools.user.uv import install_uv_packages
+from tools.watch import is_excluded, log_files, run_in_tmux, snapshot, watch_loop, wlog
 
 
 def _resolve_config_dir(config_paths: list[str]) -> str:
@@ -388,6 +390,115 @@ def status(config):
             f"  {domain}/{label}: {st.state or 'loaded'} pid={pid} last exit={st.last_exit or '-'}",
             color,
         )
+
+
+def _written_paths(config: dict) -> set[str]:
+    """Paths every deploy rewrites, which a watch must not react to."""
+    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
+    state_file = os.path.realpath(state_file)
+    return {state_file, os.path.realpath(services_key_path(state_file))}
+
+
+def _watch_run(
+    config_paths: list[str],
+    scope: tuple[str, ...],
+    approve: bool,
+    files,
+    excluded: set | None = None,
+) -> None:
+    action = "deploy" if approve else "diff"
+    wlog("=" * 60)
+    if files:
+        wlog(f"Running {action} after {len(files)} file change(s):")
+        log_files(files)
+    else:
+        wlog(f"Running initial {action} on startup")
+    wlog("=" * 60)
+    started = time.monotonic()
+    try:
+        merged = _load_merged_config(config_paths)
+    except SystemExit:
+        wlog("Config failed to load; still watching", Color.RED)
+        return
+    except Exception as exc:
+        wlog(f"Config failed to load: {exc}; still watching", Color.RED)
+        return
+    if excluded is not None:
+        excluded.clear()
+        excluded.update(_written_paths(merged))
+    config_dir = _resolve_config_dir(config_paths)
+    if approve:
+        ok = _deploy(merged, config_dir, scope)
+    else:
+        ok = show_diff(merged, config_dir, scope)
+    elapsed = f"{time.monotonic() - started:.1f}s"
+    if approve and ok:
+        wlog(f"Deploy successful ({elapsed})", Color.GREEN)
+    elif approve:
+        wlog(f"Deploy failed ({elapsed}); still watching", Color.RED)
+    elif ok:
+        wlog(f"No changes pending ({elapsed})", Color.GREEN)
+    else:
+        wlog("Changes pending; not deploying without --approve", Color.YELLOW)
+
+
+@main.command()
+@click.option(
+    "--config", multiple=True, required=True, help="Config file or directory to watch (repeatable)."
+)
+@click.option(
+    "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
+)
+@click.option(
+    "--approve",
+    is_flag=True,
+    help="Deploy on every change without prompting. Without it, only the diff is shown.",
+)
+@click.option(
+    "--debounce",
+    type=click.FloatRange(min=0),
+    default=5.0,
+    show_default=True,
+    help="Seconds to wait after the last change before running.",
+)
+@click.option(
+    "--poll",
+    type=click.FloatRange(min=0.1),
+    default=1.0,
+    show_default=True,
+    help="Seconds between scans of the config paths.",
+)
+@click.option("--tmux", is_flag=True, help="Run in tmux: session <hostname>, window tools-watch.")
+def watch(config, scope, approve, debounce, poll, tmux):
+    """Watch the config paths and redeploy when they change."""
+    config_paths = list(config)
+    missing = [p for p in config_paths if not os.path.exists(p)]
+    if missing:
+        wlog(f"Config path does not exist: {', '.join(missing)}", Color.RED)
+        sys.exit(1)
+    if tmux:
+        run_in_tmux([a for a in sys.argv[1:] if a != "--tmux"])
+        return
+
+    mode = "deploy (--approve)" if approve else "diff only; pass --approve to deploy"
+    wlog(f"Watching {', '.join(os.path.abspath(p) for p in config_paths)}")
+    wlog(f"Mode: {mode}; debounce {debounce:g}s, poll {poll:g}s")
+
+    excluded = _written_paths({})
+
+    def run(files):
+        _watch_run(config_paths, scope, approve, files, excluded)
+
+    try:
+        watch_loop(
+            lambda: snapshot(config_paths),
+            run,
+            poll=poll,
+            debounce=debounce,
+            ignore=lambda path: is_excluded(os.path.realpath(path), excluded),
+        )
+    except KeyboardInterrupt:
+        wlog("Received interrupt, stopping...")
 
 
 @main.command()

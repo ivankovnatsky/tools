@@ -10,6 +10,7 @@ reconciled from a YAML/JSON/TOML config against a local state file.
 ```console
 tools diff   [--config PATH]... [--scope SECTION]...   # dry-run preview
 tools deploy [--config PATH]... [--scope SECTION]... [--approve]
+tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
 ```
 
 - `tools diff` shows what deploy would change and **exits 1 when changes are
@@ -32,6 +33,38 @@ Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
+
+### Watch
+
+```console
+tools watch --config PATH... [--scope SECTION]... [--approve]
+            [--debounce SECONDS] [--poll SECONDS] [--tmux]
+```
+
+- Runs once on startup, then again every time a file under the `--config` paths
+  changes (same `--config`/`--scope` semantics as `deploy`, but `--config` is
+  required: there is no `.` default). Changes are debounced: the run starts
+  `--debounce` seconds (default 5) after the last change. Edits made during a
+  run trigger a follow-up run.
+- **Without `--approve` it only prints the diff**, never prompts and never
+  deploys. With `--approve` every run is `tools deploy --approve`: unattended,
+  no confirmation, removals included.
+- A failed deploy, a config error or a crash is logged and watching continues.
+  Ctrl-C stops it.
+- Change detection polls each file's mode, mtime, size, inode and symlink target
+  (dangling links included) every `--poll` seconds (default 1), following
+  symlinked directories as the config loader does. Every poll re-stats the whole
+  tree; for a large one, raise `--poll`. Inside a watched directory, hidden
+  files and directories (`.git`, editor swap files such as `.x.swp` and `.#x`,
+  `.DS_Store`) are skipped, as the config loader skips them; a hidden `files:`
+  source there does not trigger a run. Only the `--config` paths are watched:
+  `include:` files and `files:` sources outside them are not.
+- The state file and `services.key` next to it (and their `.tmp` siblings) are
+  never watched. Other deploy targets inside a watched directory make each
+  deploy trigger the next; keep them outside.
+- Log lines are prefixed `[tools watch]`. `--tmux` runs it in tmux window
+  `tools-watch` of session `<hostname>` (reused if already running) and switches
+  to it, so it never shares a window with nix-config's `rebuild watch`.
 
 ## Config
 
