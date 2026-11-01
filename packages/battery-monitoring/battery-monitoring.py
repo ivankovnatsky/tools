@@ -189,6 +189,19 @@ def _exp_soc(st):
     return [None if v is None else int(v) for _, v in packs]
 
 
+def _soc_txt(st):
+    """Combined SOC, plus main unit and each expansion pack when packs are attached."""
+    soc = _soc(st)
+    txt = "?" if soc is None else f"{int(soc)}%"
+    packs = _exp_soc(st)
+    if not packs:
+        return txt
+    main = _to_num(st.get("main_battery_soc"))
+    parts = ["main " + ("?" if main is None else f"{int(main)}%")]
+    parts += [f"exp{i} " + ("?" if v is None else f"{v}%") for i, v in enumerate(packs, 1)]
+    return f"{txt} ({', '.join(parts)})"
+
+
 async def _serve(
     host,
     port,
@@ -202,6 +215,7 @@ async def _serve(
     notify_charging,
     notify_discharging,
     state_hold,
+    notify_cooldown,
 ):
     user, password, country = creds
     webhook = _read_webhook(webhook_file)
@@ -228,11 +242,26 @@ async def _serve(
                 "charging": None,
                 "discharging": None,
                 "pending": {},
+                "notified": {},
             }
             for serial, device in found
         }
 
-        def step_notify(d, soc_num):
+        def post(message):
+            # Off the event loop: a slow webhook must not stall sampling or /soc.
+            asyncio.get_running_loop().run_in_executor(None, _notify, webhook, message)
+
+        def cooled(d, kind, now):
+            """True if `kind` may post now; at most one post per kind per cooldown."""
+            last = d["notified"].get(kind)
+            if last is not None and now - last < notify_cooldown:
+                LOG.info("%s: %s suppressed by cooldown", d["name"], kind)
+                return False
+            d["notified"][kind] = now
+            return True
+
+        def step_notify(d, st):
+            soc_num = _soc(st)
             if not notify_step or soc_num is None:
                 return
             cur = int(soc_num) // notify_step
@@ -245,7 +274,7 @@ async def _serve(
                 return
             if notify_on == "charge" and trend != "charging":
                 return
-            _notify(webhook, f"{d['name']} battery {int(soc_num)}% ({trend})")
+            post(f"{d['name']} battery {_soc_txt(st)} ({trend})")
 
         def settle(d, key, value, now):
             """Commit a state change only after it holds for state_hold seconds.
@@ -263,9 +292,9 @@ async def _serve(
             pend = d["pending"].get(key)
             if pend is None or pend[0] != value:
                 d["pending"][key] = (value, now)
-                return value
+                return prev
             if now - pend[1] < state_hold:
-                return value
+                return prev
             del d["pending"][key]
             d[key] = value
             return prev
@@ -275,22 +304,22 @@ async def _serve(
             charging = d["charging"]
             if not notify_charging or prev is None or not charging or prev:
                 return
-            soc_num = _soc(st)
-            soc_txt = "?" if soc_num is None else f"{int(soc_num)}%"
+            if not cooled(d, "charging", now):
+                return
             ac_in = _ac_in_w(st)
             watts = f", {ac_in:g}W in" if ac_in else ""
-            _notify(webhook, f"{d['name']} started charging at {soc_txt}{watts}")
+            post(f"{d['name']} started charging at {_soc_txt(st)}{watts}")
 
         def discharging_notify(d, st, now):
             prev = settle(d, "discharging", _discharging(st), now)
             discharging = d["discharging"]
             if not notify_discharging or prev is None or not discharging or prev:
                 return
-            soc_num = _soc(st)
-            soc_txt = "?" if soc_num is None else f"{int(soc_num)}%"
+            if not cooled(d, "discharging", now):
+                return
             out_w = _out_w(st)
             watts = f", {out_w:g}W out" if out_w else ""
-            _notify(webhook, f"{d['name']} started discharging at {soc_txt}{watts}")
+            post(f"{d['name']} started discharging at {_soc_txt(st)}{watts}")
 
         async def sampler():
             while True:
@@ -301,7 +330,7 @@ async def _serve(
                     if marker is not None and marker != d["marker"]:
                         d["marker"] = marker
                         d["at"] = now
-                        step_notify(d, _soc(st))
+                        step_notify(d, st)
                     if d["marker"] is not None:
                         charging_notify(d, st, now)
                         discharging_notify(d, st, now)
@@ -531,6 +560,13 @@ def cli(verbose):
     show_default=True,
     help="Seconds a charging/discharging change must persist before it is posted.",
 )
+@click.option(
+    "--notify-cooldown",
+    type=int,
+    default=1800,
+    show_default=True,
+    help="Minimum seconds between charging (or discharging) posts per device.",
+)
 @cred_options
 def serve(
     host,
@@ -544,6 +580,7 @@ def serve(
     notify_charging,
     notify_discharging,
     state_hold,
+    notify_cooldown,
     secrets_file,
 ):
     """Read SOC of all account devices over Anker cloud MQTT and expose GET /soc."""
@@ -563,6 +600,7 @@ def serve(
                 notify_charging,
                 notify_discharging,
                 state_hold,
+                notify_cooldown,
             )
         )
     except KeyboardInterrupt:
