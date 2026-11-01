@@ -198,6 +198,7 @@ async def _serve(
     notify_on,
     notify_charging,
     notify_discharging,
+    state_hold,
 ):
     user, password, country = creds
     webhook = _read_webhook(webhook_file)
@@ -223,6 +224,7 @@ async def _serve(
                 "bucket": None,
                 "charging": None,
                 "discharging": None,
+                "pending": {},
             }
             for serial, device in found
         }
@@ -242,10 +244,32 @@ async def _serve(
                 return
             _notify(webhook, f"{d['name']} battery {int(soc_num)}% ({trend})")
 
-        def charging_notify(d, st):
-            charging = _charging(st)
-            prev = d["charging"]
-            d["charging"] = charging
+        def settle(d, key, value, now):
+            """Commit a state change only after it holds for state_hold seconds.
+
+            Returns the previous committed value when a change commits, else the
+            current one, so brief flaps (output dipping to 0W between loads) are
+            not reported as new transitions.
+            """
+            prev = d[key]
+            if prev is None or value == prev:
+                d["pending"].pop(key, None)
+                if prev is None:
+                    d[key] = value
+                return prev
+            pend = d["pending"].get(key)
+            if pend is None or pend[0] != value:
+                d["pending"][key] = (value, now)
+                return value
+            if now - pend[1] < state_hold:
+                return value
+            del d["pending"][key]
+            d[key] = value
+            return prev
+
+        def charging_notify(d, st, now):
+            prev = settle(d, "charging", _charging(st), now)
+            charging = d["charging"]
             if not notify_charging or prev is None or not charging or prev:
                 return
             soc_num = _soc(st)
@@ -254,10 +278,9 @@ async def _serve(
             watts = f", {ac_in:g}W in" if ac_in else ""
             _notify(webhook, f"{d['name']} started charging at {soc_txt}{watts}")
 
-        def discharging_notify(d, st):
-            discharging = _discharging(st)
-            prev = d["discharging"]
-            d["discharging"] = discharging
+        def discharging_notify(d, st, now):
+            prev = settle(d, "discharging", _discharging(st), now)
+            discharging = d["discharging"]
             if not notify_discharging or prev is None or not discharging or prev:
                 return
             soc_num = _soc(st)
@@ -271,12 +294,14 @@ async def _serve(
                 for d in devs.values():
                     st = d["device"].get_status()
                     marker = _marker(st)
+                    now = asyncio.get_running_loop().time()
                     if marker is not None and marker != d["marker"]:
                         d["marker"] = marker
-                        d["at"] = asyncio.get_running_loop().time()
+                        d["at"] = now
                         step_notify(d, _soc(st))
-                        charging_notify(d, st)
-                        discharging_notify(d, st)
+                    if d["marker"] is not None:
+                        charging_notify(d, st, now)
+                        discharging_notify(d, st, now)
                 await asyncio.sleep(5)
 
         def reading(serial):
@@ -495,6 +520,13 @@ def cli(verbose):
     show_default=True,
     help="Post to Discord when a device starts discharging.",
 )
+@click.option(
+    "--state-hold",
+    type=int,
+    default=120,
+    show_default=True,
+    help="Seconds a charging/discharging change must persist before it is posted.",
+)
 @cred_options
 def serve(
     host,
@@ -507,6 +539,7 @@ def serve(
     notify_on,
     notify_charging,
     notify_discharging,
+    state_hold,
     secrets_file,
 ):
     """Read SOC of all account devices over Anker cloud MQTT and expose GET /soc."""
@@ -525,6 +558,7 @@ def serve(
                 notify_on,
                 notify_charging,
                 notify_discharging,
+                state_hold,
             )
         )
     except KeyboardInterrupt:
