@@ -24,6 +24,12 @@ def _uv_entry(pkg_info: Dict) -> Dict:
     return entry
 
 
+def _uv_commit_spec(source: str, commit: str) -> str:
+    """Pin `source` to `commit`: the ref goes before any `#fragment`."""
+    base, sep, fragment = source.partition("#")
+    return f"{base}@{commit}{sep}{fragment}"
+
+
 def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
     desired = set(packages.keys())
 
@@ -91,7 +97,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
             source = get_pkg_source(pkg_info)
             commit = get_pkg_commit(pkg_info)
             if source and commit:
-                spec = f"{source}@{commit}"
+                spec = _uv_commit_spec(source, commit)
             else:
                 spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), source)
             cmd = [f"{paths['uv']}/uv", "tool", "install", spec]
