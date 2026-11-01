@@ -260,6 +260,77 @@ links:
 - A tracked link is repointed or removed only while it still points where
   tools left it, and removals are held while any entry is invalid.
 
+## Brew
+
+macOS only. Keys (anything else is a config error and the whole section is
+skipped):
+
+```yaml
+brew:
+  taps: [user/homebrew-tap] # `user/homebrew-foo` == `user/foo`
+  brews: [jq, user/tap/tool]
+  casks: [kitty]
+  masApps: { Pages: 409201541 } # name: App Store id, needs `mas`
+  environment: { HOMEBREW_NO_ENV_HINTS: "1" }
+  caskArgs: { no_quarantine: true } # adds --no-quarantine to cask installs
+  trust:
+    taps: [user/homebrew-tap] # `brew trust --tap`, Homebrew 6 tap trust
+  onActivation:
+    autoUpdate: false # false: HOMEBREW_NO_AUTO_UPDATE=1; true: unset it
+    cleanup: zap # uninstall | zap; omit for ownership-only removal
+```
+
+Without `cleanup`, brew follows [State and ownership](#state-and-ownership):
+deploy never queries live brew and removes only formulae, casks, taps, App Store
+apps and trusted taps it recorded installing. Trusted taps it adds are untrusted
+when dropped from config.
+
+`onActivation.cleanup` is the explicit opt-in to remove what tools did **not**
+install. On every deploy and diff it reads `brew leaves`, `brew tap`,
+`brew info --json=v2 --installed` and, for configured packages not installed
+yet, `brew deps` plus `brew info --cask` (cask requirements); then it also
+removes:
+
+- formulae in `brew leaves` that are neither in `brews` nor recorded in state
+  (names, full names, aliases and old names all match; `mas` is kept while
+  `masApps` is set or App Store apps are being removed);
+- installed casks neither in `casks` nor recorded in state;
+- dependency-only formulae nothing remaining needs (listed and removed
+  explicitly instead of `brew autoremove`);
+- taps neither in `taps`, `trust.taps` nor recorded in state that no remaining
+  installed package comes from. `homebrew/core`, `homebrew/cask` and
+  `homebrew/bundle` are never untapped (`homebrew/core` not even when dropped
+  from `taps`; it is just forgotten from state).
+
+Nothing a remaining formula or cask, or a pending install, depends on (runtime
+formula deps, cask `depends_on` formulae and casks) is targeted. Removals run
+one package per command with `HOMEBREW_NO_AUTOREMOVE=1`, casks then formulae,
+dependents before their dependencies; taps go last. A refused removal fails the
+deploy but does not block the rest. Without `cleanup`, owned removals stay one
+`brew uninstall` batch followed by `brew autoremove`.
+
+While a configured tap (in `taps`, or of a fully-qualified package) is not
+tapped yet, its packages' dependencies can't be resolved, so cleanup is
+deferred: diff shows `? cleanup deferred until tapped: ...` and the deploy that
+adds the tap removes nothing extra; the next one does. A deferred or failed
+cleanup still runs owned removals the way it does without `cleanup`.
+
+`zap` additionally passes `--zap` to every cask uninstall, owned ones included,
+deleting the app's preferences, caches and support files. App Store apps are
+never removed by cleanup, only by ownership. Each such removal shows in
+`tools diff` with `(not installed by tools)`. If brew cannot be queried, only
+the cleanup removals are skipped (deploy reports failure) and diff shows
+`? cannot plan cleanup`.
+
+### Differences from nix-config
+
+| Option                                                            | nix-darwin `homebrew`          | tools                                  |
+| ----------------------------------------------------------------- | ------------------------------ | -------------------------------------- |
+| no `cleanup`                                                      | `none`: never removes anything | removes what tools recorded installing |
+| `cleanup: none`                                                   | accepted                       | config error; omit the key instead     |
+| `autoUpdate` default                                              | `false`                        | brew's own default (auto-update on)    |
+| `trust.taps` (nix-homebrew)                                       | never untrusted                | untrusted when dropped                 |
+| per-entry args, `upgrade`, `global.*`, `extraConfig`, pinned taps | supported                      | not supported                          |
 ## launchd
 
 Agents (`domain: user`, `gui/<uid>`) and daemons (`domain: system`). macOS only.
@@ -565,7 +636,8 @@ All services:
 ## State and ownership
 
 Deploy records what it installs in the state file and only ever removes what it
-recorded — anything installed by hand is never touched. Removing an entry from
+recorded — anything installed by hand is never touched (the one opt-in
+exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
 config removes it from the system on the next deploy (where an uninstall exists;
 `go` and `curlShell` only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
