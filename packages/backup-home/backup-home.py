@@ -45,18 +45,17 @@ from pathlib import Path
 
 
 SOPS_SECRETS = {
-    "MINISERVE_USER": "miniserve-username",
-    "MINISERVE_PASS": "miniserve-password",
+    "MINISERVE_USER": "MINISERVE_USER_FILE",
+    "MINISERVE_PASS": "MINISERVE_PASS_FILE",
 }
 
 
 def _read_secret(name: str) -> str | None:
-    """Read secret from sops-nix file."""
-    sops_name = SOPS_SECRETS.get(name)
-    if sops_name:
-        sops_path = Path.home() / ".config/sops-nix/secrets" / sops_name
+    """Read secret from the file named by its env var."""
+    path = os.environ.get(SOPS_SECRETS.get(name, ""))
+    if path:
         try:
-            return sops_path.read_text().strip()
+            return Path(path).expanduser().read_text().strip()
         except OSError:
             pass
     return None
@@ -358,9 +357,9 @@ def upload_miniserve(
     name="backup-home",
     help="Backup home directory with automatic exclusions and remote upload.",
     epilog=(
-        "Secrets (read from ~/.config/sops-nix/secrets/):\n\n"
-        "  miniserve-username    Username for miniserve authentication\n\n"
-        "  miniserve-password    Password for miniserve authentication\n\n"
+        "Secrets (full file paths from env):\n\n"
+        "  MINISERVE_USER_FILE    Username for miniserve authentication\n\n"
+        "  MINISERVE_PASS_FILE    Password for miniserve authentication\n\n"
         "Examples:\n\n"
         "  backup-home                              # Normal backup and upload via miniserve\n\n"
         "  backup-home --skip-upload                # Create backup locally only\n\n"
@@ -486,7 +485,7 @@ def main(
     miniserve_pass = _read_secret("MINISERVE_PASS")
     if not miniserve_user or not miniserve_pass:
         click.echo(
-            "Error: miniserve secrets not found in ~/.config/sops-nix/secrets/",
+            "Error: miniserve secrets not found (set MINISERVE_USER_FILE and MINISERVE_PASS_FILE)",
             err=True,
         )
         sys.exit(1)

@@ -99,7 +99,9 @@ class YoutubeClient:
 class Credentials:
     """Credential locations shared by every command, resolved lazily."""
 
-    def __init__(self, client_secret_file: str, api_key_file: str, token_dir: str):
+    def __init__(
+        self, client_secret_file: str | None, api_key_file: str | None, token_dir: str
+    ):
         self.client_secret_file = client_secret_file
         self.api_key_file = api_key_file
         self.token_dir = os.path.expanduser(token_dir)

@@ -16,9 +16,9 @@ API_HOST = "api.nextdns.io"
 API_BASE = f"https://{API_HOST}"
 USER_AGENT = "nextdns-mgmt/1.0.0"
 
-DEFAULT_SECRETS_PATH = "~/.config/sops-nix/secrets"
-DEFAULT_API_KEY_PATH = f"{DEFAULT_SECRETS_PATH}/nextdns-api-key"
-DEFAULT_PROFILE_ID_PATH_TEMPLATE = f"{DEFAULT_SECRETS_PATH}/nextdns-profile-{{name}}"
+SECRETS_DIR_ENV = "SECRETS_DIR"
+API_KEY_SECRET = "nextdns-api-key"
+PROFILE_ID_SECRET_TEMPLATE = "nextdns-profile-{name}"
 
 
 def _read_file(path: str) -> str | None:
@@ -282,16 +282,22 @@ def sync(api_key, profile_id, profile_file, dry_run):
 )
 @click.option("--profile-file", required=True, help="NextDNS profile JSON file")
 @click.option(
+    "--secrets-dir",
+    envvar=SECRETS_DIR_ENV,
+    default=None,
+    help=f"Directory holding {API_KEY_SECRET} and "
+    f"{PROFILE_ID_SECRET_TEMPLATE.format(name='<name>')} (env: {SECRETS_DIR_ENV})",
+)
+@click.option(
     "--api-key-file",
-    default=DEFAULT_API_KEY_PATH,
-    show_default=True,
-    help="File containing the NextDNS API key",
+    default=None,
+    help=f"File containing the NextDNS API key (default: <secrets-dir>/{API_KEY_SECRET})",
 )
 @click.option(
     "--profile-id-file",
     default=None,
     help="File containing the profile id; required to exist when given "
-    "(default: per-name file under the sops-nix secrets dir)",
+    "(default: per-name file under --secrets-dir)",
 )
 @click.option(
     "--dry-run",
@@ -299,15 +305,23 @@ def sync(api_key, profile_id, profile_file, dry_run):
     default=False,
     help="Show what would be updated without making changes",
 )
-def update(name, profile_file, api_key_file, profile_id_file, dry_run):
+def update(name, profile_file, secrets_dir, api_key_file, profile_id_file, dry_run):
     """Update profile using nested endpoints (section by section).
 
     Reads the API key from --api-key-file (default
-    ~/.config/sops-nix/secrets/nextdns-api-key). The profile id comes from
-    --profile-id-file, which must exist when given; otherwise, with --name,
-    ~/.config/sops-nix/secrets/nextdns-profile-<name> is tried and a missing
+    <secrets-dir>/nextdns-api-key). The profile id comes from
+    --profile-id-file, which must exist when given; otherwise, with --name and
+    --secrets-dir, <secrets-dir>/nextdns-profile-<name> is tried and a missing
     file falls back to name-based lookup.
     """
+    if not api_key_file:
+        if not secrets_dir:
+            click.echo(
+                f"Error: pass --api-key-file, or --secrets-dir / ${SECRETS_DIR_ENV}",
+                err=True,
+            )
+            sys.exit(1)
+        api_key_file = os.path.join(secrets_dir, API_KEY_SECRET)
     api_key = _read_file(api_key_file)
     if not api_key:
         click.echo(
@@ -327,8 +341,10 @@ def update(name, profile_file, api_key_file, profile_id_file, dry_run):
             )
             sys.exit(1)
         click.echo(f"Using profile id from {profile_id_file}", err=True)
-    elif name:
-        id_path = DEFAULT_PROFILE_ID_PATH_TEMPLATE.format(name=name)
+    elif name and secrets_dir:
+        id_path = os.path.join(
+            secrets_dir, PROFILE_ID_SECRET_TEMPLATE.format(name=name)
+        )
         profile_id = _read_file(id_path)
         if profile_id:
             click.echo(f"Using profile id from sops file for '{name}'", err=True)

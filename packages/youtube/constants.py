@@ -4,9 +4,9 @@ import os
 
 USER_AGENT = "youtube/1.0.0"
 
-DEFAULT_SECRETS_PATH = "~/.config/sops-nix/secrets"
-DEFAULT_CLIENT_SECRET_PATH = f"{DEFAULT_SECRETS_PATH}/youtube-client-secret"
-DEFAULT_API_KEY_PATH = f"{DEFAULT_SECRETS_PATH}/youtube-api-key"
+SECRETS_DIR_ENV = "SECRETS_DIR"
+CLIENT_SECRET_NAME = "youtube-client-secret"
+API_KEY_NAME = "youtube-api-key"
 
 
 def default_token_dir() -> str:
