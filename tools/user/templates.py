@@ -10,6 +10,7 @@ Input is plain, already-resolved data keyed by template name::
         "mode": "0400", "owner": ..., "group": ...,
         "secrets": False,                    # force secret handling
         "restartUnits": ["launchd:org.example.app"],
+        "onChange": "shell command",         # run once after a write
       },
     }
 
@@ -31,7 +32,7 @@ from tools import fsutil
 from tools.log import Color, debug, log
 from tools.placeholders import PlaceholderError, Resolver
 from tools.serialize import FORMATS, SerializeError, serialize
-from tools.util import format_diff_bytes, looks_like_secret
+from tools.util import format_diff_bytes, looks_like_secret, parse_on_change
 
 _KEYS = {
     "path",
@@ -44,6 +45,7 @@ _KEYS = {
     "restartUnits",
     "quote",
     "force",
+    "onChange",
 }
 DEFAULT_MODE = 0o400
 
@@ -63,6 +65,7 @@ class Template:
     notify: Tuple[str, ...] = ()
     quote: bool = True
     force: bool = False  # replace an existing file tools does not track
+    on_change: Optional[str] = None
 
 
 def parse_templates(
@@ -127,6 +130,7 @@ def parse_templates(
             quote = spec.get("quote", True)
             if not isinstance(quote, bool) or ("quote" in spec and fmt != "env"):
                 raise ValueError(f"{name}: quote must be a bool and only applies to format env")
+            on_change = parse_on_change(spec.get("onChange"), name)
             mode = fsutil.parse_mode(spec.get("mode"), f"templates.{name}")
             fsutil.check_owner(spec.get("owner"), f"{name}: owner")
             fsutil.check_owner(spec.get("group"), f"{name}: group")
@@ -147,6 +151,7 @@ def parse_templates(
                 notify=tuple(notify),
                 quote=quote,
                 force=force,
+                on_change=on_change,
             )
         )
     return result, errors
@@ -429,6 +434,8 @@ def describe(p: Plan) -> List[str]:
         else:
             continue
         rows += [f"    notify: {n}" for n in t.notify]
+        if t.on_change and ch.action != "pending":
+            rows.append(f"    run onChange: {t.on_change}")
     rows += [f"  ~ keep {target} (is {reason}; not removed)" for target, reason in p.keep]
     return rows + fsutil.describe_removals(p.errors or p.held, p.remove, p.forget)
 

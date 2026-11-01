@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
-from tools import fsutil
+from tools import fsutil, util
 from tools.user import git_repos, sops, templates
 
 
@@ -60,6 +60,8 @@ class Ownership(dict):
         self.trees = {_tree_key(p): (p, owner) for p, owner in (trees or {}).items()}
         self.repos = {_tree_key(p): p for p in repos}
         self.clone_pending = clone_pending
+        # State-only `files:` directories holding another section's path (canonical keys).
+        self.release_dirs: Set[str] = set()
 
     def __bool__(self) -> bool:
         return bool(len(self) or self.links or self.trees or self.repos)
@@ -213,10 +215,33 @@ def ownership_conflicts(
             claims.setdefault(key, set()).add(section)
             spelled.setdefault(key, _norm(path))
 
-    for path in files_targets(files_entries, config_dir):
+    from tools.user.files import _resolve_entries
+
+    parsed_sops = sops.parse_sops(sops_raw)
+    secrets_root = parsed_sops.secrets_dir()[0]
+    private_mode: Dict[str, str] = {}
+    directories: Set[str] = set()
+    tracked_dirs: Set[str] = set()
+    for entry in _resolve_entries(files_entries or [], config_dir)[0]:
+        claim(entry.target, "files")
+        if not entry.directory:
+            continue
+        directories.add(_link_key(entry.target))
+        if (
+            secrets_root
+            and entry.mode not in (None, fsutil.SECRETS_DIR_MODE)
+            and fsutil.is_within(
+                fsutil.canonical_real(entry.target), fsutil.canonical_real(secrets_root)
+            )
+        ):
+            private_mode[_norm(entry.target)] = (
+                f"inside secretsDir, whose directories stay "
+                f"{oct(fsutil.SECRETS_DIR_MODE)}; drop mode or move it"
+            )
+    for path, record in (state.get("files", {}) or {}).items():
         claim(path, "files")
-    for path in state.get("files", {}) or {}:
-        claim(path, "files")
+        if isinstance(record, dict) and record.get("dir") and isinstance(path, str) and path:
+            tracked_dirs.add(_link_key(path))
     for secret in sops.parse_sops(sops_raw).secrets:
         claim(secret.path, "sops")
     for path in state.get("sops", {}).get("installed", {}) or {}:
@@ -232,11 +257,17 @@ def ownership_conflicts(
         for path, sections in claims.items()
         if len(sections) > 1
     }
-    # A managed file may not be a directory on another managed file's path.
+    # A managed file may not be a directory on another managed file's path,
+    # unless it is a `files:` directory entry, declared or known only from state.
+    # A state-only one holding another section's path is released, not removed.
+    tracked_dirs -= directories
+    release_dirs: Set[str] = set()
     for key in claims:
         child, anc = key, os.path.dirname(key)
         while anc != child:
-            if anc in claims:
+            if anc in tracked_dirs and claims[key] - {"files"}:
+                release_dirs.add(anc)
+            if anc in claims and anc not in directories and anc not in tracked_dirs:
                 exact.setdefault(
                     spelled[key],
                     f"inside {spelled[anc]}, which {' and '.join(sorted(claims[anc]))} manages",
@@ -248,9 +279,13 @@ def ownership_conflicts(
                 )
                 break
             child, anc = anc, os.path.dirname(anc)
+    for path, reason in private_mode.items():
+        exact.setdefault(path, reason)
     link_paths, trees = _link_owned_paths(links_raw, skills_raw, state, config_dir)
     repos = [_norm(d) for d in _mapping(git_repos_raw) if isinstance(d, str) and d]
-    return Ownership(exact, link_paths, trees, repos, clone_pending)
+    ownership = Ownership(exact, link_paths, trees, repos, clone_pending)
+    ownership.release_dirs = release_dirs
+    return ownership
 
 
 def _mapping(raw) -> Mapping:
@@ -371,7 +406,27 @@ def deploy_templates(
     state.setdefault("templates", {})["installed"] = installed
     _merge(report, "templates", [t.name for t in res.changed], phase)
     report.notify += [(n, f"templates/{t.name}") for t in res.changed for n in t.notify]
+    # In state at once, so a later phase failing or an interrupt still retries them.
+    util.add_pending_hooks(
+        state, "templates", {t.on_change: [t.target] for t in res.changed if t.on_change}
+    )
     return res.success
+
+
+def template_hooks(raw) -> set:
+    """Every onChange in the raw templates config, parseable or not."""
+    if not isinstance(raw, Mapping):
+        return set()
+    return {
+        s["onChange"]
+        for s in raw.values()
+        if isinstance(s, Mapping) and isinstance(s.get("onChange"), str)
+    }
+
+
+def run_template_hooks(raw, state: Dict) -> bool:
+    """Templates' onChange commands, once after every phase has written."""
+    return util.settle_hooks(state, "templates", {}, template_hooks(raw))
 
 
 def plan_sops(
@@ -436,7 +491,18 @@ def diff_templates(
         pending_errors=(sops.SecretUnavailable,),
         **_split(phase, inside),
     )
-    return templates.describe(p)
+    rows = templates.describe(p)
+    if phase != EARLY:
+        declared = template_hooks(raw)
+        listed = {
+            ch.template.on_change for ch in p.changes if ch.action in ("create", "update", "chmod")
+        }
+        rows += [
+            f"  ~ run onChange: {cmd} (failed last deploy)"
+            for cmd in util.pending_hooks(state, "templates", declared)
+            if cmd not in listed
+        ]
+    return rows
 
 
 def files_targets(entries, config_dir: str) -> List[str]:
@@ -444,7 +510,7 @@ def files_targets(entries, config_dir: str) -> List[str]:
     from tools.user.files import _resolve_entries
 
     resolved, _errors = _resolve_entries(entries or [], config_dir)
-    return [target for target, _source, _mode, _secrets in resolved]
+    return [e.target for e in resolved]
 
 
 def format_notify(report: RunReport) -> List[str]:

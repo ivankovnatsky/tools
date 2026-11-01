@@ -2,11 +2,19 @@ import hashlib
 import os
 import stat
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
-from tools.fsutil import fingerprint, removal_blocked, respell, same_file_as, same_identity
+from tools.fsutil import (
+    canonical_path,
+    fingerprint,
+    makedirs_secret,
+    removal_blocked,
+    respell,
+    same_file_as,
+    same_identity,
+)
 from tools.log import Color, debug, log
-from tools.util import format_diff_bytes, looks_like_secret
+from tools.util import format_diff_bytes, looks_like_secret, parse_on_change, settle_hooks
 
 
 def _file_hash(path: str) -> Optional[str]:
@@ -43,6 +51,82 @@ def _removable(target: str, record) -> bool:
         return False
     stored_hash = record.get("hash")
     return not stored_hash or _file_hash(target) == stored_hash
+
+
+def _is_real_dir(path: str) -> bool:
+    # normpath: with a trailing slash, islink follows the link.
+    path = os.path.normpath(path)
+    return os.path.isdir(path) and not os.path.islink(path)
+
+
+def _dir_record(target: str) -> Dict:
+    fp = fingerprint(target) or {}
+    return {"dir": True, **{k: fp[k] for k in ("dev", "ino") if k in fp}}
+
+
+def _released_dir(target: str, conflicts) -> bool:
+    keys = getattr(conflicts, "release_dirs", None)
+    return bool(keys) and canonical_path(os.path.abspath(os.path.expanduser(target))) in keys
+
+
+def _same_dir(target: str, record) -> bool:
+    """Whether ``target`` is the directory ``record`` was taken from.
+
+    A directory's mtime moves with its entries, so unlike files a changed
+    device number (APFS remount) is accepted on the inode alone.
+    """
+    if not isinstance(record, dict) or not record.get("dir") or "ino" not in record:
+        return False
+    fp = fingerprint(os.path.normpath(target))
+    return _is_real_dir(target) and fp is not None and fp["ino"] == record["ino"]
+
+
+def _dir_kept(target: str, record) -> Optional[str]:
+    """Why a tracked directory no longer declared stays; None to remove it."""
+    if not _same_dir(target, record):
+        return "not the directory tools created"
+    try:
+        if os.listdir(target):
+            return "not empty"
+    except OSError as e:
+        return f"unreadable ({e})"
+    return None
+
+
+def _ensure_dir(
+    target: str,
+    mode: Optional[int],
+    record,
+    private_root: Optional[str] = None,
+    created_dirs: Optional[list] = None,
+) -> Tuple[Optional[bool], Optional[Dict]]:
+    """Create ``target`` (and parents) if missing, then apply ``mode``.
+
+    Returns (result, record): result as in `_copy_file`; record is set only
+    for a directory tools created, so removal never touches one it did not.
+    Directories under ``private_root`` (the secretsDir) are made like sops'
+    and appended to ``created_dirs``.
+    """
+    if os.path.lexists(target) and not _is_real_dir(target):
+        log(f"files: {target} exists and is not a directory", Color.RED)
+        return False, None
+    tracked = _same_dir(target, record)
+    result = None
+    try:
+        if not os.path.lexists(target):
+            makedirs_secret(target, private_root, created_dirs)
+            if mode is not None:
+                os.chmod(target, mode)
+            log(f"Created directory: {target}", Color.GREEN)
+            return True, _dir_record(target)
+        if mode is not None and stat.S_IMODE(os.lstat(target).st_mode) != mode:
+            os.chmod(target, mode, follow_symlinks=False)
+            log(f"Chmod: {target} -> {oct(mode)}", Color.GREEN)
+            result = True
+    except OSError as e:
+        log(f"Failed to create {target}: {e}", Color.RED)
+        return False, record if tracked else None
+    return result, _dir_record(target) if tracked else None
 
 
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
@@ -145,26 +229,63 @@ def _copy_file(
     return True, source_hash
 
 
+class Entry(NamedTuple):
+    target: str
+    source: Optional[str]  # None for a directory entry
+    mode: Optional[int]
+    secrets: bool
+    on_change: Optional[str] = None
+    directory: bool = False
+
+
+def declared_hooks(entries) -> set:
+    """Every onChange in the raw config, including entries that fail to resolve."""
+    if not isinstance(entries, list):
+        return set()
+    return {
+        e["onChange"] for e in entries if isinstance(e, dict) and isinstance(e.get("onChange"), str)
+    }
+
+
+def _ordered(resolved: List[Entry]) -> List[Entry]:
+    """Directory entries first, parents before children, so a directory exists
+    (and is tracked as created) before anything is written inside it."""
+    return sorted(
+        resolved,
+        key=lambda e: (not e.directory, e.target.count(os.sep) if e.directory else 0),
+    )
+
+
+def _removal_order(targets, records: Dict) -> List[str]:
+    """Files before directories, deepest directory first."""
+
+    def is_dir(t):
+        return isinstance(records.get(t), dict) and bool(records[t].get("dir"))
+
+    return sorted(targets, key=lambda t: (is_dir(t), -t.count(os.sep) if is_dir(t) else 0))
+
+
 def _resolve_entries(
     entries: List[Dict[str, object]], config_dir: str
-) -> Tuple[List[Tuple[str, str, Optional[int], bool]], List[str]]:
-    """Expand a `files:` config into a flat list of (target, source, mode, secrets) tuples.
+) -> Tuple[List[Entry], List[str]]:
+    """Expand a `files:` config into a flat list of `Entry`.
 
-    Two entry shapes are supported and may be mixed in the same list:
-      - dir entry:  {dir: <path>, mode?: <octal>, secrets?: <bool>}
-      - file entry: {source, target, mode?, secrets?}
+    Three entry shapes are supported and may be mixed in the same list:
+      - dir entry:       {dir: <path>, mode?, secrets?, onChange?}
+      - file entry:      {source, target, mode?, secrets?, onChange?}
+      - directory entry: {target, directory: true, mode?, onChange?}
 
     The ``secrets`` flag, when true, suppresses inline content diffs in
     both ``tools deploy`` and ``tools diff`` for that entry. On a dir
     entry it propagates to every file walked under that tree.
 
-    File entries take precedence over dir entries on the same target.
+    File and directory entries take precedence over dir entries on the same target.
 
     Returns (resolved, errors). `resolved` is deduped by target, last-write-wins.
     `errors` contains human-readable messages about malformed entries.
     """
-    dir_pairs: List[Tuple[str, str, Optional[int], bool]] = []
-    file_pairs: List[Tuple[str, str, Optional[int], bool]] = []
+    dir_pairs: List[Entry] = []
+    file_pairs: List[Entry] = []
     errors: List[str] = []
     home = os.path.expanduser("~")
     if entries is None:
@@ -181,6 +302,11 @@ def _resolve_entries(
         except (TypeError, ValueError) as e:
             errors.append(f"invalid mode in entry {entry!r}: {e}")
             continue
+        try:
+            on_change = parse_on_change(entry.get("onChange"), f"entry {entry!r}")
+        except ValueError as e:
+            errors.append(str(e))
+            continue
 
         secrets_raw = entry.get("secrets", False)
         if not isinstance(secrets_raw, bool):
@@ -189,6 +315,18 @@ def _resolve_entries(
             )
             continue
         entry_secrets = secrets_raw
+
+        directory = entry.get("directory", False)
+        if not isinstance(directory, bool):
+            errors.append(f"`directory` must be a bool in {entry!r}")
+            continue
+        if directory:
+            if "target" not in entry or "source" in entry or "dir" in entry:
+                errors.append(f"a directory entry takes `target` and no `source`/`dir`: {entry!r}")
+                continue
+            target = os.path.normpath(os.path.expanduser(str(entry["target"])))
+            file_pairs.append(Entry(target, None, entry_mode, False, on_change, True))
+            continue
 
         if "dir" in entry:
             source_dir = os.path.join(config_dir, str(entry["dir"]))
@@ -203,36 +341,31 @@ def _resolve_entries(
                     source = os.path.join(root, name)
                     rel = os.path.relpath(source, source_dir)
                     target = os.path.join(home, rel)
-                    dir_pairs.append((target, source, entry_mode, entry_secrets))
+                    dir_pairs.append(Entry(target, source, entry_mode, entry_secrets, on_change))
             continue
 
         if "source" in entry and "target" in entry:
             source = os.path.join(config_dir, str(entry["source"]))
-            target = os.path.expanduser(str(entry["target"]))
+            target = os.path.normpath(os.path.expanduser(str(entry["target"])))
             if not os.path.isfile(source):
                 errors.append(f"source not found: {entry['source']}")
                 continue
-            file_pairs.append((target, source, entry_mode, entry_secrets))
+            file_pairs.append(Entry(target, source, entry_mode, entry_secrets, on_change))
             continue
 
         errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
 
-    # Dedupe by target, later entries win on (source, mode) — but
-    # `secrets` is sticky across every collision (dir/dir, dir/file,
-    # file/file): once any entry marks a target as secret, the
-    # resolved entry stays secret. Otherwise a later entry added just
-    # to override the mode (or two overlapping `dir:` walks) would
-    # silently downgrade the suppression flag and re-expose content
+    # Dedupe by target, later entries win — but `secrets` is sticky across
+    # every collision (dir/dir, dir/file, file/file): once any entry marks a
+    # target as secret, the resolved entry stays secret. Otherwise a later
+    # entry added just to override the mode (or two overlapping `dir:` walks)
+    # would silently downgrade the suppression flag and re-expose content
     # from a secret source.
-    resolved_map: Dict[str, Tuple[str, Optional[int], bool]] = {}
-    for target, source, mode, secrets in dir_pairs + file_pairs:
-        prev_secrets = resolved_map.get(target, (None, None, False))[2]
-        resolved_map[target] = (source, mode, secrets or prev_secrets)
-
-    resolved = [
-        (target, source, mode, secrets) for target, (source, mode, secrets) in resolved_map.items()
-    ]
-    return resolved, errors
+    resolved_map: Dict[str, Entry] = {}
+    for e in dir_pairs + file_pairs:
+        prev = resolved_map.get(e.target)
+        resolved_map[e.target] = e._replace(secrets=e.secrets or bool(prev and prev.secrets))
+    return list(resolved_map.values()), errors
 
 
 def _conflict(target: str, conflicts: Optional[Dict[str, str]]) -> Optional[str]:
@@ -246,8 +379,12 @@ def install_files(
     config_dir: str,
     state: Dict,
     conflicts: Optional[Dict[str, str]] = None,
+    private_root: Optional[str] = None,
 ) -> bool:
     """Deploy files declared in the `files:` config section.
+
+    ``private_root`` is the sops secretsDir: directory entries inside it are
+    created with its mode and registered with the sops section's created dirs.
 
     See `_resolve_entries` for the supported entry shapes.
 
@@ -258,18 +395,21 @@ def install_files(
     """
     success = True
     changed = False
-    managed_targets: Dict[str, str] = {}
+    managed: Dict[str, Dict] = {}
+    hooks: Dict[str, List[str]] = {}
 
     resolved, errors = _resolve_entries(entries, config_dir)
     for err in errors:
         log(f"files: {err}", Color.RED)
         success = False
-    declared = [target for target, _source, _mode, _secrets in resolved]
+    declared = [e.target for e in resolved]
     # State keys match declared targets by file identity, not spelling.
     state_files = respell(dict(state.get("files", {}) or {}), declared)
 
     held: Dict[str, Dict] = {}
-    for target, source, mode, secrets in resolved:
+    released = set()
+    for e in _ordered(resolved):
+        target = e.target
         reason = _conflict(target, conflicts)
         if reason:
             log(f"files: refusing {target}: {reason}", Color.RED)
@@ -277,24 +417,40 @@ def install_files(
             if target in state_files:
                 held[target] = state_files[target]
             continue
-        result, source_hash = _copy_file(
-            source, target, mode, secrets=secrets, tracked=_tracked(target, state_files.get(target))
-        )
+        if e.directory:
+            created = state.setdefault("sops", {}).setdefault("createdDirs", [])
+            result, record = _ensure_dir(
+                target, e.mode, state_files.get(target), private_root, created
+            )
+            if record is not None:
+                managed[target] = record
+            elif result is not False:
+                released.add(target)
+        else:
+            result, source_hash = _copy_file(
+                e.source,
+                target,
+                e.mode,
+                secrets=e.secrets,
+                tracked=_tracked(target, state_files.get(target)),
+            )
+            if source_hash and result is not False:
+                managed[target] = _record(target, source_hash)
         if result is False:
             success = False
             if target in state_files:
                 held[target] = state_files[target]
         elif result is True:
             changed = True
-
-        if source_hash and result is not False:
-            managed_targets[target] = source_hash
+            if e.on_change:
+                hooks.setdefault(e.on_change, []).append(target)
 
     # Only config errors hold removals: an unparsed entry looks undesired.
     if not errors:
         kept = dict(held)
-        for target in list(state_files.keys()):
-            if target not in managed_targets and target not in held:
+        for target in _removal_order(state_files, state_files):
+            if target not in managed and target not in held and target not in released:
+                record = state_files.get(target)
                 blocked = removal_blocked(conflicts, target)
                 twin = same_file_as(target, declared)
                 if twin:
@@ -304,38 +460,53 @@ def install_files(
                         f"files: not removing {target}: it is {blocked}; still tracked",
                         Color.YELLOW,
                     )
-                    kept[target] = state_files[target]
+                    kept[target] = record
                     continue
-                if os.path.exists(target):
-                    # A file edited since then holds work this tool never authored.
-                    if not _removable(target, state_files.get(target)):
-                        log(
-                            f"Keeping {target}: modified since we wrote it. "
-                            "Delete it by hand if it is no longer wanted.",
-                            Color.YELLOW,
-                        )
-                        kept[target] = state_files[target]
+                if not os.path.exists(target):
+                    continue
+                is_dir = isinstance(record, dict) and record.get("dir")
+                if is_dir and _released_dir(target, conflicts):
+                    log(
+                        f"files: releasing {target}: another section manages a path inside",
+                        Color.YELLOW,
+                    )
+                    continue
+                if is_dir:
+                    why = _dir_kept(target, record)
+                    if why:
+                        log(f"Keeping {target}: {why}.", Color.YELLOW)
+                        kept[target] = record
                         continue
-                    try:
+                # A file edited since then holds work this tool never authored.
+                elif not _removable(target, record):
+                    log(
+                        f"Keeping {target}: modified since we wrote it. "
+                        "Delete it by hand if it is no longer wanted.",
+                        Color.YELLOW,
+                    )
+                    kept[target] = record
+                    continue
+                try:
+                    if is_dir:
+                        os.rmdir(os.path.normpath(target))
+                    else:
                         os.remove(target)
-                        log(f"Removed: {target}", Color.RED)
-                        changed = True
-                    except OSError as e:
-                        log(f"Failed to remove {target}: {e}", Color.RED)
-                        success = False
-                        # Keep tracking it so the next run retries the cleanup.
-                        kept[target] = state_files[target]
+                    log(f"Removed: {target}", Color.RED)
+                    changed = True
+                except OSError as e:
+                    log(f"Failed to remove {target}: {e}", Color.RED)
+                    success = False
+                    # Keep tracking it so the next run retries the cleanup.
+                    kept[target] = record
 
-        state["files"] = {
-            target: _record(target, file_hash) for target, file_hash in managed_targets.items()
-        }
+        state["files"] = dict(managed)
         state["files"].update(kept)
     else:
         merged = dict(state_files)
-        merged.update(
-            {target: _record(target, file_hash) for target, file_hash in managed_targets.items()}
-        )
+        merged.update(managed)
         state["files"] = merged
+
+    success &= settle_hooks(state, "files", hooks, declared_hooks(entries))
 
     if not changed and entries:
         debug("All files up to date", Color.BLUE)

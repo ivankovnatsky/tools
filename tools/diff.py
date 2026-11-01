@@ -246,70 +246,100 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
 def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, conflicts=None):
     """Dry-run for the unified `files:` section.
 
-    Resolves entries via `_resolve_entries`, compares each desired
-    (target, source, mode, secrets) against the live filesystem, and
-    accounts for cleanup against state.
+    Resolves entries via `_resolve_entries`, compares each desired entry
+    against the live filesystem, and accounts for cleanup against state.
     """
     from tools.fsutil import removal_blocked, respell, same_file_as
-    from tools.user.files import _conflict, _removable, _resolve_entries, _tracked
+    from tools.user.files import (
+        _conflict,
+        _dir_kept,
+        _is_real_dir,
+        _ordered,
+        _released_dir,
+        _removable,
+        _removal_order,
+        _resolve_entries,
+        _tracked,
+        declared_hooks,
+    )
+    from tools.util import pending_hooks
 
     changes: List[str] = []
+    hooks: Dict[str, None] = {}
 
     resolved, errors = _resolve_entries(entries, config_dir)
     for err in errors:
         changes.append(f"  ! {err}")
-    declared = [target for target, _source, _mode, _secrets in resolved]
+    declared = [e.target for e in resolved]
     state_files = respell(dict(state.get("files", {}) or {}), declared)
 
     managed_targets = set()
-    for target, source, desired_mode, secrets in resolved:
+    for e in _ordered(resolved):
+        target, source, desired_mode, secrets = e.target, e.source, e.mode, e.secrets
         managed_targets.add(target)
         reason = _conflict(target, conflicts)
         if reason:
             changes.append(f"  ! refusing {target}: {reason}")
             continue
+        before = len(changes)
 
-        if not os.path.exists(target):
+        if e.directory:
+            if not os.path.lexists(target):
+                changes.append(f"  + create directory {target}")
+            elif not _is_real_dir(target):
+                changes.append(f"  ! {target} exists and is not a directory")
+                continue
+            elif desired_mode is not None and stat.S_IMODE(os.lstat(target).st_mode) != (
+                desired_mode
+            ):
+                changes.append(f"  ~ chmod {target} -> {oct(desired_mode)}")
+        elif not os.path.exists(target):
             changes.append(f"  + create {target}")
-            continue
+        else:
+            try:
+                with open(source, "rb") as f:
+                    src_bytes = f.read()
+            except OSError:
+                changes.append(f"  ? cannot read source {source}")
+                continue
+            try:
+                with open(target, "rb") as f:
+                    tgt_bytes = f.read()
+            except OSError:
+                changes.append(f"  ? cannot read {target}")
+                continue
 
-        try:
-            with open(source, "rb") as f:
-                src_bytes = f.read()
-        except OSError:
-            changes.append(f"  ? cannot read source {source}")
-            continue
-        try:
-            with open(target, "rb") as f:
-                tgt_bytes = f.read()
-        except OSError:
-            changes.append(f"  ? cannot read {target}")
-            continue
+            src_hash = hashlib.sha256(src_bytes).hexdigest()
+            tgt_hash = hashlib.sha256(tgt_bytes).hexdigest()
 
-        src_hash = hashlib.sha256(src_bytes).hexdigest()
-        tgt_hash = hashlib.sha256(tgt_bytes).hexdigest()
+            target_mode = stat.S_IMODE(os.stat(target).st_mode)
+            source_mode = stat.S_IMODE(os.stat(source).st_mode)
+            effective_mode = desired_mode if desired_mode is not None else source_mode
 
-        target_mode = stat.S_IMODE(os.stat(target).st_mode)
-        source_mode = stat.S_IMODE(os.stat(source).st_mode)
-        effective_mode = desired_mode if desired_mode is not None else source_mode
+            if src_hash != tgt_hash:
+                is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
+                if not _tracked(target, state_files.get(target)):
+                    changes.append(
+                        f"  ~ replace {target} (not tracked by tools; content not shown)"
+                    )
+                elif is_secret:
+                    changes.append(f"  ~ update {target} (secret, diff suppressed)")
+                else:
+                    changes.append(f"  ~ update {target}")
+                    diff_text = format_diff_bytes(src_bytes, tgt_bytes, target)
+                    if diff_text:
+                        changes.append(diff_text)
+            elif effective_mode != target_mode:
+                changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
-        if src_hash != tgt_hash:
-            is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
-            if not _tracked(target, state_files.get(target)):
-                changes.append(f"  ~ replace {target} (not tracked by tools; content not shown)")
-            elif is_secret:
-                changes.append(f"  ~ update {target} (secret, diff suppressed)")
-            else:
-                changes.append(f"  ~ update {target}")
-                diff_text = format_diff_bytes(src_bytes, tgt_bytes, target)
-                if diff_text:
-                    changes.append(diff_text)
-        elif effective_mode != target_mode:
-            changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
+        if e.on_change and len(changes) > before:
+            hooks[e.on_change] = None
 
     # Deploy holds removals on config errors; a refused target stays tracked.
-    for target in state_files if not errors else ():
+    removed = set()
+    for target in _removal_order(state_files, state_files) if not errors else ():
         if target not in managed_targets:
+            record = state_files.get(target)
             blocked = removal_blocked(conflicts, target)
             twin = same_file_as(target, declared)
             if twin:
@@ -318,14 +348,39 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
                 changes.append(f"  ~ keep {target} (is {blocked}; not removed)")
                 continue
             if os.path.exists(target):
-                if not _removable(target, state_files.get(target)):
+                if isinstance(record, dict) and record.get("dir"):
+                    if _released_dir(target, conflicts):
+                        changes.append(
+                            f"  ~ release {target} (another section manages a path inside)"
+                        )
+                        continue
+                    why = _dir_kept(target, record)
+                    if why == "not empty" and _empty_after(target, removed):
+                        why = None
+                    if why:
+                        changes.append(f"  ~ keep {target} ({why}; not removed)")
+                        continue
+                elif not _removable(target, record):
                     changes.append(
                         f"  ~ keep {target} (modified since tools wrote it; not removed)"
                     )
                     continue
                 changes.append(f"  - remove {target}")
+                removed.add(target)
 
+    for command in pending_hooks(state, "files", declared_hooks(entries)):
+        hooks[command] = None
+    changes += [f"  ~ run onChange: {command}" for command in hooks]
     return changes
+
+
+def _empty_after(directory: str, removed) -> bool:
+    """Whether ``directory`` holds nothing but entries this diff removes."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    return all(os.path.join(directory, n) in removed for n in names)
 
 
 def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:

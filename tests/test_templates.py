@@ -61,6 +61,7 @@ class TemplatesTestBase(unittest.TestCase):
             ok = secrets_flow.deploy_templates(
                 raw, self.sops_raw, self.state, self.report, decryptor=self.decryptor()
             )
+            ok &= secrets_flow.run_template_hooks(raw, self.state)
         self.assertNotIn(SECRET, out.getvalue())
         return ok, out.getvalue()
 
@@ -206,6 +207,95 @@ class RenderTest(TemplatesTestBase):
             state=self.state,
             config_dir=self.tmp,
         )
+
+    def test_on_change_runs_after_write_only(self):
+        marker = os.path.join(self.tmp, "ran")
+        raw = self.tpl({"a": 1}, onChange=f"echo x >> {marker}")
+        self.assertIn(f"    run onChange: echo x >> {marker}", self.diff(raw))
+        self.assertFalse(os.path.exists(marker))
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok)
+        self.assertIn("templates: onChange (", out)
+        ok, _out = self.deploy(raw)
+        self.assertTrue(ok)
+        self.assertEqual(self.diff(raw), [])
+        with open(marker) as f:
+            self.assertEqual(f.read(), "x\n")
+
+    def test_failing_on_change_fails_deploy_keeps_file_and_retries(self):
+        raw = self.tpl({"a": 1}, onChange="exit 4")
+        ok, out = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertIn("onChange failed (exit 4)", out)
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        self.assertEqual(self.diff(raw), ["  ~ run onChange: exit 4 (failed last deploy)"])
+        ok, out = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertIn("onChange failed (exit 4)", out)
+        ok, _out = self.deploy(self.tpl({"a": 1}))
+        self.assertTrue(ok)
+        self.assertEqual(self.diff(self.tpl({"a": 1})), [])
+
+    def test_early_phase_hooks_recorded_in_state_at_once(self):
+        raw = self.tpl({"a": 1}, onChange="true")
+        repo = os.path.join(self.tmp, "repo")
+        inside = secrets_flow.paths_in_repos({repo: {}}, self.sops_raw, raw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            secrets_flow.deploy_templates(
+                raw,
+                self.sops_raw,
+                self.state,
+                self.report,
+                decryptor=self.decryptor(),
+                phase=secrets_flow.EARLY,
+                inside=inside,
+            )
+        self.assertEqual(self.state["onChange"]["templates"], {"true": [self.target]})
+
+    def test_pending_hook_kept_while_template_fails_to_parse(self):
+        self.deploy(self.tpl({"a": 1}, onChange="exit 4"))
+        broken = self.tpl({"a": 1}, onChange="exit 4", format="nope")
+        with contextlib.redirect_stdout(io.StringIO()):
+            secrets_flow.run_template_hooks(broken, self.state)
+        self.assertIn("exit 4", self.state["onChange"]["templates"])
+
+    def test_shared_on_change_runs_once_across_phases(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        marker = os.path.join(self.tmp, "ran")
+        hook = f"ls {repo}/late.json >> {marker}"
+        raw = {
+            "early": {"path": self.target, "format": "json", "content": {}, "onChange": hook},
+            "late": {
+                "path": os.path.join(repo, "late.json"),
+                "format": "json",
+                "content": {},
+                "onChange": hook,
+            },
+        }
+        inside = secrets_flow.paths_in_repos({repo: {}}, self.sops_raw, raw)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = True
+            for phase in (secrets_flow.EARLY, secrets_flow.LATE):
+                ok &= secrets_flow.deploy_templates(
+                    raw,
+                    self.sops_raw,
+                    self.state,
+                    self.report,
+                    decryptor=self.decryptor(),
+                    phase=phase,
+                    inside=inside,
+                )
+            ok &= secrets_flow.run_template_hooks(raw, self.state)
+        self.assertTrue(ok, out.getvalue())
+        with open(marker) as f:
+            self.assertEqual(f.read().splitlines(), [os.path.join(repo, "late.json")])
+
+    def test_on_change_must_be_a_string(self):
+        _tmpls, errors = templates.parse_templates(self.tpl({}, onChange=["x"]))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("onChange", errors[0])
 
     def test_conflict_with_tracked_files_and_sops_paths(self):
         self.state["files"] = {self.target: {"hash": "h"}}

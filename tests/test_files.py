@@ -326,3 +326,375 @@ class FilesIdentityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _quiet(fn, *args):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        return fn(*args), out.getvalue()
+
+
+class OnChangeTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = os.path.realpath(self._tmp.name)
+        self.marker = os.path.join(self.d, "ran")
+        self.hook = f"echo x >> {self.marker}"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def runs(self):
+        if not os.path.exists(self.marker):
+            return 0
+        with open(self.marker) as f:
+            return len(f.read().splitlines())
+
+    def test_file_hook_runs_only_when_written(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "out", "a.conf")
+        entries = [{"source": "src/a.conf", "target": target, "onChange": self.hook}]
+        state = {}
+        self.assertIn(f"  ~ run onChange: {self.hook}", _diff_files(entries, self.d, state))
+        self.assertEqual(self.runs(), 0)
+        (ok, out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertIn("files: onChange (", out)
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+        _write(os.path.join(self.d, "src", "a.conf"), "two\n")
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(self.runs(), 2)
+
+    def test_dir_entry_hook_runs_once(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
+        _write(os.path.join(self.d, "tree", ".cfg", "b"), "b\n")
+        entries = [{"dir": "tree", "onChange": self.hook}]
+        home = os.path.join(self.d, "home")
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            rows = _diff_files(entries, self.d, {})
+            self.assertEqual(rows.count(f"  ~ run onChange: {self.hook}"), 1)
+            (ok, out) = _quiet(files.install_files, entries, self.d, {})
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertIn("and 1 more", out)
+
+    def test_failing_hook_fails_deploy_and_is_retried(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        flag = os.path.join(self.d, "flag")
+        hook = f"if [ -e {flag} ]; then {self.hook}; else touch {flag}; exit 3; fi"
+        entries = [{"source": "src/a.conf", "target": target, "onChange": hook}]
+        state = {}
+        (ok, out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertFalse(ok)
+        self.assertIn("onChange failed (exit 3)", out)
+        self.assertTrue(os.path.exists(target))
+        self.assertIn(target, state["files"])
+        self.assertEqual(_diff_files(entries, self.d, state), [f"  ~ run onChange: {hook}"])
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertNotIn("onChange", state)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+
+    def test_pending_hook_kept_while_entry_fails_to_resolve(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        state = {}
+        entries = [{"source": "src/a.conf", "target": target, "onChange": "exit 3"}]
+        _quiet(files.install_files, entries, self.d, state)
+        os.remove(os.path.join(self.d, "src", "a.conf"))
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertFalse(ok)
+        self.assertIn("exit 3", state["onChange"]["files"])
+
+    def test_pending_hook_dropped_when_no_longer_declared(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        state = {}
+        entries = [{"source": "src/a.conf", "target": target, "onChange": "exit 3"}]
+        _quiet(files.install_files, entries, self.d, state)
+        (ok, _out) = _quiet(
+            files.install_files, [{"source": "src/a.conf", "target": target}], self.d, state
+        )
+        self.assertTrue(ok)
+        self.assertNotIn("onChange", state)
+
+    def test_invalid_on_change_is_config_error(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        for bad in ("", 3, ["x"]):
+            entries = [{"source": "src/a.conf", "target": "~/x", "onChange": bad}]
+            _resolved, errors = files._resolve_entries(entries, self.d)
+            self.assertEqual(len(errors), 1, bad)
+            self.assertIn("onChange", errors[0])
+
+
+class DirectoryEntryTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = os.path.realpath(self._tmp.name)
+        self.target = os.path.join(self.d, "a", "Screenshots")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def entries(self, **extra):
+        return [{"target": self.target, "directory": True, **extra}]
+
+    def test_create_track_chmod_and_remove_when_empty(self):
+        from tools.diff import _diff_files
+
+        state = {}
+        entries = self.entries(mode="0700")
+        self.assertEqual(
+            _diff_files(entries, self.d, state), [f"  + create directory {self.target}"]
+        )
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.isdir(self.target))
+        self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o700)
+        self.assertTrue(state["files"][self.target]["dir"])
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+
+        os.chmod(self.target, 0o755)
+        self.assertEqual(_diff_files(entries, self.d, state), [f"  ~ chmod {self.target} -> 0o700"])
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o700)
+
+        self.assertEqual(_diff_files([], self.d, state), [f"  - remove {self.target}"])
+        (ok, _out) = _quiet(files.install_files, [], self.d, state)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(self.target))
+        self.assertEqual(state["files"], {})
+
+    def test_non_empty_directory_is_kept(self):
+        from tools.diff import _diff_files
+
+        state = {}
+        _quiet(files.install_files, self.entries(), self.d, state)
+        _write(os.path.join(self.target, "shot.png"), "x")
+        self.assertEqual(
+            _diff_files([], self.d, state), [f"  ~ keep {self.target} (not empty; not removed)"]
+        )
+        (ok, _out) = _quiet(files.install_files, [], self.d, state)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(os.path.join(self.target, "shot.png")))
+        self.assertIn(self.target, state["files"])
+
+    def test_existing_directory_is_not_adopted(self):
+        os.makedirs(self.target)
+        state = {}
+        (ok, _out) = _quiet(files.install_files, self.entries(mode="0700"), self.d, state)
+        self.assertTrue(ok)
+        self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o700)
+        self.assertEqual(state["files"], {})
+        _quiet(files.install_files, [], self.d, state)
+        self.assertTrue(os.path.isdir(self.target))
+
+    def test_file_or_symlink_at_target_refused(self):
+        from tools.diff import _diff_files
+
+        os.makedirs(os.path.dirname(self.target))
+        os.symlink(self.d, self.target)
+        state = {}
+        rows = _diff_files(self.entries(), self.d, state)
+        self.assertEqual(rows, [f"  ! {self.target} exists and is not a directory"])
+        (ok, _out) = _quiet(files.install_files, self.entries(), self.d, state)
+        self.assertFalse(ok)
+        self.assertTrue(os.path.islink(self.target))
+
+    def test_hook_runs_on_create_only(self):
+        marker = os.path.join(self.d, "ran")
+        entries = self.entries(onChange=f"echo x >> {marker}")
+        state = {}
+        _quiet(files.install_files, entries, self.d, state)
+        _quiet(files.install_files, entries, self.d, state)
+        with open(marker) as f:
+            self.assertEqual(f.read(), "x\n")
+
+    def test_files_inside_a_directory_entry_are_not_conflicts(self):
+        from tools.user import secrets_flow
+
+        _write(os.path.join(self.d, "src", "k"), "k\n")
+        entries = self.entries(mode="0700") + [
+            {"source": "src/k", "target": os.path.join(self.target, "k")}
+        ]
+        conflicts = secrets_flow.ownership_conflicts(
+            files_entries=entries, state={}, config_dir=self.d
+        )
+        (ok, _out) = _quiet(files.install_files, entries, self.d, {}, conflicts)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.isfile(os.path.join(self.target, "k")))
+
+    def test_directory_tracked_and_hooked_when_declared_after_its_files(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "k"), "k\n")
+        marker = os.path.join(self.d, "ran")
+        entries = [{"source": "src/k", "target": os.path.join(self.target, "k")}] + self.entries(
+            onChange=f"echo x >> {marker}"
+        )
+        state = {}
+        rows = _diff_files(entries, self.d, state)
+        self.assertEqual(rows[0], f"  + create directory {self.target}")
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertTrue(state["files"][self.target]["dir"])
+        self.assertTrue(os.path.exists(marker))
+
+    def test_directory_removed_with_its_files_in_one_deploy(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "k"), "k\n")
+        inner = os.path.join(self.target, "inner")
+        entries = [
+            {"source": "src/k", "target": os.path.join(inner, "k")},
+            {"target": inner, "directory": True},
+        ] + self.entries()
+        state = {}
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(len(state["files"]), 3)
+        rows = _diff_files([], self.d, state)
+        self.assertEqual(
+            rows,
+            [
+                f"  - remove {os.path.join(inner, 'k')}",
+                f"  - remove {inner}",
+                f"  - remove {self.target}",
+            ],
+        )
+        (ok, _out) = _quiet(files.install_files, [], self.d, state)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(self.target))
+        self.assertEqual(state["files"], {})
+
+    def test_record_survives_device_renumbering(self):
+        state = {}
+        _quiet(files.install_files, self.entries(), self.d, state)
+        state["files"][self.target]["dev"] += 1
+        (ok, _out) = _quiet(files.install_files, self.entries(), self.d, state)
+        self.assertTrue(ok)
+        self.assertIn(self.target, state["files"])
+        state["files"][self.target]["dev"] += 1
+        _quiet(files.install_files, [], self.d, state)
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_mode_inside_secrets_dir_refused(self):
+        from tools.fsutil import SECRETS_DIR_MODE
+        from tools.user import secrets_flow
+
+        secrets_dir = os.path.join(self.d, "secrets")
+        sops_raw = {"secretsDir": secrets_dir}
+        target = os.path.join(secrets_dir, "sub")
+        for mode, refused in (("0700", True), (oct(SECRETS_DIR_MODE)[2:], False), (None, False)):
+            entry = {"target": target, "directory": True}
+            if mode:
+                entry["mode"] = mode
+            conflicts = secrets_flow.ownership_conflicts(
+                files_entries=[entry], sops_raw=sops_raw, state={}, config_dir=self.d
+            )
+            self.assertEqual(files._conflict(target, conflicts) is not None, refused, mode)
+
+    def test_state_only_directory_never_blocks_other_sections(self):
+        from tools.diff import _diff_files
+        from tools.user import secrets_flow
+
+        _write(os.path.join(self.d, "src", "k"), "k\n")
+        state = {}
+        _quiet(files.install_files, self.entries(), self.d, state)
+        inner = os.path.join(self.target, "k")
+        files_only = secrets_flow.ownership_conflicts(
+            files_entries=[{"source": "src/k", "target": inner}], state=state, config_dir=self.d
+        )
+        self.assertIsNone(files._conflict(inner, files_only))
+
+        tmpl = {"t": {"path": inner, "content": "x"}}
+        sops_file = os.path.join(self.d, "secrets.yaml")
+        _write(sops_file, "ENC")
+        sops_raw = {
+            "binary": "/fake/sops",
+            "secretsDir": os.path.join(self.d, "secrets"),
+            "defaultSopsFile": sops_file,
+            "secrets": {"s": {"path": inner + "2", "key": "s"}},
+        }
+        self.assertEqual(
+            [x.path for x in secrets_flow.sops.parse_sops(sops_raw).secrets], [inner + "2"]
+        )
+        for others in ({"templates_raw": tmpl}, {"sops_raw": sops_raw}):
+            st = {"files": dict(state["files"])}
+            for _deploy in range(2):
+                c = secrets_flow.ownership_conflicts(state=st, config_dir=self.d, **others)
+                self.assertIsNone(files._conflict(inner, c), others)
+                self.assertIsNone(files._conflict(inner + "2", c), others)
+                self.assertIsNone(files._conflict(self.target, c), others)
+                if _deploy == 0:
+                    self.assertEqual(
+                        _diff_files([], self.d, st, c),
+                        [f"  ~ release {self.target} (another section manages a path inside)"],
+                    )
+                    _write(inner, "x")
+                (ok, _out) = _quiet(files.install_files, [], self.d, st, c)
+                self.assertTrue(ok)
+                self.assertNotIn(self.target, st["files"])
+            self.assertTrue(os.path.isdir(self.target))
+            os.remove(inner)
+
+    def test_trailing_slash_symlink_never_followed(self):
+        from tools.diff import _diff_files
+
+        real = os.path.join(self.d, "real")
+        os.makedirs(real)
+        os.chmod(real, 0o755)
+        link = os.path.join(self.d, "link")
+        os.symlink(real, link)
+        entries = [{"target": link + "/", "directory": True, "mode": "0700"}]
+        state = {}
+        self.assertEqual(
+            _diff_files(entries, self.d, state), [f"  ! {link} exists and is not a directory"]
+        )
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertFalse(ok)
+        self.assertEqual(os.stat(real).st_mode & 0o777, 0o755)
+
+        state = {"files": {link + "/": {"dir": True, "ino": os.stat(real).st_ino}}}
+        (ok, _out) = _quiet(files.install_files, [], self.d, state)
+        self.assertTrue(os.path.isdir(real))
+        self.assertTrue(os.path.islink(link))
+
+    def test_directory_inside_secrets_dir_is_private(self):
+        from tools.fsutil import SECRETS_DIR_MODE
+
+        secrets_dir = os.path.join(self.d, "secrets")
+        target = os.path.join(secrets_dir, "sub")
+        state = {}
+        (ok, _out) = _quiet(
+            files.install_files,
+            [{"target": target, "directory": True}],
+            self.d,
+            state,
+            None,
+            secrets_dir,
+        )
+        self.assertTrue(ok)
+        for d in (secrets_dir, target):
+            self.assertEqual(os.stat(d).st_mode & 0o777, SECRETS_DIR_MODE)
+        self.assertEqual(state["sops"]["createdDirs"], [secrets_dir, target])
+        self.assertTrue(state["files"][target]["dir"])
+
+    def test_malformed_directory_entries(self):
+        for entry in (
+            {"directory": True},
+            {"directory": True, "target": "~/x", "source": "y"},
+            {"directory": "yes", "target": "~/x"},
+        ):
+            _resolved, errors = files._resolve_entries([entry], self.d)
+            self.assertEqual(len(errors), 1, entry)

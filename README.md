@@ -56,11 +56,35 @@ Notable keys:
   `~/.local/state/tools/state.json`).
 - `paths` — binary/install locations the reconcilers use; documented in the
   comment block of `examples/config.yaml`.
-- `files:` entries take `{source, target, mode?, secrets?}` or
-  `{dir, mode?, secrets?}`. `mode` must be a **quoted octal string** (`"0644"`);
-  bare YAML ints are rejected as ambiguous. `secrets: true` suppresses inline
-  content diffs for that entry. Removals wait while any entry is malformed; a
-  target refused by another owner stays tracked and does not hold others.
+- `files:` entries take `{source, target, mode?, secrets?}`,
+  `{dir, mode?, secrets?}` or `{target, directory: true, mode?}`. `mode` must be
+  a **quoted octal string** (`"0644"`); bare YAML ints are rejected as
+  ambiguous. `secrets: true` suppresses inline content diffs for that entry.
+  Removals wait while any entry is malformed; a target refused by another owner
+  stays tracked and does not hold others.
+- `directory: true` ensures the directory (and its parents) exists and applies
+  `mode`. Only a directory tools created is tracked, and it is removed only
+  while empty; parents and pre-existing directories are never removed. Other
+  managed paths may live inside it. Inside `secretsDir` only mode `0751` (or
+  none) is accepted.
+- `onChange: "<shell command>"` (on `files:` entries and templates) runs via
+  `/bin/sh -c` after the deploy creates, updates or chmods that entry, once per
+  distinct command per section (a `dir:` walk runs it once however many files
+  changed; templates run theirs after every phase). Unchanged deploys,
+  removals and `tools diff` never run it; diff lists it as `run onChange`. A
+  failing command fails the deploy, the written file stays, and the command is
+  retried on each deploy until it succeeds or is no longer declared.
+
+  ```yaml
+  files:
+    - source: amethyst/amethyst.yml
+      target: ~/.config/amethyst/amethyst.yml
+      onChange: pkill -x Amethyst; open -a Amethyst
+    - target: ~/Screenshots
+      directory: true
+      mode: "0755"
+  ```
+
 - `vars` — placeholder values for every other section; see below.
 
 ## Vars and placeholders

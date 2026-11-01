@@ -182,6 +182,8 @@ def _run_sections(
 
     if inside:
         success &= secrets(conflicts, secrets_flow.LATE)
+    if run_templates:
+        success &= secrets_flow.run_template_hooks(config.get("templates"), state)
     for line in secrets_flow.format_notify(report):
         log(line, Color.YELLOW)
 
@@ -233,7 +235,13 @@ def _run_sections(
         success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
 
     if "files" in active:
-        success &= install_files(config.get("files", []) or [], config_dir, state, conflicts)
+        success &= install_files(
+            config.get("files", []) or [],
+            config_dir,
+            state,
+            conflicts,
+            sops_section.parse_sops(config.get("sops")).secrets_dir()[0],
+        )
 
     # Gated on state too, like gitRepos: dropping the whole section must
     # still reach the reconciler so it can remove what it installed.
