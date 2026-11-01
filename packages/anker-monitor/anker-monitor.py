@@ -7,9 +7,10 @@ Architecture (read-only against Anker):
                              battery SOC over Anker's cloud MQTT stream and exposes
                              it on the LAN: GET /soc lists every MQTT-capable device
                              on the account (the --pn/--sn one flagged "primary"),
-                             /soc/<sn> returns one. Optionally posts a Discord note
-                             each time a device's SOC crosses a --notify-step boundary
-                             and when a device starts charging or discharging.
+                             /soc/<sn> returns one, GET / renders a dashboard.
+                             Optionally posts a Discord note each time a device's
+                             SOC crosses a --notify-step boundary and when a device
+                             starts charging or discharging.
     anker-monitor check   -- runs on each protected host. Polls /soc and reads the
                              primary entry (or a bare object from an older serve);
                              when SOC stays at/below the threshold it shuts the host
@@ -32,6 +33,7 @@ import logging
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import click
 from aiohttp import ClientSession, ClientTimeout, web
@@ -44,6 +46,7 @@ except Exception:  # noqa: BLE001 - never let a missing notifier break monitorin
     send_discord = None
 
 LOG = logging.getLogger("anker-monitor")
+DASHBOARD = Path(__file__).with_name("dashboard.html")
 
 DEFAULT_PN = "A1763"  # C1000 Gen 2
 TRIGGER_TIMEOUT = 300  # seconds the device keeps publishing before re-trigger
@@ -345,6 +348,7 @@ async def _serve(
 
         sampler_task = asyncio.create_task(sampler())
         app = web.Application()
+        app.router.add_get("/", lambda _r: web.FileResponse(DASHBOARD))
         app.router.add_get("/soc", soc_all)
         app.router.add_get("/soc/{sn}", soc_by_sn)
         app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))

@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anker Power</title>
+<style>
+:root{
+  --bg:#f5f5f2;--card:#fff;--ink:#16181d;--mute:#6b7079;--line:#e4e4df;
+  --ok:#1f9d55;--warn:#d98b00;--bad:#d64545;--accent:#2f6fed;--track:#ececE7;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f1115;--card:#181b21;--ink:#e9eaee;--mute:#8b909a;--line:#262a32;
+  --ok:#3ccf7f;--warn:#f0ad2c;--bad:#f06a6a;--accent:#6c9bff;--track:#252932;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.45 ui-sans-serif,-apple-system,"SF Pro Text",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1120px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+h1{font-size:20px;margin:0;letter-spacing:-.01em}
+.meta{color:var(--mute);font-size:12px;display:flex;gap:10px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block}
+.dot.off{background:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,500px),1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+.top{display:flex;gap:20px;align-items:center}
+.ring{flex:none;position:relative;width:128px;height:128px}
+.ring svg{transform:rotate(-90deg)}
+.ring .v{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring .v b{font-size:32px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.ring .v span{font-size:11px;color:var(--mute)}
+.name{font-size:17px;font-weight:600;margin:0 0 2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{font-size:11px;font-weight:500;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--mute)}
+.pill.primary{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,transparent)}
+.pill.chg{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+.pill.dis{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+.pill.stale{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
+.sub{color:var(--mute);font-size:12px}
+.flows{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}
+.flow{background:var(--bg);border-radius:10px;padding:8px 10px}
+.flow small{display:block;color:var(--mute);font-size:11px}
+.flow b{font-size:18px;font-variant-numeric:tabular-nums}
+.flow b i{font-style:normal;font-size:12px;color:var(--mute);font-weight:400;margin-left:2px}
+h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:20px 0 8px;font-weight:600}
+.ports{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:8px}
+.port{border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.port small{color:var(--mute);font-size:11px;display:flex;justify-content:space-between;align-items:center}
+.port b{font-variant-numeric:tabular-nums}
+.port.on{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
+.led{width:6px;height:6px;border-radius:50%;background:var(--line)}
+.port.on .led{background:var(--ok)}
+.packs{display:flex;flex-direction:column;gap:8px}
+.bar{display:grid;grid-template-columns:90px 1fr 48px;gap:10px;align-items:center;font-size:12px}
+.bar .t{height:8px;border-radius:99px;background:var(--track);overflow:hidden}
+.bar .t div{height:100%;border-radius:99px}
+.bar .n{text-align:right;font-variant-numeric:tabular-nums}
+dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:2px 16px;margin:0}
+dl div{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:12px}
+dt{color:var(--mute)}dd{margin:0;font-variant-numeric:tabular-nums;text-align:right}
+details{margin-top:16px}
+summary{cursor:pointer;color:var(--mute);font-size:12px}
+pre{font-size:11px;overflow:auto;background:var(--bg);padding:10px;border-radius:8px;max-height:320px}
+.err{color:var(--bad);font-size:12px}
+@media (max-width:520px){.top{flex-direction:column;align-items:flex-start}.flows{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Anker Power</h1>
+    <div class="meta"><span class="dot" id="live"></span><span id="upd">loading…</span></div>
+  </header>
+  <div class="grid" id="grid"></div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const num = v => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
+const w = v => { const n = num(v); return n >= 100 ? Math.round(n) : +n.toFixed(1); };
+const socColor = p => p <= 25 ? "var(--bad)" : p <= 50 ? "var(--warn)" : "var(--ok)";
+const onOff = v => v === undefined ? null : (+v ? "on" : "off");
+const PORT_LABEL = {usbc:"USB-C", usba:"USB-A", dc_12v:"12V DC"};
+
+function ring(p){
+  const known = p !== null && p !== undefined;
+  if (!known) p = 0;
+  const r = 54, c = 2 * Math.PI * r, off = c * (1 - Math.max(0, Math.min(100, p)) / 100);
+  return `<div class="ring"><svg width="128" height="128">
+    <circle cx="64" cy="64" r="${r}" fill="none" stroke="var(--track)" stroke-width="10"/>
+    <circle cx="64" cy="64" r="${r}" fill="none" stroke="${socColor(p)}" stroke-width="10"
+      stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}"/>
+  </svg><div class="v"><b>${known ? p + "%" : "—"}</b><span>battery</span></div></div>`;
+}
+
+function ports(s){
+  const out = [];
+  const keys = Object.keys(s).filter(k => /^(usbc|usba|dc_12v)_\d+_status$/.test(k)).sort();
+  for (const k of keys){
+    const base = k.replace(/_status$/, ""), m = base.match(/^(.*)_(\d+)$/);
+    const on = +s[k] === 1 || num(s[base + "_power"]) > 0;
+    const pw = s[base + "_power"];
+    out.push(`<div class="port ${on ? "on" : ""}"><small>${PORT_LABEL[m[1]]} ${m[2]}<span class="led"></span></small>
+      <b>${pw !== undefined ? w(pw) + " W" : (on ? "on" : "off")}</b></div>`);
+  }
+  const acOn = s.ac_output_power_switch !== undefined ? +s.ac_output_power_switch === 1 : +s.ac_output_status === 1;
+  out.unshift(`<div class="port ${acOn ? "on" : ""}"><small>AC out<span class="led"></span></small><b>${w(s.ac_output_power)} W</b></div>`);
+  return out.join("");
+}
+
+function packs(d){
+  const s = d.status || {}, rows = [];
+  const bar = (label, soc, soh, temp) => `<div class="bar"><span>${label}</span>
+    <div class="t"><div style="width:${soc}%;background:${socColor(soc)}"></div></div>
+    <span class="n">${soc}%</span></div>
+    <div class="sub" style="margin:-4px 0 4px 100px">health ${num(soh).toFixed(0)}%${temp ? ` · ${temp}°C` : ""}</div>`;
+  rows.push(bar("Main", num(s.main_battery_soc ?? d.main_soc), s.battery_soh, s.temperature));
+  for (let i = 1; i <= (+s.expansion_packs || 0); i++)
+    rows.push(bar(`Exp ${i}${s[`exp_${i}_type`] ? ` <span class="sub">${esc(s[`exp_${i}_type`].replace(/^A\d+_/, ""))}</span>` : ""}`,
+      num(s[`exp_${i}_soc`]), s[`exp_${i}_soh`], s[`exp_${i}_temperature`]));
+  return rows.join("");
+}
+
+function details(s){
+  const f = [
+    ["Model", s.device_pn], ["Temperature", s.temperature && s.temperature + "°C"],
+    ["Charge limit", s.max_soc && s.max_soc + "%"], ["Power cutoff", s.power_cutoff && s.power_cutoff + "%"],
+    ["AC input limit", s.ac_input_limit && `${s.ac_input_limit}${s.ac_input_limit_max ? " / " + s.ac_input_limit_max : ""} W`],
+    ["AC frequency", s.ac_frequency && s.ac_frequency + " Hz"],
+    ["AC fast charge", onOff(s.ac_fast_charge_switch)], ["Port memory", onOff(s.port_memory_switch)],
+    ["DC output", onOff(s.dc_output_power_switch)], ["Light", onOff(s.light_mode)],
+    ["Device timeout", s.device_timeout_minutes !== undefined && s.device_timeout_minutes + " min"],
+    ["Display timeout", s.display_timeout_seconds !== undefined && s.display_timeout_seconds + " s"],
+    ["Wi-Fi", s.wifi_name && `${s.wifi_name}${s.wifi_signal ? " · " + s.wifi_signal + "%" : ""}`],
+    ["Firmware", s.sw_version], ["BMS", s.bms_version], ["Hardware", s.hw_version],
+    ["Controller", s.sw_controller], ["Expansion fw", s.sw_expansion],
+  ].filter(([, v]) => v !== undefined && v !== null && v !== false && v !== "");
+  return f.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("");
+}
+
+function card(d){
+  const s = d.status || {};
+  const outW = num(s.output_power_total ?? d.ac_w), acIn = num(s.ac_input_power_total ?? s.ac_input_power ?? d.ac_in_w);
+  const dcIn = num(s.dc_input_power_total ?? s.dc_input_power) + num(s.photovoltaic_power);
+  const hrs = num(s.remaining_time_hours);
+  const state = d.charging ? `<span class="pill chg">charging</span>` : d.discharging ? `<span class="pill dis">discharging</span>` : `<span class="pill">idle</span>`;
+  return `<section class="card">
+    <div class="top">${ring(d.soc)}
+      <div style="flex:1;min-width:0">
+        <p class="name">${esc(d.name)} ${d.primary ? `<span class="pill primary">primary</span>` : ""} ${state} ${d.stale ? `<span class="pill stale">stale</span>` : ""}</p>
+        <div class="sub">${esc(d.sn)} · updated ${esc(d.ts)} (${d.age === null ? "never" : Math.round(d.age) + "s ago"})</div>
+        <div class="sub">${hrs ? `~${hrs} h remaining at current load` : "no load"}</div>
+        <div class="flows">
+          <div class="flow"><small>Output</small><b>${w(outW)}<i>W</i></b></div>
+          <div class="flow"><small>AC in</small><b>${w(acIn)}<i>W</i></b></div>
+          <div class="flow"><small>DC / solar in</small><b>${w(dcIn)}<i>W</i></b></div>
+        </div>
+      </div>
+    </div>
+    <h3>Ports</h3><div class="ports">${ports(s)}</div>
+    <h3>Batteries</h3><div class="packs">${packs(d)}</div>
+    <h3>Device</h3><dl>${details(s)}</dl>
+    <details><summary>Raw status</summary><pre>${esc(JSON.stringify(d, null, 2))}</pre></details>
+  </section>`;
+}
+
+function render(list){
+  list = (Array.isArray(list) ? list : [list]).sort((a, b) => (b.primary ? 1 : 0) - (a.primary ? 1 : 0));
+  $("#grid").innerHTML = list.map(card).join("");
+  $("#live").className = "dot";
+  $("#upd").textContent = `live · ${new Date().toLocaleTimeString()}`;
+}
+
+async function tick(){
+  try {
+    const r = await fetch("soc", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+  } catch (e) {
+    $("#live").className = "dot off";
+    $("#upd").textContent = `unreachable (${e.message}) · ${new Date().toLocaleTimeString()}`;
+  }
+}
+tick(); setInterval(tick, 10000);
+</script>
+</body>
+</html>
