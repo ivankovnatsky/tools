@@ -3,7 +3,7 @@
 
 Architecture (read-only against Anker):
 
-    anker-monitor serve   -- one process, one Anker cloud login. Reads the C1000
+    battery-monitoring serve -- one process, one Anker cloud login. Reads the C1000
                              battery SOC over Anker's cloud MQTT stream and exposes
                              it on the LAN: GET /soc lists every MQTT-capable device
                              on the account (the --pn/--sn one flagged "primary"),
@@ -11,7 +11,7 @@ Architecture (read-only against Anker):
                              Optionally posts a Discord note each time a device's
                              SOC crosses a --notify-step boundary and when a device
                              starts charging or discharging.
-    anker-monitor check   -- runs on each protected host. Polls /soc and reads the
+    battery-monitoring check -- runs on each protected host. Polls /soc and reads the
                              primary entry (or a bare object from an older serve);
                              when SOC stays at/below the threshold it shuts the host
                              down cleanly (before the C1000's own ~15% AC cutoff).
@@ -45,7 +45,7 @@ try:  # shared repo helper on PYTHONPATH; notifications are best-effort
 except Exception:  # noqa: BLE001 - never let a missing notifier break monitoring
     send_discord = None
 
-LOG = logging.getLogger("anker-monitor")
+LOG = logging.getLogger("battery-monitoring")
 DASHBOARD = Path(__file__).with_name("dashboard.html")
 
 DEFAULT_PN = "A1763"  # C1000 Gen 2
@@ -69,7 +69,7 @@ def _notify(webhook, message):
     if not webhook or send_discord is None:
         return
     try:
-        send_discord(webhook, message, source="anker-monitor")
+        send_discord(webhook, message, source="battery-monitoring")
     except Exception as err:  # noqa: BLE001 - a failed alert must not break the loop
         LOG.warning("discord notify failed: %s", err)
 

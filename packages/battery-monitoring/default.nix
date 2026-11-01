@@ -51,7 +51,7 @@ let
     anker-solix-api
   ]);
 in
-pkgs.writeShellScriptBin "anker-monitor" ''
+pkgs.writeShellScriptBin "battery-monitoring" ''
   export PYTHONPATH="${discordSrc}''${PYTHONPATH:+:$PYTHONPATH}"
-  exec ${python}/bin/python ${src}/anker-monitor.py "$@"
+  exec ${python}/bin/python ${src}/battery-monitoring.py "$@"
 ''
