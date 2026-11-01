@@ -63,7 +63,7 @@ def cmd_auth_status(creds):
         ("API key", key_source, creds.api_key() is not None),
     ]
     for label, path, present in entries:
-        click.echo(f"{'✓' if present else '✗'} {label:<13} {path or '(unset)'}")
+        click.echo(f"{'✓' if present else '✗'} {label:<13} {path}")
 
 
 def cmd_trending(creds, region, category, limit, save_dir, output_format):

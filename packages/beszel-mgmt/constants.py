@@ -1,6 +1,6 @@
 """Constants for beszel-mgmt."""
 
-SECRETS_DIR_ENV = "SECRETS_DIR"
-EMAIL_SECRET = "beszel-email"
-PASSWORD_SECRET = "beszel-password"
-DISCORD_WEBHOOK_SECRET = "discord-webhook-beszel"
+DEFAULT_SECRETS_PATH = "~/.config/sops-nix/secrets"
+DEFAULT_EMAIL_PATH = f"{DEFAULT_SECRETS_PATH}/beszel-email"
+DEFAULT_PASSWORD_PATH = f"{DEFAULT_SECRETS_PATH}/beszel-password"
+DEFAULT_DISCORD_WEBHOOK_PATH = f"{DEFAULT_SECRETS_PATH}/discord-webhook-beszel"

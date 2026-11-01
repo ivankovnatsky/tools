@@ -1,7 +1,6 @@
 """Argument parsing and CLI entry point for beszel-mgmt."""
 
 import json
-import os
 import sys
 
 import click
@@ -10,10 +9,9 @@ from auth import read_secret_file
 from client import BeszelClient
 from commands import cmd_list, cmd_get, cmd_create, cmd_update, cmd_delete, cmd_sync
 from constants import (
-    DISCORD_WEBHOOK_SECRET,
-    EMAIL_SECRET,
-    PASSWORD_SECRET,
-    SECRETS_DIR_ENV,
+    DEFAULT_EMAIL_PATH,
+    DEFAULT_PASSWORD_PATH,
+    DEFAULT_DISCORD_WEBHOOK_PATH,
 )
 
 
@@ -107,18 +105,12 @@ def delete_cmd(base_url, email, password, system_id):
     default=False,
     help="Show what would be changed without making changes",
 )
-@click.option(
-    "--secrets-dir",
-    envvar=SECRETS_DIR_ENV,
-    required=True,
-    help=f"Directory holding {EMAIL_SECRET}, {PASSWORD_SECRET} and "
-    f"{DISCORD_WEBHOOK_SECRET} (env: {SECRETS_DIR_ENV})",
-)
-def sync_cmd(config_file, dry_run, secrets_dir):
+def sync_cmd(config_file, dry_run):
     """Sync systems from configuration file.
 
-    Reads credentials from files under --secrets-dir. base_url is read from
-    the config JSON.
+    Reads credentials directly from sops-rendered files under
+    ~/.config/sops-nix/secrets/ (beszel-email, beszel-password,
+    discord-webhook-beszel). base_url is read from the config JSON.
     """
     with open(config_file) as f:
         config = json.load(f)
@@ -127,11 +119,9 @@ def sync_cmd(config_file, dry_run, secrets_dir):
         click.echo("Error: config file missing 'base_url' field", err=True)
         sys.exit(1)
 
-    email = _require_secret(os.path.join(secrets_dir, EMAIL_SECRET), "email")
-    password = _require_secret(os.path.join(secrets_dir, PASSWORD_SECRET), "password")
-    discord_webhook = read_secret_file(
-        os.path.join(secrets_dir, DISCORD_WEBHOOK_SECRET)
-    )
+    email = _require_secret(DEFAULT_EMAIL_PATH, "email")
+    password = _require_secret(DEFAULT_PASSWORD_PATH, "password")
+    discord_webhook = read_secret_file(DEFAULT_DISCORD_WEBHOOK_PATH)
 
     client = BeszelClient(base_url, email, password)
     cmd_sync(config_file, dry_run, discord_webhook, client)

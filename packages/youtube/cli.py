@@ -1,7 +1,5 @@
 """Argument parsing and CLI entry point for youtube."""
 
-import os
-
 import click
 from client import Credentials
 from commands import (
@@ -20,13 +18,12 @@ from commands import (
     cmd_video,
 )
 from constants import (
-    API_KEY_NAME,
     CATEGORIES,
     CATEGORY_ALIASES,
     CATEGORY_DOCS_URL,
     CHART_LIMIT,
-    CLIENT_SECRET_NAME,
-    SECRETS_DIR_ENV,
+    DEFAULT_API_KEY_PATH,
+    DEFAULT_CLIENT_SECRET_PATH,
     default_token_dir,
 )
 
@@ -87,22 +84,16 @@ def _resolve_category(ctx, param, value):
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option(
-    "--secrets-dir",
-    envvar=SECRETS_DIR_ENV,
-    default=None,
-    help=f"Directory holding {CLIENT_SECRET_NAME} and {API_KEY_NAME} "
-    f"(env: {SECRETS_DIR_ENV})",
-)
-@click.option(
     "--client-secret-file",
-    default=None,
-    help=f"Google OAuth client JSON (Desktop app) (default: <secrets-dir>/{CLIENT_SECRET_NAME})",
+    default=DEFAULT_CLIENT_SECRET_PATH,
+    show_default=True,
+    help="Google OAuth client JSON (Desktop app)",
 )
 @click.option(
     "--api-key-file",
-    default=None,
-    help="API key for public data; $YOUTUBE_API_KEY wins when set "
-    f"(default: <secrets-dir>/{API_KEY_NAME})",
+    default=DEFAULT_API_KEY_PATH,
+    show_default=True,
+    help="API key for public data; $YOUTUBE_API_KEY wins when set",
 )
 @click.option(
     "--token-dir",
@@ -111,18 +102,13 @@ def _resolve_category(ctx, param, value):
     help="Where OAuth refresh tokens are kept",
 )
 @click.pass_context
-def main(ctx, secrets_dir, client_secret_file, api_key_file, token_dir):
+def main(ctx, client_secret_file, api_key_file, token_dir):
     """YouTube Data API v3 tool.
 
     Public commands (trending, search, video, channel, playlist, categories)
     use the API key when one is configured and fall back to the read-only
     OAuth token otherwise. Account commands always use OAuth.
     """
-    if secrets_dir:
-        client_secret_file = client_secret_file or os.path.join(
-            secrets_dir, CLIENT_SECRET_NAME
-        )
-        api_key_file = api_key_file or os.path.join(secrets_dir, API_KEY_NAME)
     ctx.obj = Credentials(client_secret_file, api_key_file, token_dir)
 
 

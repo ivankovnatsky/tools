@@ -10,29 +10,23 @@ import webbrowser
 
 import click
 import requests
-from constants import AUTH_URI, CONSENT_TIMEOUT, SECRETS_DIR_ENV, TOKEN_URI, USER_AGENT
+from constants import AUTH_URI, CONSENT_TIMEOUT, TOKEN_URI, USER_AGENT
 
 
-def read_secret_file(path: str | None) -> str | None:
-    """Read and strip a secret file's contents, or None if unset or missing.
+def read_secret_file(path: str) -> str | None:
+    """Read and strip a secret file's contents, or None if missing.
 
     Distinguishes FileNotFoundError (silent None) from other OSError
     (re-raise) so a permissions error isn't masked as "not configured".
     """
-    if not path:
-        return None
     try:
         return open(os.path.expanduser(path)).read().strip()
     except FileNotFoundError:
         return None
 
 
-def client_credentials(client_secret_file: str | None) -> tuple[str, str]:
+def client_credentials(client_secret_file: str) -> tuple[str, str]:
     """Return (client_id, client_secret) from a Google OAuth client JSON."""
-    if not client_secret_file:
-        raise click.ClickException(
-            f"no OAuth client: pass --client-secret-file, or --secrets-dir / ${SECRETS_DIR_ENV}"
-        )
     raw = read_secret_file(client_secret_file)
     if not raw:
         raise click.ClickException(
