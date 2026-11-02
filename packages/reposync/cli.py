@@ -149,8 +149,14 @@ def _gitdir_repo_at(path, repos):
 
 @main.command()
 @config_file_option
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite the remote even if its tip was never local here; "
+    "drops commits only another host has.",
+)
 @click.argument("path", default=".", type=click.Path(exists=True, file_okay=False))
-def push(config_file, path):
+def push(config_file, force, path):
     """Force the remote to match the local branch of the repo at PATH.
 
     Use after rewinding or rewriting the branch on purpose; `sync` would
@@ -169,7 +175,7 @@ def push(config_file, path):
         repo = next((r for r in repos if os.path.realpath(r["path"]) == target), None)
         if repo is None:
             raise click.ClickException(f"{target} is not a reposync repo")
-    if not push_repo(repo, webhook_url):
+    if not push_repo(repo, webhook_url, force=force):
         sys.exit(1)
     clear_alerts_for_repo(get_repo_full_name(repo))
     sys.exit(0)

@@ -796,11 +796,12 @@ def _in_reflog(path, branch, sha):
     return reflog.returncode == 0 and sha in reflog.stdout.split()
 
 
-def push_repo(repo, webhook_url=None):
+def push_repo(repo, webhook_url=None, force=False):
     """Force the remote to the local branch, for when local was rewound or
     rewritten on purpose and sync would otherwise pull the dropped commits
     back. Refuses unless the remote tip is one this host's branch once had,
-    so commits published by another host are never dropped. Other hosts
+    so commits published by another host are never dropped; `force`
+    skips that check and drops them. Other hosts
     still holding the dropped commits push them back on their next sync
     unless they are reset too. Returns True on success."""
     path = repo["path"]
@@ -866,10 +867,14 @@ def push_repo(repo, webhook_url=None):
     if remote_sha == local_sha and not missing:
         click.echo(f"{name}: OK (already at {local_sha[:8]})", err=True)
         return True
-    if remote_sha is not None and not _in_reflog(path, branch, remote_sha):
+    if (
+        not force
+        and remote_sha is not None
+        and not _in_reflog(path, branch, remote_sha)
+    ):
         click.echo(
             f"{name}: remote tip {remote_sha[:8]} was never local here, "
-            "pull it first or resolve manually",
+            "pull it first, resolve manually or push --force",
             err=True,
         )
         return False
