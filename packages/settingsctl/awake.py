@@ -13,6 +13,25 @@ from common import is_linux, is_macos
 
 DEFAULT_TIMEOUT = 43200  # 12 hours in seconds
 
+DURATION_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+class Duration(click.ParamType):
+    """Duration like '30m', '2h', '90s', '1d', or raw seconds."""
+
+    name = "duration"
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, int):
+            return value
+        text = str(value).strip().lower()
+        try:
+            if text and text[-1] in DURATION_SUFFIXES:
+                return int(text[:-1]) * DURATION_SUFFIXES[text[-1]]
+            return int(text)
+        except ValueError:
+            self.fail(f"{value!r} is not a valid duration (e.g. 90s, 15m, 2h, 1d)")
+
 
 def awake_macos(
     display: bool,
@@ -132,10 +151,11 @@ def register(cli):
     )
     @click.option(
         "--timeout",
-        type=int,
+        type=Duration(),
         default=None,
         help=(
-            "Timeout in seconds before the assertion is dropped (caffeinate -t). "
+            "Timeout before the assertion is dropped (caffeinate -t): seconds "
+            "or a duration like 90s, 15m, 2h, 1d. "
             f"Default when no flags are given: {DEFAULT_TIMEOUT} (12h)."
         ),
     )
