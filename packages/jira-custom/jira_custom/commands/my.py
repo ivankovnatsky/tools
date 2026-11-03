@@ -52,8 +52,6 @@ def my_issues_fn(
         status_name = issue.fields.status.name
         priority_name = issue.fields.priority.name if issue.fields.priority else "None"
         summary = issue.fields.summary
-        if len(summary) > 45:
-            summary = summary[:42] + "..."
         click.echo(f"{key:<15} {status_name:<15} {priority_name:<10} {summary}")
 
 

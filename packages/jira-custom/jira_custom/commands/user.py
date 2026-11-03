@@ -8,15 +8,13 @@ from ..client import get_jira_client
 def show_me_fn():
     """Show current user info"""
     jira = get_jira_client()
-    user = jira.myself()
+    user = jira.myself()  # a dict, not a resource object
 
-    click.echo(f"Name:     {user.displayName}")
-    click.echo(f"Email:    {user.emailAddress}")
-    click.echo(
-        f"Account:  {user.accountId if hasattr(user, 'accountId') else user.name}"
-    )
-    click.echo(f"Active:   {user.active}")
-    click.echo(f"Timezone: {user.timeZone if hasattr(user, 'timeZone') else 'N/A'}")
+    click.echo(f"Name:     {user.get('displayName')}")
+    click.echo(f"Email:    {user.get('emailAddress')}")
+    click.echo(f"Account:  {user.get('accountId')}")
+    click.echo(f"Active:   {user.get('active')}")
+    click.echo(f"Timezone: {user.get('timeZone', 'N/A')}")
 
 
 def show_serverinfo_fn():

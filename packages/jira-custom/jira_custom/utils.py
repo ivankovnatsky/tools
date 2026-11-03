@@ -180,3 +180,54 @@ def truncate_text(text, max_len):
     if max_len <= 3:
         return text[:max_len]
     return text[: max_len - 3] + "..."
+
+
+def resolve_account_id(jira, user):
+    """Resolve "me", an email or a display name to a Jira Cloud accountId.
+
+    Returns None for "x" (unassign). Raises if nothing or several users match.
+    """
+    if user.lower() == "x":
+        return None
+    if user.lower() == "me":
+        return jira.myself()["accountId"]
+
+    url = f"{jira._options['server']}/rest/api/3/user/search"
+    response = jira._session.get(url, params={"query": user})
+    if response.status_code != 200:
+        raise click.ClickException(f"User search failed: {response.text}")
+
+    users = [u for u in response.json() if u.get("active", True)]
+    # The search matches prefixes; require an exact email or name match
+    # so a partial query never picks the wrong person.
+    exact = [
+        u
+        for u in users
+        if user.lower()
+        in (
+            (u.get("emailAddress") or "").lower(),
+            (u.get("displayName") or "").lower(),
+        )
+    ]
+    if len(exact) == 1:
+        return exact[0]["accountId"]
+    candidates = exact or users
+    if not candidates:
+        raise click.ClickException(f"No Jira user matches '{user}'")
+    names = ", ".join(
+        f"{u.get('displayName')} <{u.get('emailAddress', '?')}>" for u in candidates
+    )
+    raise click.ClickException(
+        f"'{user}' is not an exact email or name of one user; candidates: {names}"
+    )
+
+
+def verify_assignee(jira, issue_key, account_id):
+    """Read the issue back and fail if its assignee isn't account_id."""
+    assignee = jira.issue(issue_key, fields="assignee").fields.assignee
+    actual = getattr(assignee, "accountId", None) if assignee else None
+    if actual != account_id:
+        name = assignee.displayName if assignee else "Unassigned"
+        raise click.ClickException(
+            f"Assignee of {issue_key} is {name}, not the requested user"
+        )

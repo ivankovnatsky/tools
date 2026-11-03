@@ -14,7 +14,14 @@ from ..adf import (
 )
 from ..client import get_jira_client
 from ..editor import edit_in_editor
-from ..utils import ISSUE_KEY, parse_labels, move_issue_type, parse_jira_url
+from ..utils import (
+    ISSUE_KEY,
+    move_issue_type,
+    parse_jira_url,
+    parse_labels,
+    resolve_account_id,
+    verify_assignee,
+)
 from .attachment import attachment_group
 from .comment import comment_group, comment_edit_fn
 from .transition import transition_group
@@ -38,20 +45,25 @@ def issue_create_fn(
     }
     if parent:
         fields["parent"] = {"key": parent}
+    account_id = None
     if assignee:
-        fields["assignee"] = {"name": assignee}
+        account_id = resolve_account_id(jira, assignee)
+        if account_id:
+            fields["assignee"] = {"accountId": account_id}
     if labels:
         fields["labels"] = list(labels)
     # API v2 takes wiki markup; set markdown descriptions through v3 as ADF.
     # Convert first so a bad description fails before the issue exists.
     doc = markdown_to_adf(description) if description else None
     issue = jira.create_issue(fields=fields)
-    if doc:
-        try:
+    try:
+        if doc:
             set_description_adf(jira, issue.key, doc)
-        except click.ClickException:
-            click.echo(issue.key)
-            raise
+        if account_id:
+            verify_assignee(jira, issue.key, account_id)
+    except click.ClickException:
+        click.echo(issue.key)
+        raise
     click.echo(issue.key)
 
 
@@ -83,7 +95,8 @@ def issue_update_fn(
     if summary:
         fields["summary"] = summary
     if assignee:
-        fields["assignee"] = {"name": assignee}
+        account_id = resolve_account_id(jira, assignee)
+        fields["assignee"] = {"accountId": account_id} if account_id else None
 
     if labels_add or labels_remove:
         label_ops = []
@@ -107,6 +120,9 @@ def issue_update_fn(
 
     if doc:
         set_description_adf(jira, issue_key, doc)
+
+    if assignee:
+        verify_assignee(jira, issue_key, account_id)
 
     click.echo(f"Updated {issue_key}", err=True)
 
@@ -161,13 +177,19 @@ def status_get_fn(issue_key):
 def issue_assign_fn(issue_key, user):
     """Assign or unassign an issue"""
     jira = get_jira_client()
-    issue = jira.issue(issue_key)
+    account_id = resolve_account_id(jira, user)
 
-    if user.lower() == "x":
-        issue.update(assignee=None)
+    url = f"{jira._options['server']}/rest/api/3/issue/{issue_key}/assignee"
+    response = jira._session.put(url, json={"accountId": account_id})
+    if response.status_code not in (200, 204):
+        raise click.ClickException(
+            f"Assign failed ({response.status_code}): {response.text}"
+        )
+    verify_assignee(jira, issue_key, account_id)
+
+    if account_id is None:
         click.echo(f"Unassigned {issue_key}", err=True)
     else:
-        issue.update(assignee={"name": user})
         click.echo(f"Assigned {issue_key} to {user}", err=True)
 
 
@@ -460,8 +482,6 @@ def issue_list_fn(
             else "Unassigned"
         )
         summary = issue.fields.summary
-        if len(summary) > 35:
-            summary = summary[:32] + "..."
         click.echo(
             f"{key:<15} {itype:<12} {status_name:<15} {assignee_name:<20} {summary}"
         )
@@ -498,7 +518,7 @@ issue_group.add_command(transition_group)
 @click.option("--type", "issue_type", default="Task", help="Issue type (default: Task)")
 @click.option("-d", "--description", help="Issue description")
 @click.option("-p", "--parent", help="Parent issue key for sub-tasks")
-@click.option("-a", "--assignee", help="Assignee email/name")
+@click.option("-a", "--assignee", help="Assignee: email, name or 'me'")
 @click.option("-l", "--label", multiple=True, help="Add label (can be repeated)")
 def issue_create_cmd(
     project, summary, issue_type, description, parent, assignee, label
@@ -512,7 +532,9 @@ def issue_create_cmd(
 @click.argument("issue_key", type=ISSUE_KEY)
 @click.option("-s", "--summary", help="New issue summary/title")
 @click.option("-d", "--description", help="New issue description")
-@click.option("-a", "--assignee", help="New assignee (email/name)")
+@click.option(
+    "-a", "--assignee", help="New assignee: email, name, 'me' or 'x' to unassign"
+)
 @click.option(
     "-l", "--label", multiple=True, help="Add/remove label (prefix with - to remove)"
 )
@@ -578,7 +600,7 @@ def issue_fields_cmd(filter_pattern):
 @click.argument("issue_key", type=ISSUE_KEY)
 @click.argument("user")
 def issue_assign_cmd(issue_key, user):
-    """Assign/unassign issue (use 'x' to unassign)"""
+    """Assign issue to an email, name or 'me' ('x' unassigns)"""
     issue_assign_fn(issue_key, user)
 
 
