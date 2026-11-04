@@ -13,12 +13,16 @@ the last one used).
 
 With no flags it shows an fzf picker. --account / --role narrow the candidates;
 when they leave exactly one match the picker is skipped (non-interactive use).
+
+--destination signs in and lands on a console page instead of the home page:
+it swaps the Destination of the federation URL aws-sso prints.
 """
 
 import configparser
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import click
@@ -76,6 +80,26 @@ def pick(entries: list[tuple[str, str, str]]) -> tuple[str, str, str]:
     return entries[idx]
 
 
+def deep_link(cmd: list[str], destination: str) -> str:
+    """Return the aws-sso federation URL with Destination set to a page URL."""
+    proc = subprocess.run(
+        cmd + ["--url-action", "printurl"], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise click.ClickException("aws-sso console failed")
+    url = next(
+        (w for w in (proc.stdout + proc.stderr).split() if "/federation?" in w),
+        None,
+    )
+    if not url:
+        raise click.ClickException("no federation URL in aws-sso output")
+    parts = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    query["Destination"] = destination
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
 def match(
     entries: list[tuple[str, str, str]], account: str | None, role: str | None
 ) -> list[tuple[str, str, str]]:
@@ -107,8 +131,18 @@ def match(
     is_flag=True,
     help="Print the URL instead of opening it.",
 )
+@click.option(
+    "-d",
+    "--destination",
+    metavar="URL",
+    help="Console page to open after sign-in (e.g. a CloudWatch or Billing URL).",
+)
 def main(
-    account: str | None, role: str | None, region: str | None, print_url: bool
+    account: str | None,
+    role: str | None,
+    region: str | None,
+    print_url: bool,
+    destination: str | None,
 ) -> None:
     """Open the AWS SSO console for a selected profile."""
     entries = load_profiles()
@@ -129,6 +163,15 @@ def main(
     console_region = load_region(region)
     if console_region:
         cmd += ["--region", console_region]
+    if destination:
+        if not destination.startswith("https://"):
+            raise click.ClickException("--destination must be an https:// URL")
+        url = deep_link(cmd, destination)
+        if print_url:
+            click.echo(url)
+        elif click.launch(url) != 0:
+            raise click.ClickException("failed to open the browser")
+        return
     cmd += ["--url-action", "print" if print_url else "open"]
     subprocess.run(cmd, check=True)
 
