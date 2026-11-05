@@ -466,6 +466,16 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
     )
     if run_sops or run_templates:
         decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
+    # In memory only: diff never saves state.
+    moves = secrets_flow.move_between_sections(
+        state,
+        files_entries=config.get("files"),
+        sops_raw=config.get("sops"),
+        templates_raw=config.get("templates"),
+        config_dir=config_dir,
+    )
+    if moves:
+        sections.append(("move", [f"~ move {m}" for m in moves]))
     conflicts = secrets_flow.ownership_conflicts(
         files_entries=config.get("files"),
         sops_raw=config.get("sops"),

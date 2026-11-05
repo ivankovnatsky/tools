@@ -183,6 +183,80 @@ def _link_owned_paths(links_raw, skills_raw, state: Dict, config_dir: str):
     return link_paths, trees
 
 
+def move_between_sections(
+    state: Dict,
+    *,
+    files_entries=None,
+    sops_raw=None,
+    templates_raw=None,
+    config_dir: str = ".",
+) -> List[str]:
+    """Move state records of paths whose owner changed in config.
+
+    When exactly one of files, sops and templates declares a path that another
+    of them only tracks in state, the record moves to the declaring section so
+    it adopts the file instead of both refusing it. Only a file still as tools
+    wrote it moves (a missing one just drops the record); an edited one keeps
+    its record and stays refused. Skipped
+    while any of the three sections has config errors. Mutates ``state`` and
+    returns ``"<path> (<from> -> <to>)"`` per move.
+    """
+    from tools.user.files import _file_hash, _record, _resolve_entries
+
+    entries, files_errors = _resolve_entries(files_entries or [], config_dir)
+    parsed_sops = sops.parse_sops(sops_raw)
+    tmpls, tmpl_errors = templates.parse_templates(templates_raw, *parsed_sops.secrets_dir())
+    if files_errors or parsed_sops.errors or tmpl_errors:
+        return []
+
+    declared: Dict[str, Tuple[str, str, str]] = {}  # key -> (section, path, name)
+    counts: Dict[str, int] = {}
+    for section, items in (
+        ("files", [(e.target, "") for e in entries if not e.directory]),
+        ("sops", [(x.path, x.name) for x in parsed_sops.secrets]),
+        ("templates", [(t.target, t.name) for t in tmpls]),
+    ):
+        for path, name in items:
+            if isinstance(path, str) and path:
+                key = _link_key(path)
+                counts[key] = counts.get(key, 0) + 1
+                declared[key] = (section, path, name)
+
+    stores = {
+        "files": state.setdefault("files", {}),
+        "sops": state.setdefault("sops", {}).setdefault("installed", {}),
+        "templates": state.setdefault("templates", {}).setdefault("installed", {}),
+    }
+    moved: List[str] = []
+    for old in stores:
+        for path, record in list(stores[old].items()):
+            key = _link_key(path) if isinstance(path, str) and path else None
+            if key not in declared or counts[key] > 1:
+                continue
+            new, new_path, name = declared[key]
+            if new == old or not isinstance(record, dict) or record.get("dir"):
+                continue
+            if not os.path.lexists(path):
+                del stores[old][path]
+                moved.append(f"{new_path} ({old} -> {new})")
+                continue
+            if old == "files":
+                unmodified = bool(record.get("hash")) and _file_hash(path) == record["hash"]
+            else:
+                unmodified = fsutil.matches_fingerprint(path, record)
+            if not unmodified:
+                continue
+            del stores[old][path]
+            if new == "files":
+                stores[new][new_path] = _record(path, _file_hash(path))
+            else:
+                stores[new][new_path] = {"name": name, **(fsutil.fingerprint(path) or {})}
+                if new == "templates":
+                    stores[new][new_path]["secret"] = old == "sops" or bool(record.get("secret"))
+            moved.append(f"{new_path} ({old} -> {new})")
+    return moved
+
+
 def ownership_conflicts(
     *,
     files_entries=None,

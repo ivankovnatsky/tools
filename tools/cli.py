@@ -125,6 +125,18 @@ def _run_sections(
 ) -> bool:
     success = True
 
+    moves = secrets_flow.move_between_sections(
+        state,
+        files_entries=config.get("files"),
+        sops_raw=config.get("sops"),
+        templates_raw=config.get("templates"),
+        config_dir=config_dir,
+    )
+    for move in moves:
+        log(f"Moved: {move}", Color.GREEN)
+    if moves:
+        persist()
+
     def registry():
         return secrets_flow.ownership_conflicts(
             files_entries=config.get("files"),

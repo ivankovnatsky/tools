@@ -219,7 +219,7 @@ templates:
 
 ## Ownership (files, sops, templates)
 
-- A path claimed by two of `files`/`sops`/`templates` is refused by all of them; moving a path between sections takes two deploys.
+- A path declared by two of `files`/`sops`/`templates` is refused by all of them. Moving a path from one section to another moves its state record first (`~ move <path> (files -> templates)`), so the new section takes the file over in the same deploy; a file edited since tools wrote it keeps its old record and stays refused.
 - Refused as well: symlinks managed by `links`/`skills`, paths through them or inside their targets, skill copy dirs and the skills cache.
 - Symlinked parents and case (on case-insensitive volumes) are normalized before comparing, so aliases match.
 - A managed path may not be inside another one (for example, a secret named `rendered`).
