@@ -255,7 +255,11 @@ def main(config_path):
     print(f"agent-sessions: wrote {written} files")
 
 
-if __name__ == "__main__":
+def run():
     if len(sys.argv) != 2:
         sys.exit("usage: agent-sessions <config.json>")
     main(sys.argv[1])
+
+
+if __name__ == "__main__":
+    run()

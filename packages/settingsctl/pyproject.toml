@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "settingsctl"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "dbus-python; sys_platform == 'linux'",
+]
+
+[project.scripts]
+settings = "settingsctl:cli"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "accessibility.py",
+    "accessibility_state.py",
+    "accessibility_ui.py",
+    "appearance.py",
+    "autohide.py",
+    "autovolume.py",
+    "awake.py",
+    "battery.py",
+    "common.py",
+    "cpufreq.py",
+    "daemon.py",
+    "dock.py",
+    "fulldiskaccess.py",
+    "location.py",
+    "login.py",
+    "menubar.py",
+    "privacy_pane.py",
+    "scaling.py",
+    "scaling_displays.py",
+    "scrolling.py",
+    "spaces.py",
+    "turnoff.py",
+    "volume.py",
+    "windows.py",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"settings.py" = "settingsctl.py"

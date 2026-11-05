@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jira-custom"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "jira",
+    "markdown-it-py",
+    "rich",
+]
+
+[project.scripts]
+jira-custom = "jira_custom.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jira_custom"]

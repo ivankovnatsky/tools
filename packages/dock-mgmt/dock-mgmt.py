@@ -5,6 +5,7 @@ Compares current dock state with desired state and rebuilds if needed.
 """
 
 import os
+import shutil
 import sys
 import subprocess
 import json
@@ -164,12 +165,19 @@ def main():
     0 - Success (dock is up to date or was rebuilt)
     1 - Error
     """
-    if len(sys.argv) != 3:
+    # The Nix wrapper passes the dockutil store path as argv[1].
+    if len(sys.argv) == 3:
+        dockutil_path = sys.argv[1]
+    elif len(sys.argv) == 2:
+        dockutil_path = shutil.which("dockutil")
+        if not dockutil_path:
+            print("Error: dockutil not found on PATH", file=sys.stderr)
+            sys.exit(1)
+    else:
         print("Usage: dock-mgmt <entries_json>", file=sys.stderr)
         sys.exit(1)
 
-    dockutil_path = sys.argv[1]
-    entries_json = sys.argv[2]
+    entries_json = sys.argv[-1]
 
     # Parse entries
     try:

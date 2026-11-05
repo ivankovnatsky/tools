@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cleanup-home"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+]
+
+[project.scripts]
+cleanup-home = "cleanup_home:main"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"cleanup-home.py" = "cleanup_home.py"

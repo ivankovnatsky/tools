@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "notifications"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "discord-webhook",
+]
+
+[project.scripts]
+notifications = "notifications:cli"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "notifications.py",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../settingsctl/battery.py" = "battery.py"
+"../settingsctl/common.py" = "common.py"
+"../discord/discord.py" = "discord.py"
+"../discord/digest.py" = "digest.py"

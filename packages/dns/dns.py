@@ -248,7 +248,7 @@ def flush():
     flush_dns_cache_impl()
 
 
-if __name__ == "__main__":
+def run():
     try:
         main(prog_name="dns")
     except KeyboardInterrupt:
@@ -257,3 +257,7 @@ if __name__ == "__main__":
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()
