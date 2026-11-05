@@ -28,8 +28,8 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`sops`, `templates`, `files`, `skills`, `links`, `brew`, `ollamaModels`,
-`flatpak`, `launchd`, `defaults`, `dock`, `services`.
+`sops`, `templates`, `files`, `env`, `skills`, `links`, `brew`,
+`ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `services`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
@@ -316,6 +316,71 @@ links:
 - A missing source is skipped with a warning, so no dangling link is made.
 - A tracked link is repointed or removed only while it still points where
   tools left it, and removals are held while any entry is invalid.
+
+## Env
+
+`env:` declares session environment variables and `PATH` entries, the
+home-manager `home.sessionVariables` / `home.sessionPath` equivalent:
+
+```yaml
+env:
+  vars:
+    EDITOR: nvim
+    HF_HOME: ${externalStoragePath}/.cache/huggingface
+    UV_PYTHON_INSTALL_DIR: ~/.local/share/uv/python
+  path:                           # prepended to PATH, first entry first
+    - ~/.local/bin
+  shells: [sh, fish, nu]          # default: all three
+  dir: ~/.local/state/tools/env   # default
+  launchd: false                  # macOS: also `launchctl setenv` each var
+```
+
+Deploy renders one snippet per shell into `dir`: `env.sh` (bash, zsh, dash),
+`env.fish` and `env.nu`. Source it from the rc file:
+
+```sh
+# ~/.zshenv, ~/.bashrc, ~/.profile
+[ -r ~/.local/state/tools/env/env.sh ] && . ~/.local/state/tools/env/env.sh
+```
+
+```fish
+# ~/.config/fish/config.fish
+test -r ~/.local/state/tools/env/env.fish; and source ~/.local/state/tools/env/env.fish
+```
+
+```nu
+# config.nu; `source` is resolved at parse time, so the file must exist
+source ~/.local/state/tools/env/env.nu
+```
+
+- Placeholders (`${var}`, `${env:NAME}`, `${sopsPath:NAME}`) resolve at load
+  time as everywhere else. `${sops:NAME}` is a config error, and a value that
+  looks like a secret (a PEM key, an `@VAR@` placeholder) is refused: the
+  snippets are world-readable (0644) and every process inherits the values.
+  Point at a file instead (`GH_TOKEN_FILE: ${sopsPath:gh-token}`).
+- Values are written literally, quoted for each shell: `$HOME` stays `$HOME`.
+  Only a leading `~` is expanded, at deploy time. Names are
+  `[A-Za-z_][A-Za-z0-9_]*`; `PATH` is set through `path:`. Numbers become
+  strings; booleans must be quoted. Control characters are rejected.
+- `path:` entries must be absolute after `~` expansion and may not contain
+  `:`. Sourcing moves each one to the front of `PATH` and drops duplicates, so
+  re-sourcing (tmux, nested shells, macOS `path_helper`) never grows `PATH`.
+- Deploy exports the same vars and `PATH` into its own process before any
+  section runs, so `uv`, `npm` and the rest see them (e.g.
+  `UV_PYTHON_INSTALL_DIR`). This happens whenever `env:` is valid, even under
+  a `--scope` that excludes `env`; `tools diff` does not export.
+- The snippets are tracked in state. Dropping a var rewrites them without it;
+  dropping a shell from `shells:`, changing `dir:` or removing the section
+  removes the files tools wrote, unless they were edited since (then they are
+  released and left in place). Shells already running keep their environment
+  until restarted. Any config error holds the whole section. A path another
+  section (`files`, `templates`, `sops`) also claims is refused by both.
+- `launchd: true` (macOS) runs `launchctl setenv` for each var so GUI apps
+  launched afterwards see it; `PATH` is not set this way. `launchctl` values
+  do not survive logout or reboot: the diff compares against
+  `launchctl getenv` and the next deploy sets them again. A var dropped from
+  config (or `launchd: false`) is `unsetenv`-ed only while it still holds the
+  value tools set. On other platforms the flag is a warning.
 
 ## Brew
 

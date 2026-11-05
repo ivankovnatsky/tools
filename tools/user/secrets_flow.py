@@ -279,8 +279,9 @@ def ownership_conflicts(
     config_dir: str = ".",
     git_repos_raw=None,
     clone_pending: bool = False,
+    env_raw=None,
 ) -> Ownership:
-    """Paths every file-writing section (files, sops, templates) refuses.
+    """Paths every file-writing section (files, sops, templates, env) refuses.
 
     A path claimed by more than one of them, declared now or tracked in
     state, is refused by all, so two owners never overwrite each other. A
@@ -337,6 +338,14 @@ def ownership_conflicts(
         claim(tmpl.target, "templates")
     for path in state.get("templates", {}).get("installed", {}) or {}:
         claim(path, "templates")
+    if env_raw is not None:
+        from tools.user import env as env_section
+
+        spec, _errors = env_section.parse(env_raw)
+        for path in spec.files() if spec else ():
+            claim(path, "env")
+    for path in state.get("env", {}).get("files", {}) or {}:
+        claim(path, "env")
     exact = {
         spelled[path]: "claimed by " + " and ".join(sorted(sections))
         for path, sections in claims.items()

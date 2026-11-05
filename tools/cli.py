@@ -21,6 +21,9 @@ from tools.user.defaults import has_work as defaults_has_work
 from tools.user.defaults import install_defaults, run_restarts
 from tools.user.dock import has_work as dock_has_work
 from tools.user.dock import install_dock
+from tools.user.env import export_process as env_export_process
+from tools.user.env import has_work as env_has_work
+from tools.user.env import install_env
 from tools.user.files import install_files
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
@@ -147,7 +150,12 @@ def _run_sections(
             state=state,
             config_dir=config_dir,
             git_repos_raw=config.get("gitRepos"),
+            env_raw=config.get("env"),
         )
+
+    # Before anything installs: uv/npm/... must see the session env (e.g.
+    # UV_PYTHON_INSTALL_DIR) even under a --scope that excludes env.
+    env_export_process(config.get("env"))
 
     # One registry for every file-writing section, taken before any of them runs.
     conflicts = registry()
@@ -256,6 +264,9 @@ def _run_sections(
             conflicts,
             sops_section.parse_sops(config.get("sops")).secrets_dir()[0],
         )
+
+    if "env" in active and env_has_work(config.get("env"), state):
+        success &= install_env(config.get("env"), state, conflicts)
 
     # Gated on state too, like gitRepos: dropping the whole section must
     # still reach the reconciler so it can remove what it installed.

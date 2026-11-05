@@ -18,6 +18,8 @@ from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
 from tools.user.dock import diff_dock
 from tools.user.dock import has_work as dock_has_work
+from tools.user.env import diff_env
+from tools.user.env import has_work as env_has_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.git_repos import is_checkout
 from tools.user.launchd import diff_launchd
@@ -46,6 +48,7 @@ ALL_SECTIONS = (
     "sops",
     "templates",
     "files",
+    "env",
     "skills",
     "links",
     "brew",
@@ -486,6 +489,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         config_dir=config_dir,
         git_repos_raw=config.get("gitRepos"),
         clone_pending="gitRepos" in active,
+        env_raw=config.get("env"),
     )
     # Same order as deploy: paths inside a gitRepos destination after the clone.
     inside = secrets_flow.paths_in_repos(
@@ -536,6 +540,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = _diff_files(config.get("files", []) or [], config_dir, state, conflicts)
         if changes:
             sections.append(("files", changes))
+
+    if "env" in active and env_has_work(config.get("env"), state):
+        changes = diff_env(config.get("env"), state, conflicts)
+        if changes:
+            sections.append(("env", changes))
 
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
         changes = diff_skills(config.get("skills") or {}, config_dir, state)
