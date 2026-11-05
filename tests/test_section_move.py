@@ -90,6 +90,42 @@ class SectionMoveTest(unittest.TestCase):
         self.assertEqual(self.move(state, templates=bad), [])
         self.assertIn(self.target, state["files"])
 
+    def test_sops_to_templates_keeps_secret_flag(self):
+        self.write_target()
+        from tools import fsutil
+
+        state = {
+            "sops": {"installed": {self.target: {"name": "s", **fsutil.fingerprint(self.target)}}}
+        }
+        moved = self.move(state, templates=self.tmpl_cfg())
+        self.assertEqual(moved, [f"{self.target} (sops -> templates)"])
+        self.assertTrue(state["templates"]["installed"][self.target]["secret"])
+
+    def test_new_section_needs_only_a_table_entry(self):
+        from unittest import mock
+
+        from tools import fsutil
+
+        class Env:
+            record_unmodified = staticmethod(fsutil.matches_fingerprint)
+
+            @staticmethod
+            def record_for(path, name, secret):
+                return {"env": True}
+
+            @staticmethod
+            def record_secret(record):
+                return False
+
+        self.write_target()
+        state = {"env": {self.target: {**fsutil.fingerprint(self.target)}}}
+        table = {**secrets_flow._movable(), "env": (lambda st: st.setdefault("env", {}), Env)}
+        with mock.patch.object(secrets_flow, "_movable", return_value=table):
+            moved = self.move(state, templates=self.tmpl_cfg())
+        self.assertEqual(moved, [f"{self.target} (env -> templates)"])
+        self.assertEqual(state["env"], {})
+        self.assertIn(self.target, state["templates"]["installed"])
+
     def test_deploy_switches_files_to_templates_in_one_run(self):
         self.write_target()
         state = {"files": {self.target: _record(self.target, _file_hash(self.target))}}

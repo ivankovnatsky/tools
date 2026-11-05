@@ -341,6 +341,19 @@ def _record(ch: Change) -> Dict:
     }
 
 
+# Section move (secrets_flow.move_between_sections).
+def record_unmodified(path: str, record) -> bool:
+    return isinstance(record, dict) and fsutil.matches_fingerprint(path, record)
+
+
+def record_for(path: str, name: str, secret: bool) -> Dict:
+    return {"name": name, "secret": secret, **(fsutil.fingerprint(path) or {})}
+
+
+def record_secret(record) -> bool:
+    return bool(record.get("secret"))
+
+
 def apply(
     p: Plan,
     installed: Dict[str, Dict],

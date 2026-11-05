@@ -183,6 +183,39 @@ def _link_owned_paths(links_raw, skills_raw, state: Dict, config_dir: str):
     return link_paths, trees
 
 
+def _movable():
+    """Sections a path can move between: name -> (state store, module).
+
+    Each module defines record_unmodified, record_for and record_secret.
+    """
+    from tools.user import files
+
+    return {
+        "files": (lambda st: st.setdefault("files", {}), files),
+        "sops": (lambda st: st.setdefault("sops", {}).setdefault("installed", {}), sops),
+        "templates": (
+            lambda st: st.setdefault("templates", {}).setdefault("installed", {}),
+            templates,
+        ),
+    }
+
+
+def _declared(files_entries, sops_raw, templates_raw, config_dir):
+    """section -> [(path, name)] declared now, or None on any config error."""
+    from tools.user.files import _resolve_entries
+
+    entries, files_errors = _resolve_entries(files_entries or [], config_dir)
+    parsed_sops = sops.parse_sops(sops_raw)
+    tmpls, tmpl_errors = templates.parse_templates(templates_raw, *parsed_sops.secrets_dir())
+    if files_errors or parsed_sops.errors or tmpl_errors:
+        return None
+    return {
+        "files": [(e.target, "") for e in entries if not e.directory],
+        "sops": [(x.path, x.name) for x in parsed_sops.secrets],
+        "templates": [(t.target, t.name) for t in tmpls],
+    }
+
+
 def move_between_sections(
     state: Dict,
     *,
@@ -193,42 +226,29 @@ def move_between_sections(
 ) -> List[str]:
     """Move state records of paths whose owner changed in config.
 
-    When exactly one of files, sops and templates declares a path that another
-    of them only tracks in state, the record moves to the declaring section so
-    it adopts the file instead of both refusing it. Only a file still as tools
-    wrote it moves (a missing one just drops the record); an edited one keeps
-    its record and stays refused. Skipped
-    while any of the three sections has config errors. Mutates ``state`` and
-    returns ``"<path> (<from> -> <to>)"`` per move.
+    When exactly one movable section declares a path that another only tracks
+    in state, the record moves to the declaring section so it adopts the file
+    instead of both refusing it. Only a file still as tools wrote it moves (a
+    missing one just drops the record); an edited one keeps its record and
+    stays refused. Skipped while any of them has config errors. Mutates
+    ``state`` and returns ``"<path> (<from> -> <to>)"`` per move.
     """
-    from tools.user.files import _file_hash, _record, _resolve_entries
-
-    entries, files_errors = _resolve_entries(files_entries or [], config_dir)
-    parsed_sops = sops.parse_sops(sops_raw)
-    tmpls, tmpl_errors = templates.parse_templates(templates_raw, *parsed_sops.secrets_dir())
-    if files_errors or parsed_sops.errors or tmpl_errors:
+    declared_by = _declared(files_entries, sops_raw, templates_raw, config_dir)
+    if declared_by is None:
         return []
-
     declared: Dict[str, Tuple[str, str, str]] = {}  # key -> (section, path, name)
     counts: Dict[str, int] = {}
-    for section, items in (
-        ("files", [(e.target, "") for e in entries if not e.directory]),
-        ("sops", [(x.path, x.name) for x in parsed_sops.secrets]),
-        ("templates", [(t.target, t.name) for t in tmpls]),
-    ):
+    for section, items in declared_by.items():
         for path, name in items:
             if isinstance(path, str) and path:
                 key = _link_key(path)
                 counts[key] = counts.get(key, 0) + 1
                 declared[key] = (section, path, name)
 
-    stores = {
-        "files": state.setdefault("files", {}),
-        "sops": state.setdefault("sops", {}).setdefault("installed", {}),
-        "templates": state.setdefault("templates", {}).setdefault("installed", {}),
-    }
+    sections = _movable()
+    stores = {name: store(state) for name, (store, _) in sections.items()}
     moved: List[str] = []
-    for old in stores:
+    for old, (_, old_mod) in sections.items():
         for path, record in list(stores[old].items()):
             key = _link_key(path) if isinstance(path, str) and path else None
             if key not in declared or counts[key] > 1:
@@ -236,23 +256,14 @@ def move_between_sections(
             new, new_path, name = declared[key]
             if new == old or not isinstance(record, dict) or record.get("dir"):
                 continue
-            if not os.path.lexists(path):
-                del stores[old][path]
-                moved.append(f"{new_path} ({old} -> {new})")
-                continue
-            if old == "files":
-                unmodified = bool(record.get("hash")) and _file_hash(path) == record["hash"]
-            else:
-                unmodified = fsutil.matches_fingerprint(path, record)
-            if not unmodified:
-                continue
+            if os.path.lexists(path):
+                if not old_mod.record_unmodified(path, record):
+                    continue
+                new_mod = sections[new][1]
+                stores[new][new_path] = new_mod.record_for(
+                    path, name, old_mod.record_secret(record)
+                )
             del stores[old][path]
-            if new == "files":
-                stores[new][new_path] = _record(path, _file_hash(path))
-            else:
-                stores[new][new_path] = {"name": name, **(fsutil.fingerprint(path) or {})}
-                if new == "templates":
-                    stores[new][new_path]["secret"] = old == "sops" or bool(record.get("secret"))
             moved.append(f"{new_path} ({old} -> {new})")
     return moved
 

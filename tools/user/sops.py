@@ -640,6 +640,19 @@ def _record(s: Secret) -> Dict:
     return record
 
 
+# Section move (secrets_flow.move_between_sections).
+def record_unmodified(path: str, record) -> bool:
+    return isinstance(record, dict) and fsutil.matches_fingerprint(path, record)
+
+
+def record_for(path: str, name: str, secret: bool) -> Dict:
+    return {"name": name, **(fsutil.fingerprint(path) or {})}
+
+
+def record_secret(record) -> bool:
+    return True
+
+
 @dataclass
 class Result:
     success: bool

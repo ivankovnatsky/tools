@@ -44,6 +44,24 @@ def _record(target: str, file_hash: str) -> Dict:
     return {"hash": file_hash, **{k: fp[k] for k in ("dev", "ino") if k in fp}}
 
 
+# Section move (secrets_flow.move_between_sections): every file-writing
+# section defines these three.
+def record_unmodified(target: str, record) -> bool:
+    return (
+        isinstance(record, dict)
+        and bool(record.get("hash"))
+        and (_file_hash(target) == record["hash"])
+    )
+
+
+def record_for(target: str, name: str, secret: bool) -> Dict:
+    return _record(target, _file_hash(target))
+
+
+def record_secret(record) -> bool:
+    return False
+
+
 def _removable(target: str, record) -> bool:
     """Only delete what still matches what we wrote."""
     record = record or {}
