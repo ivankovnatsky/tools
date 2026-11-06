@@ -47,17 +47,19 @@ def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
     return bool(stdout.strip())
 
 
-def install_git_repos(repos: Dict[str, str], state: Dict):
-    """Clone or update git repositories to specified paths."""
+def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
+    """Clone missing repositories; with ``update``, also pull existing ones."""
     installed = set(state.get("gitRepos", {}).get("installed", []))
     if not repos and not installed:
         return True
     desired = set(repos.keys())
     to_install = desired - installed
     to_remove = installed - desired
-    # A tracked checkout still needs pulling — "installed once" is not the same
-    # as "up to date", and nothing else ever revisits these.
-    to_update = {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}
+    to_update = (
+        {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}
+        if update
+        else set()
+    )
 
     if not to_install and not to_remove and not to_update:
         debug("All git repos already installed", Color.BLUE)
@@ -107,12 +109,15 @@ def install_git_repos(repos: Dict[str, str], state: Dict):
                 log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
                 success = False
                 continue
-            log(f"Updating git repo: {dest_path}", Color.BLUE)
-            cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
-            returncode, stdout, stderr = run_command(cmd, env)
-            if returncode != 0:
-                log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
-                success = False
+            if update:
+                log(f"Updating git repo: {dest_path}", Color.BLUE)
+                cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
+                returncode, stdout, stderr = run_command(cmd, env)
+                if returncode != 0:
+                    log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
+                    success = False
+            else:
+                log(f"Tracking existing git repo: {dest_path}", Color.BLUE)
         else:
             log(f"Cloning git repo: {repo_url} -> {dest_path}", Color.GREEN)
             parent_dir = os.path.dirname(expanded_path)

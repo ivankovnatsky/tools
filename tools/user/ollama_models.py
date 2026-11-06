@@ -117,8 +117,12 @@ def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
     return changes
 
 
-def install_ollama_models(config: Dict, state: Dict) -> bool:
-    """Reconcile installed Ollama models toward the desired list."""
+def install_ollama_models(config: Dict, state: Dict, update: bool = False) -> bool:
+    """Reconcile installed Ollama models toward the desired list.
+
+    With ``update``, tracked desired models are pulled again, which moves a
+    tag to its newest upstream digest.
+    """
     desired_models = [_canonical(m) for m in (config.get("models", []) or [])]
     tracked = set(_tracked_for_context(config, state))
     if not desired_models and not tracked:
@@ -139,7 +143,8 @@ def install_ollama_models(config: Dict, state: Dict) -> bool:
     desired = set(desired_models)
     newly_pulled: Set[str] = set()
 
-    for model in sorted(desired - installed):
+    refresh = desired & tracked & installed if update else set()
+    for model in sorted((desired - installed) | refresh):
         log(f"Pulling {model} ...", Color.GREEN)
         rc, _, stderr = run_command([ollama, "pull", model], env=env)
         if rc != 0:

@@ -77,5 +77,24 @@ class NpmPartialFailureTest(unittest.TestCase):
         self.assertFalse(result)
 
 
+class NpmUpdateTest(unittest.TestCase):
+    def test_unpinned_packages_reinstall_only_with_update(self):
+        paths = {"nodejs": "/n", "npmBin": "/nonexistent/bin"}
+        packages = {"loose": {}, "pinned": {"version": "1.0.0"}}
+        installs = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            installs.append(cmd[3:])
+            return 0, "", ""
+
+        for update in (False, True):
+            state = {"npm": {"packages": {}, "prefix": "/nonexistent/bin"}}
+            for pkg, info in packages.items():
+                state["npm"]["packages"][pkg] = {"installed": True, "version": "latest", **info}
+            with mock.patch.object(npm_mod, "run_command", fake_run):
+                self.assertTrue(install_npm_packages(packages, paths, state, {}, update))
+        self.assertEqual(installs, [["loose"]])
+
+
 if __name__ == "__main__":
     unittest.main()

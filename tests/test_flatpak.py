@@ -47,6 +47,8 @@ class FakeFlatpak:
         if verb == "uninstall":
             self.installed.discard(cmd[-1])
             return 0, "", ""
+        if verb == "update":
+            return 0, "", ""
         raise AssertionError(f"unexpected flatpak verb: {verb}")
 
 
@@ -282,6 +284,23 @@ class FlatpakTest(unittest.TestCase):
 
         self.assertEqual(fake.commands, [])
         self.assertEqual(state, {})
+
+
+class FlatpakUpdateTest(unittest.TestCase):
+    def test_tracked_apps_are_updated_only_with_update(self):
+        config = {"packages": ["org.example.App", "org.example.Hand"]}
+        for update, expected in (
+            (False, []),
+            (True, [["flatpak", flatpak.SCOPE, "update", "--noninteractive", "org.example.App"]]),
+        ):
+            fake = FakeFlatpak(installed=["org.example.App", "org.example.Hand"])
+            state = {"flatpak": {"packages": ["org.example.App"], "remotes": []}}
+            with (
+                mock.patch.object(flatpak, "_find_flatpak", return_value="flatpak"),
+                mock.patch.object(flatpak, "run_command", fake.run),
+            ):
+                self.assertTrue(flatpak.install_flatpak_packages(config, state, update))
+            self.assertEqual([c for c in fake.commands if c[2] == "update"], expected)
 
 
 if __name__ == "__main__":

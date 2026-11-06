@@ -213,9 +213,14 @@ def _plan(spec: BrewSpec, prev: Dict) -> Dict[str, list]:
     }
 
 
-def _brew_env(brew: str, spec: BrewSpec) -> Dict[str, str]:
+def _brew_env(brew: str, spec: BrewSpec, update: bool = False) -> Dict[str, str]:
     env = os.environ.copy()
     env["PATH"] = f"{os.path.dirname(brew)}:{env.get('PATH', '')}"
+    if not update:
+        # `brew install` otherwise upgrades an already-installed target and
+        # the installed dependents of anything it upgrades.
+        env["HOMEBREW_NO_INSTALL_UPGRADE"] = "1"
+        env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"] = "1"
     if spec.auto_update is False:
         env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
     elif spec.auto_update:
@@ -508,7 +513,7 @@ def _record(state: Dict, brews, casks, taps, mas, trusted) -> None:
     }
 
 
-def install_brew_packages(brew_config: dict, state: dict) -> bool:
+def install_brew_packages(brew_config: dict, state: dict, update: bool = False) -> bool:
     """Declarative Homebrew package management.
 
     State is the source of truth: we reconcile the desired config against what
@@ -520,6 +525,9 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
 
     The exception is `onActivation.cleanup`, which queries live brew on every
     deploy and also removes installed items that tools never recorded.
+
+    Installed packages are only upgraded with ``update``: `brew upgrade` on
+    the tracked formulae and casks, `mas upgrade` on the tracked apps.
     """
     if sys.platform != "darwin":
         return True
@@ -555,8 +563,14 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
             state["brew"]["masApps"] = dict(spec.mas)
         return True
 
+    upgrade = {
+        "--formula": sorted(inst_brews & spec.brews),
+        "--cask": sorted(inst_casks & spec.casks),
+        "mas": sorted({str(i) for i in inst_mas.values()} & {str(i) for i in spec.mas.values()}),
+    }
+    upgrades = update and any(upgrade.values())
     planned = any(plan.values())
-    if not planned and not spec.cleanup:
+    if not planned and not upgrades and not spec.cleanup:
         debug("All brew packages in sync", Color.BLUE)
         return unchanged()
 
@@ -569,7 +583,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         log("brew not found and bootstrap failed, skipping", Color.RED)
         return False
 
-    env = _brew_env(brew, spec)
+    env = _brew_env(brew, spec, update)
     success = True
 
     clean = _no_cleanup()
@@ -584,7 +598,7 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
         else:
             clean = cleanup_targets(spec, prev, plan, live)
             cleanup_planned = True
-    if not planned and not any(clean.values()):
+    if not planned and not upgrades and not any(clean.values()):
         debug("All brew packages in sync", Color.BLUE)
         return unchanged() and success
 
@@ -610,6 +624,22 @@ def install_brew_packages(brew_config: dict, state: dict) -> bool:
             success = False
         else:
             inst_trust.add(tap)
+
+    # --- Upgrades of what was already installed, before installs and removals ---
+    if upgrades:
+        for kind in ("--formula", "--cask"):
+            if upgrade[kind]:
+                log(f"Upgrading {', '.join(upgrade[kind])}", Color.BLUE)
+                rc, _, stderr = run_command([brew, "upgrade", kind] + upgrade[kind], env)
+                if rc != 0:
+                    log(f"Failed to upgrade {', '.join(upgrade[kind])}: {stderr}", Color.RED)
+                    success = False
+        if upgrade["mas"] and (mas := _mas_bin_from_env(env)):
+            log(f"Upgrading Mac App Store apps: {', '.join(upgrade['mas'])}", Color.BLUE)
+            rc, _, stderr = run_command([mas, "upgrade"] + upgrade["mas"], env)
+            if rc != 0:
+                log(f"Failed to upgrade Mac App Store apps: {stderr}", Color.RED)
+                success = False
 
     # --- Installs ---
     brews_to_install = plan["brews_install"]

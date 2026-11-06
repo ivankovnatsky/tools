@@ -178,5 +178,19 @@ class OllamaModelsTest(unittest.TestCase):
                 self.assertEqual(bool(changes), acted or state_moved)
 
 
+class OllamaUpdateTest(unittest.TestCase):
+    def test_tracked_models_are_pulled_again_only_with_update(self):
+        config = {"models": ["llama3", "mine"]}
+        for update, expected in ((False, []), (True, [["ollama", "pull", "llama3:latest"]])):
+            state = {"ollamaModels": {"installed": ["llama3:latest"], "context": "|"}}
+            fake = FakeOllama(installed=["llama3:latest", "mine:latest"])
+            with (
+                mock.patch.object(ollama_models, "_find_ollama", return_value="ollama"),
+                mock.patch.object(ollama_models, "run_command", fake.run),
+            ):
+                self.assertTrue(ollama_models.install_ollama_models(config, state, update))
+            self.assertEqual([c for c in fake.commands if c[1] == "pull"], expected)
+
+
 if __name__ == "__main__":
     unittest.main()

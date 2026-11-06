@@ -9,7 +9,7 @@ reconciled from a YAML/JSON/TOML config against a local state file.
 
 ```console
 tools diff   [--config PATH]... [--scope SECTION]...   # dry-run preview
-tools deploy [--config PATH]... [--scope SECTION]... [--approve]
+tools deploy [--config PATH]... [--scope SECTION]... [--approve] [--update]
 tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
 ```
 
@@ -18,8 +18,23 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
   the filesystem.
 - `tools deploy` previews, asks for confirmation when there is anything to
   approve, then reconciles. `--approve` skips the prompt. A clean preview still
-  deploys: non-destructive maintenance (pulling tracked git checkouts) runs on
-  every deploy.
+  deploys (state housekeeping, `--update` upgrades).
+- A plain deploy never upgrades anything already installed: it installs what is
+  missing, removes what was dropped, reinstalls what changed in config (a new
+  version, source, commit or ref) and converges config files. `--update`
+  additionally upgrades what is already there, combined with `--scope` like any
+  other run (`--scope gitRepos --update` only pulls checkouts). `tools diff`
+  never shows these upgrades, and `watch` never runs them. With `--update`:
+  - `gitRepos`: `git pull --ff-only` in every tracked checkout.
+  - `skills`: git sources are fetched and moved to the newest commit of their
+    ref.
+  - `npm`, `bun`, `go`: packages without a version or commit pin are reinstalled
+    at the latest release; `uv` runs `uv tool upgrade` on them.
+  - `brew`: `brew upgrade` on tracked formulae and casks, `mas upgrade` on
+    tracked App Store apps.
+  - `ollamaModels`: tracked models are pulled again; `flatpak`: tracked apps get
+    `flatpak update`.
+  - `pi`, `mcp` and `curlShell` have no upgrade step.
 - `--config` accepts a file or a directory and may be repeated; configs are
   deep-merged in order (scalars replace, dicts recurse, lists replace).
   **Relative `files:` sources always resolve against the first `--config` path's
@@ -283,8 +298,9 @@ skills:
   install flat as `<target>/<last path segment>/`.
 - Git sources are cloned into `cacheDir` (default `~/.cache/tools/skills`),
   which tools owns outright. `diff` never touches the network: it previews
-  first fetches and url/ref changes, while new upstream commits on an
-  unchanged ref land on the next deploy, like `gitRepos` pulls.
+  first fetches and url/ref changes. A deploy only fetches an existing clone
+  when its url, ref or subdir changed; new upstream commits on an unchanged ref
+  need `deploy --update`, like `gitRepos` pulls.
 - Ownership follows `files:`. An existing directory tools did not create is
   never overwritten, a copy modified since tools wrote it is neither updated
   nor removed, and removals only run when every source fetched and every
@@ -398,9 +414,18 @@ brew:
   trust:
     taps: [user/homebrew-tap] # `brew trust --tap`, Homebrew 6 tap trust
   onActivation:
-    autoUpdate: false # false: HOMEBREW_NO_AUTO_UPDATE=1; true: unset it
+    autoUpdate: false # false: HOMEBREW_NO_AUTO_UPDATE=1; true: unset it (metadata only)
     cleanup: zap # uninstall | zap; omit for ownership-only removal
 ```
+
+`autoUpdate` only controls Homebrew's metadata refresh (`brew update`) before a
+brew command; it never upgrades installed packages. Without `deploy --update`,
+every brew command runs with `HOMEBREW_NO_INSTALL_UPGRADE=1` and
+`HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`, so installing a package does not
+upgrade one already installed or its dependents (Homebrew still upgrades an
+outdated dependency the new package requires). `environment` can override both.
+With `--update`, `brew upgrade` runs on the tracked formulae and casks and
+`mas upgrade` on the tracked App Store apps.
 
 Without `cleanup`, brew follows [State and ownership](#state-and-ownership):
 deploy never queries live brew and removes only formulae, casks, taps, App Store
@@ -452,7 +477,8 @@ the cleanup removals are skipped (deploy reports failure) and diff shows
 | `cleanup: none`                                                   | accepted                       | config error; omit the key instead     |
 | `autoUpdate` default                                              | `false`                        | brew's own default (auto-update on)    |
 | `trust.taps` (nix-homebrew)                                       | never untrusted                | untrusted when dropped                 |
-| per-entry args, `upgrade`, `global.*`, `extraConfig`, pinned taps | supported                      | not supported                          |
+| `onActivation.upgrade`                                            | upgrades outdated packages     | `deploy --update` (tracked only)       |
+| per-entry args, `global.*`, `extraConfig`, pinned taps            | supported                      | not supported                          |
 ## launchd
 
 Agents (`domain: user`, `gui/<uid>`) and daemons (`domain: system`). macOS only.

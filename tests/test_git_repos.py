@@ -173,24 +173,35 @@ class GitReposRemovalTest(unittest.TestCase):
 
 
 class GitReposUpdateTest(unittest.TestCase):
-    def _reconcile(self, repos, state, fake):
+    def _reconcile(self, repos, state, fake, update=False):
         with (
             mock.patch.object(git_repos, "system_bin", return_value="git"),
             mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
             mock.patch.object(git_repos, "run_command", fake.run),
         ):
-            return git_repos.install_git_repos(repos, state)
+            return git_repos.install_git_repos(repos, state, update)
 
-    def test_already_tracked_repo_is_pulled(self):
-        # "Installed once" is not "up to date"; nothing else revisits these.
-        with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, ".git"))
-            state = {"gitRepos": {"installed": [d]}}
+    def _pulls(self, fake):
+        return [c for c in fake.commands if c[3:4] == ["pull"]]
+
+    def test_existing_checkouts_are_pulled_only_with_update(self):
+        with tempfile.TemporaryDirectory() as tracked, tempfile.TemporaryDirectory() as found:
+            for d in (tracked, found):
+                os.mkdir(os.path.join(d, ".git"))
+            repos = {tracked: "u", found: "u"}
+            state = {"gitRepos": {"installed": [tracked]}}
+
             fake = FakeGit()
+            self.assertTrue(self._reconcile(repos, state, fake))
+            self.assertEqual(self._pulls(fake), [])
+            self.assertEqual(state["gitRepos"]["installed"], sorted([tracked, found]))
 
-            self._reconcile({d: "https://example/r.git"}, state, fake)
-
-            self.assertTrue(any(c[3:4] == ["pull"] for c in fake.commands), fake.commands)
+            fake = FakeGit()
+            self.assertTrue(self._reconcile(repos, state, fake, update=True))
+            self.assertEqual(
+                sorted(self._pulls(fake)),
+                sorted(["git", "-C", d, "pull", "--ff-only"] for d in (tracked, found)),
+            )
 
     def test_non_repo_directory_is_not_marked_installed(self):
         # Marking it installed would make it an rmtree candidate later.

@@ -5,12 +5,15 @@ from tools.log import Color, debug, log
 from tools.util import (
     pkg_spec_full,
     pkg_state_entry,
+    pkg_unpinned,
     run_command,
     version_changed,
 )
 
 
-def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
+def install_bun_packages(
+    packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update: bool = False
+):
     """Fully declarative bun package management.
 
     Ensures all declared packages exist in ~/.bun/bin at the declared version.
@@ -78,7 +81,11 @@ def install_bun_packages(packages: Dict, paths: Dict, state: Dict, bun_config: D
     to_install = []
     to_install_names = []
     for pkg, pkg_info in packages.items():
-        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "bun"):
+        if (
+            pkg not in state_packages
+            or version_changed(pkg, pkg_info, state, "bun")
+            or (update and pkg_unpinned(pkg_info))
+        ):
             to_install.append(pkg_spec_full(pkg, pkg_info))
             to_install_names.append(pkg)
     install_failed: set = set()

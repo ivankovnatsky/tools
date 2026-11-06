@@ -126,6 +126,11 @@ def get_pkg_commit(pkg_info: Dict) -> str:
     return pkg_info.get("commit", "")
 
 
+def pkg_unpinned(pkg_info: Dict) -> bool:
+    """No version or commit pin: reinstalling may move it to a newer release."""
+    return get_pkg_version(pkg_info) in ("", "latest") and not get_pkg_commit(pkg_info)
+
+
 def pkg_spec_full(name: str, pkg_info: Dict) -> str:
     """Install spec honoring source and commit (npm/bun style `source#commit`).
 

@@ -227,9 +227,8 @@ def _diff_curl_shell(curl_shell: Dict, state: Dict):
 def _diff_git_repos(git_repos: Dict, state: Dict):
     changes = []
     installed = set(state.get("gitRepos", {}).get("installed", []))
-    # Pulls of already-tracked checkouts are deliberately not previewed:
-    # they are non-destructive and would make every diff report changes.
-    # They run on every deploy (the clean-diff path included).
+    # Pulls of already-tracked checkouts only run on `deploy --update`, so
+    # they are not pending changes.
     for dest, _url in git_repos.items():
         expanded = os.path.expanduser(dest)
         if not os.path.exists(expanded):

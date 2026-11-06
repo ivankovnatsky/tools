@@ -7,6 +7,7 @@ from tools.util import (
     get_pkg_commit,
     get_pkg_source,
     get_pkg_version,
+    pkg_unpinned,
     run_command,
     version_changed,
 )
@@ -71,7 +72,7 @@ def _go_entry(pkg_info: Dict) -> Dict:
     return entry
 
 
-def install_go_packages(packages: Dict, paths: Dict, state: Dict):
+def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     desired = set(packages.keys())
 
     # Go has no uninstall, so a changed install dir cannot "release" anything
@@ -114,6 +115,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict):
         if pkg not in state_packages
         or context_changed
         or version_changed(pkg, pkg_info, state, "go")
+        or (update and pkg_unpinned(pkg_info))
     ]
 
     if to_install:

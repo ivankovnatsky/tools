@@ -145,8 +145,12 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     return changes
 
 
-def install_flatpak_packages(config: Dict, state: Dict) -> bool:
-    """Reconcile flatpak remotes and installed apps toward the desired config."""
+def install_flatpak_packages(config: Dict, state: Dict, update: bool = False) -> bool:
+    """Reconcile flatpak remotes and installed apps toward the desired config.
+
+    Apps already installed are only updated with ``update``, and only the
+    tracked ones.
+    """
     desired_remotes = config.get("remotes", {}) or {}
     desired_apps = _desired_packages(config)
     tracked = state.get("flatpak", {})
@@ -227,6 +231,19 @@ def install_flatpak_packages(config: Dict, state: Dict) -> bool:
         changed = True
 
     managed_apps = (set(tracked.get("packages", [])) | newly_installed) & installed
+    to_update = sorted((managed_apps & set(desired_apps)) - newly_installed) if update else []
+    for app in to_update:
+        remote = desired_apps[app]
+        if mismatched_remotes and (not remote or remote in mismatched_remotes):
+            log(f"Skipping update of {app}: remote URL mismatch unresolved", Color.RED)
+            success = False
+            continue
+        log(f"Updating {app} ...", Color.BLUE)
+        rc, _, stderr = run_command([flatpak, SCOPE, "update", "--noninteractive", app])
+        if rc != 0:
+            log(f"Failed to update {app}: {stderr.strip()}", Color.RED)
+            success = False
+
     managed_remotes = (set(tracked.get("remotes", [])) | newly_added_remotes) & remotes
 
     for app in sorted((managed_apps & installed) - set(desired_apps)):

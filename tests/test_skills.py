@@ -626,8 +626,22 @@ class GitSourceTest(SkillsTestBase):
         self.deploy(self.git_config())
         shutil.rmtree(self.repo)
 
-        self.assertFalse(self.deploy(self.git_config()))
+        self.assertTrue(self.deploy(self.git_config()))
+        cfg = self.git_config()
+        self.assertFalse(skills.install_skills(cfg, self.config_dir, self.state, update=True))
         self.assertTrue(os.path.exists(os.path.join(self.t1, "pdf")))
+
+    def test_unchanged_ref_moves_only_with_update(self):
+        self.assertTrue(self.deploy(self.git_config()))
+        _write(os.path.join(self.repo, "skills", "pdf", "SKILL.md"), "v3")
+        self._git("commit", "-q", "--no-gpg-sign", "-am", "v3")
+
+        self.assertTrue(self.deploy(self.git_config()))
+        self.assertEqual(self.read_installed(), "v2")
+
+        cfg = self.git_config()
+        self.assertTrue(skills.install_skills(cfg, self.config_dir, self.state, update=True))
+        self.assertEqual(self.read_installed(), "v3")
 
 
 class SkillsEnvPathTest(unittest.TestCase):

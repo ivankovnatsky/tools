@@ -19,6 +19,27 @@ class DeployGatingTest(unittest.TestCase):
         ):
             return cli._deploy(config, "/tmp", scope)
 
+    def test_update_flag_reaches_scoped_sections_only(self):
+        config = {"gitRepos": {"/r": "u"}, "brew": {"brews": ["a"]}}
+        runner = CliRunner()
+        with (
+            mock.patch.object(cli, "_load_merged_config", return_value=config),
+            mock.patch.object(cli, "load_json", return_value={}),
+            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "install_git_repos", return_value=True) as git,
+            mock.patch.object(cli, "install_brew_packages", return_value=True) as brew,
+        ):
+            result = runner.invoke(
+                cli.main, ["deploy", "--approve", "--scope", "gitRepos", "--update"]
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            git.assert_called_once_with({"/r": "u"}, mock.ANY, True)
+            brew.assert_not_called()
+
+            runner.invoke(cli.main, ["deploy", "--approve", "--scope", "gitRepos"])
+            self.assertEqual(git.call_args.args[2], False)
+
     def test_empty_config_does_not_crash(self):
         # No paths at all: the pre-fix code raised KeyError: 'bun'.
         self.assertTrue(self._deploy({}, {}))

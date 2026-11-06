@@ -85,8 +85,13 @@ def _load_merged_config(config_paths: list[str]) -> dict:
         sys.exit(1)
 
 
-def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
-    """Apply config to bring system to desired state. Returns True on success."""
+def _deploy(
+    config: dict, config_dir: str, scope: tuple[str, ...] = (), update: bool = False
+) -> bool:
+    """Apply config to bring system to desired state. Returns True on success.
+
+    Already-installed items are only upgraded (pulled, refetched) with ``update``.
+    """
     # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
     # crash expanduser — and it must resolve identically to show_diff.
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
@@ -111,6 +116,7 @@ def _deploy(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
             active,
             lambda: save_json(state_file, state),
             state_file,
+            update,
         )
     finally:
         save_json(state_file, state)
@@ -125,6 +131,7 @@ def _run_sections(
     active: set,
     persist=lambda: None,
     state_file: str = "",
+    update: bool = False,
 ) -> bool:
     success = True
 
@@ -198,7 +205,7 @@ def _run_sections(
     if "gitRepos" in active and (
         config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
     ):
-        success &= install_git_repos(config.get("gitRepos") or {}, state)
+        success &= install_git_repos(config.get("gitRepos") or {}, state, update)
         # A fresh checkout can bring in symlinks that make paths collide.
         conflicts = registry()
 
@@ -217,25 +224,25 @@ def _run_sections(
         bun_packages = bun_config.get("packages", {})
         bun_only_config = {"configFile": bun_config.get("configFile")}
         if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
-            success &= install_bun_packages(bun_packages, paths, state, bun_only_config)
+            success &= install_bun_packages(bun_packages, paths, state, bun_only_config, update)
 
     if "npm" in active:
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
         npm_only_config = {"configFile": npm_config.get("configFile")}
         if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
-            success &= install_npm_packages(npm_packages, paths, state, npm_only_config)
+            success &= install_npm_packages(npm_packages, paths, state, npm_only_config, update)
 
     if "uv" in active:
         uv_packages = config.get("uv", {}).get("packages", {})
         if uv_packages or state.get("uv", {}).get("packages"):
-            success &= install_uv_packages(uv_packages, paths, state)
+            success &= install_uv_packages(uv_packages, paths, state, update)
 
     if "go" in active:
         go_packages = config.get("go", {}).get("packages", {})
         go_state = state.get("go", {})
         if go_packages or go_state.get("packages"):
-            success &= install_go_packages(go_packages, paths, state)
+            success &= install_go_packages(go_packages, paths, state, update)
 
     if "pi" in active:
         pi_packages = config.get("pi", {}).get("packages", {})
@@ -271,20 +278,20 @@ def _run_sections(
     # Gated on state too, like gitRepos: dropping the whole section must
     # still reach the reconciler so it can remove what it installed.
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
-        success &= install_skills(config.get("skills") or {}, config_dir, state)
+        success &= install_skills(config.get("skills") or {}, config_dir, state, update)
 
     # After skills, so links into freshly installed skill dirs find their source.
     if "links" in active and links_has_work(config.get("links") or [], state):
         success &= install_links(config.get("links") or [], state)
 
     if "brew" in active:
-        success &= install_brew_packages(config.get("brew", {}), state)
+        success &= install_brew_packages(config.get("brew", {}), state, update)
 
     if "ollamaModels" in active:
-        success &= install_ollama_models(config.get("ollamaModels", {}) or {}, state)
+        success &= install_ollama_models(config.get("ollamaModels", {}) or {}, state, update)
 
     if "flatpak" in active:
-        success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state)
+        success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state, update)
 
     # After files, so restartOn hashes see files written in this run.
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
@@ -336,7 +343,12 @@ def main(verbose):
     "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
 )
 @click.option("--approve", is_flag=True, help="Skip confirmation prompt.")
-def deploy(config, scope, approve):
+@click.option(
+    "--update",
+    is_flag=True,
+    help="Also upgrade what is already installed (packages, git checkouts, skill sources).",
+)
+def deploy(config, scope, approve, update):
     """Apply config to bring system to desired state."""
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
@@ -350,11 +362,9 @@ def deploy(config, scope, approve):
                 log("Aborted.", Color.YELLOW)
                 sys.exit(1)
 
-    # Deploy runs even when the preview was clean: non-destructive
-    # maintenance (pulling tracked git checkouts) has no diff line of its
-    # own, and skipping it here would make it exclusive to --approve.
-    # A clean diff means there is nothing approval-worthy, not nothing to do.
-    if not _deploy(merged, config_dir, scope):
+    # Deploy runs even when the preview was clean: --update upgrades and
+    # state housekeeping have no diff line of their own.
+    if not _deploy(merged, config_dir, scope, update):
         sys.exit(1)
 
 
@@ -362,9 +372,10 @@ def deploy(config, scope, approve):
 @click.option("--config", multiple=True, default=["."])
 @click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
 @click.option("--approve", is_flag=True)
-def apply(config, scope, approve):
+@click.option("--update", is_flag=True)
+def apply(config, scope, approve, update):
     """Alias for deploy."""
-    deploy.callback(config, scope, approve)
+    deploy.callback(config, scope, approve, update)
 
 
 @main.command()

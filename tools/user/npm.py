@@ -9,12 +9,15 @@ from tools.util import (
     pkg_install_spec,
     pkg_spec_full,
     pkg_state_entry,
+    pkg_unpinned,
     run_command,
     version_changed,
 )
 
 
-def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
+def install_npm_packages(
+    packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False
+):
     """Declarative npm package management.
 
     Ensures all declared packages exist in ~/.npm/bin at the declared version.
@@ -84,7 +87,11 @@ def install_npm_packages(packages: Dict, paths: Dict, state: Dict, npm_config: D
     to_install = []
     to_install_names = []
     for pkg, pkg_info in packages.items():
-        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "npm"):
+        if (
+            pkg not in state_packages
+            or version_changed(pkg, pkg_info, state, "npm")
+            or (update and pkg_unpinned(pkg_info))
+        ):
             to_install.append(pkg_spec_full(pkg, pkg_info))
             to_install_names.append(pkg)
     install_failed: set = set()

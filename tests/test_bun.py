@@ -68,5 +68,24 @@ class BunPartialFailureTest(unittest.TestCase):
         self.assertFalse(result)
 
 
+class BunUpdateTest(unittest.TestCase):
+    def test_unpinned_packages_reinstall_only_with_update(self):
+        paths = {"bun": "/b", "nodejs": "/n", "bunBin": "/bin"}
+        packages = {"loose": {}, "pinned": {"version": "1.0.0"}}
+        installs = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            installs.append(cmd[3:])
+            return 0, "", ""
+
+        for update in (False, True):
+            state = {"bun": {"packages": {}, "prefix": "/bin"}}
+            for pkg, info in packages.items():
+                state["bun"]["packages"][pkg] = {"installed": True, "version": "latest", **info}
+            with mock.patch.object(bun_mod, "run_command", fake_run):
+                self.assertTrue(install_bun_packages(packages, paths, state, {}, update))
+        self.assertEqual(installs, [["loose"]])
+
+
 if __name__ == "__main__":
     unittest.main()

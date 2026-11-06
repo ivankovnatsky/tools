@@ -68,5 +68,22 @@ class UvInstallTest(unittest.TestCase):
         run.assert_not_called()
 
 
+class UvUpdateTest(unittest.TestCase):
+    def test_unpinned_packages_upgrade_only_with_update(self):
+        packages = {"loose": {}, "pinned": {"version": "1.0.0"}}
+        for update, expected in ((False, []), (True, [["/uv/uv", "tool", "upgrade", "loose"]])):
+            state = {"uv": {"context": "/bin|/tooldir", "packages": {}}}
+            for pkg, info in packages.items():
+                state["uv"]["packages"][pkg] = {
+                    "installed": True,
+                    "version": "latest",
+                    "source": "",
+                    **info,
+                }
+            with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")) as run:
+                self.assertTrue(install_uv_packages(packages, PATHS, state, update))
+            self.assertEqual([c.args[0] for c in run.call_args_list], expected)
+
+
 if __name__ == "__main__":
     unittest.main()

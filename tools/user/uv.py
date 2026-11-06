@@ -7,6 +7,7 @@ from tools.util import (
     get_pkg_source,
     get_pkg_version,
     pkg_install_spec,
+    pkg_unpinned,
     run_command,
     version_changed,
 )
@@ -30,7 +31,7 @@ def _uv_commit_spec(source: str, commit: str) -> str:
     return f"{base}@{commit}{sep}{fragment}"
 
 
-def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
+def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     desired = set(packages.keys())
 
     # Fail with a clear message instead of a KeyError traceback when the
@@ -113,6 +114,16 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict):
             tracked[pkg] = _uv_entry(pkg_info)
     elif not to_remove:
         debug("All UV packages already installed", Color.BLUE)
+
+    if update:
+        for pkg, pkg_info in packages.items():
+            if pkg in tracked and pkg not in to_install and pkg_unpinned(pkg_info):
+                log(f"Upgrading UV package: {pkg}", Color.BLUE)
+                cmd = [f"{paths['uv']}/uv", "tool", "upgrade", pkg]
+                returncode, _, stderr = run_command(cmd, env)
+                if returncode != 0:
+                    log(f"Failed to upgrade UV package {pkg}: {stderr}", Color.RED)
+                    success = False
 
     # Refresh metadata for desired packages already installed and unchanged
     # (drops any legacy fields such as the old "binary").

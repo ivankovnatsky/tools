@@ -385,6 +385,33 @@ class BrewOptionsTest(unittest.TestCase):
             _, fake = self._run({"brews": ["a"], "onActivation": {"autoUpdate": True}}, {})
         self.assertNotIn("HOMEBREW_NO_AUTO_UPDATE", fake.envs[0])
 
+    def test_installs_never_upgrade_without_update(self):
+        _, fake = self._run({"brews": ["a"]}, {})
+        self.assertEqual(fake.envs[0]["HOMEBREW_NO_INSTALL_UPGRADE"], "1")
+        self.assertEqual(fake.envs[0]["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"], "1")
+
+    def test_tracked_packages_are_upgraded_only_with_update(self):
+        config = {"brews": ["a", "new"], "casks": ["c"]}
+        _, fake = self._run(config, _state(brews=["a"], casks=["c"]))
+        self.assertEqual(fake.calls, [["/brew", "install", "new"]])
+
+        with mock.patch.object(brew, "run_command", FakeBrew()) as fake:
+            with (
+                mock.patch.object(brew.sys, "platform", "darwin"),
+                mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            ):
+                state = _state(brews=["a"], casks=["c"])
+                self.assertTrue(brew.install_brew_packages(config, state, update=True))
+        self.assertEqual(
+            fake.calls,
+            [
+                ["/brew", "upgrade", "--formula", "a"],
+                ["/brew", "upgrade", "--cask", "c"],
+                ["/brew", "install", "new"],
+            ],
+        )
+        self.assertNotIn("HOMEBREW_NO_INSTALL_UPGRADE", fake.envs[0])
+
     def test_without_cleanup_unmanaged_items_are_never_queried(self):
         result, fake = self._run({"brews": ["a"]}, _state(brews=["a"]))
         self.assertTrue(result)

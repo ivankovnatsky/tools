@@ -83,5 +83,30 @@ class GoRemovalTest(unittest.TestCase):
         self.assertEqual(state["go"]["packages"], {})
 
 
+class GoUpdateTest(unittest.TestCase):
+    def test_unpinned_packages_reinstall_only_with_update(self):
+        paths = {"goBin": "/gobin"}
+        packages = {
+            "hey": {"source": "github.com/rakyll/hey"},
+            "pinned": {"source": "example.com/pinned", "version": "v1.0.0"},
+        }
+        installs = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            installs.append(cmd[1:])
+            return 0, "", ""
+
+        for update in (False, True):
+            state = {"go": {"context": "/gobin|", "packages": {}}}
+            for pkg, info in packages.items():
+                state["go"]["packages"][pkg] = {"installed": True, "version": "latest", **info}
+            with (
+                mock.patch("tools.user.go.run_command", fake_run),
+                mock.patch("tools.user.go.shutil.which", return_value="/go"),
+            ):
+                self.assertTrue(install_go_packages(packages, paths, state, update))
+        self.assertEqual(installs, [["install", "github.com/rakyll/hey@latest"]])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,7 +42,9 @@ move replaces each tracked link with a copy. A link the `links:` section
 tracks is left to it.
 
 Git sources are cloned into ``cacheDir/<source>``. That directory belongs
-to this tool entirely, so it is fetched and force-checked-out freely.
+to this tool entirely, so it is fetched and force-checked-out freely. An
+existing clone is only refetched when its url, ref or subdir changed, or
+on ``update``.
 """
 
 import hashlib
@@ -674,7 +676,7 @@ def _source_fingerprint(source: Dict) -> Dict:
 # --------------------------------------------------------------------------
 
 
-def install_skills(skills_config: Dict, config_dir: str, state: Dict) -> bool:
+def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bool = False) -> bool:
     skills_config = skills_config or {}
     section = state.setdefault("skills", {})
     installed: Dict[str, Dict] = dict(section.get("installed", {}) or {})
@@ -688,6 +690,12 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict) -> bool:
 
     failed = set()
     for name, source in sorted(git_sources.items()):
+        if (
+            not update
+            and cached.get(name) == _source_fingerprint(source)
+            and _is_checkout(os.path.join(cache_dir, name))
+        ):
+            continue
         if sync_git_source(name, source, cache_dir):
             cached[name] = _source_fingerprint(source)
         else:
@@ -845,8 +853,8 @@ def diff_skills(skills_config: Dict, config_dir: str, state: Dict) -> List[str]:
         else (_git_sources(skills_config))
     )
 
-    # Upstream commits on an unchanged url/ref are not previewed (like
-    # gitRepos pulls): seeing them would need the network.
+    # Upstream commits on an unchanged url/ref are only fetched by
+    # `deploy --update`, so they are not pending changes.
     for name, source in sorted(git_sources.items()):
         path = os.path.join(cache_dir, name)
         if os.path.lexists(path) and not _is_checkout(path):
