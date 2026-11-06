@@ -6,10 +6,10 @@ import stat
 from typing import Dict, List
 
 from tools.log import Color, log
-from tools.services import diff_services
-from tools.services import has_work as services_has_work
-from tools.services import released_rows as services_released_rows
-from tools.services.keys import key_path as services_key_path
+from tools.mgmt import diff_mgmt
+from tools.mgmt import has_work as mgmt_has_work
+from tools.mgmt import released_rows as mgmt_released_rows
+from tools.mgmt.keys import key_path as mgmt_key_path
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
@@ -57,7 +57,7 @@ ALL_SECTIONS = (
     "launchd",
     "defaults",
     "dock",
-    "services",
+    "mgmt",
 )
 
 
@@ -392,7 +392,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
     # Deploy keeps the key beside the migrated state file, not a legacy one.
-    services_key = services_key_path(state_file)
+    mgmt_key = mgmt_key_path(state_file)
     # Read the same state deploy would act on — including a not-yet-migrated
     # legacy location — but without copying anything: diff is a dry run and
     # must not modify the filesystem.
@@ -593,19 +593,19 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
     if restarts:
         sections.append(("restart", [f"  ~ restart {proc}" for proc in restarts]))
 
-    if "services" in active:
-        if services_has_work(config.get("services")):
-            subsections = diff_services(
-                config.get("services"),
+    if "mgmt" in active:
+        if mgmt_has_work(config.get("mgmt")):
+            subsections = diff_mgmt(
+                config.get("mgmt"),
                 config_dir,
                 state,
-                services_key,
+                mgmt_key,
                 **sops_section.secrets_dir_kwargs(config.get("sops")),
             )
         else:
-            subsections = services_released_rows(config.get("services"), state)
+            subsections = mgmt_released_rows(config.get("mgmt"), state)
         if subsections:
-            sections.append(("services", subsections))
+            sections.append(("mgmt", subsections))
 
     if sections:
         has_changes = True

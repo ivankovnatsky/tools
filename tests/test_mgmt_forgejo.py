@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from services_fakes import Harness
+from mgmt_fakes import Harness
 
-from tools.services import forgejo
+from tools.mgmt import forgejo
 
 URL = "http://svc.example.com"
 FILES = {

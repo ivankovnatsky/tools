@@ -44,7 +44,7 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 `sops`, `templates`, `files`, `env`, `skills`, `links`, `brew`,
-`ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `services`.
+`ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `mgmt`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only and never uses sudo.
@@ -74,7 +74,7 @@ tools watch --config PATH... [--scope SECTION]... [--approve]
   `.DS_Store`) are skipped, as the config loader skips them; a hidden `files:`
   source there does not trigger a run. Only the `--config` paths are watched:
   `include:` files and `files:` sources outside them are not.
-- The state file and `services.key` next to it (and their `.tmp` siblings) are
+- The state file and `mgmt.key` next to it (and their `.tmp` siblings) are
   never watched. Other deploy targets inside a watched directory make each
   deploy trigger the next; keep them outside.
 - Log lines are prefixed `[tools watch]`. `--tmux` runs it in tmux window
@@ -670,14 +670,14 @@ written, restored or deleted, and Dock tiles added, changed or removed
 | Config error | eval fails | section held |
 | `diff` | none | per key, restarts listed once |
 
-## Services
+## mgmt
 
-`services:` configures running services through their HTTP APIs (ported from the
+`mgmt:` configures running services through their HTTP APIs (ported from the
 nix-config `*-mgmt` tools). One sub-key per service; a missing sub-key is not
 managed and an absent section makes no network calls.
 
 ```yaml
-services:
+mgmt:
   jellyfin:
     baseUrl: http://127.0.0.1:8096
     apiKeyFile: /run/secrets/jellyfin-api-key
@@ -701,7 +701,7 @@ Full shapes for `arr` (radarr/sonarr/lidarr/prowlarr), `beszel`, `forgejo`,
 (default 30s), `retries` (5), `retryDelay` (2s, doubled) and `prune`.
 
 - Secrets are file paths only (`*File`); values are redacted as `***` and never stored.
-- Masked secrets are compared against an HMAC of the last value pushed to that endpoint (key in `services.key`, 0600).
+- Masked secrets are compared against an HMAC of the last value pushed to that endpoint (key in `mgmt.key`, 0600).
 - Only differences are written; updates merge into the full remote object.
 - `diff` reads only (no retries, no file changes); `deploy` retries reads but not writes.
 - A bad read shape, a duplicate identity, or an unresolved name aborts that service before any write.

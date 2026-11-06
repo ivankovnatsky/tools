@@ -11,10 +11,10 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from tools.services import identity
-from tools.services import spec as s
-from tools.services.engine import Context, Endpoint
-from tools.services.http import (
+from tools.mgmt import identity
+from tools.mgmt import spec as s
+from tools.mgmt.engine import Context, Endpoint
+from tools.mgmt.http import (
     ApiClient,
     BadResponse,
     InvalidSpec,

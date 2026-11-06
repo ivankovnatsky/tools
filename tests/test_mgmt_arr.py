@@ -2,9 +2,9 @@ import contextlib
 import io
 import unittest
 
-from services_fakes import Harness
+from mgmt_fakes import Harness
 
-from tools.services import arr
+from tools.mgmt import arr
 
 URL = "http://svc.example.com"
 FILES = {

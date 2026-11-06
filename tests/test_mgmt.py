@@ -4,11 +4,11 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from services_fakes import FakeServer, Harness
+from mgmt_fakes import FakeServer, Harness
 
 from tools import cli
 from tools import diff as diff_mod
-from tools.services.http import ApiClient, Unreachable
+from tools.mgmt.http import ApiClient, Unreachable
 
 URL = "http://svc.example.com"
 U = URL
@@ -27,7 +27,7 @@ class GatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
-            mock.patch.object(cli, "install_services", return_value=True) as install,
+            mock.patch.object(cli, "install_mgmt", return_value=True) as install,
         ):
             cli._deploy(config, "/tmp")
         return install
@@ -38,11 +38,11 @@ class GatingTest(unittest.TestCase):
     def test_state_alone_does_not_trigger_network(self):
         # Nothing is deleted on the strength of state, so stale fingerprints
         # must not wake the reconciler.
-        state = {"services": {"arr": {"fingerprints": {"x": "y"}}}}
+        state = {"mgmt": {"arr": {"fingerprints": {"x": "y"}}}}
         self._deploy({}, state).assert_not_called()
 
     def test_all_null_services_is_a_no_op(self):
-        self._deploy({"services": {"jellyfin": None, "arr": None}}, {}).assert_not_called()
+        self._deploy({"mgmt": {"jellyfin": None, "arr": None}}, {}).assert_not_called()
 
     def test_null_service_is_unmanaged_next_to_real_one(self):
         h = Harness(files={KEY: "k"})
@@ -67,10 +67,10 @@ class GatingTest(unittest.TestCase):
         self.assertEqual(rows, [])
 
     def test_absent_section_releases_state_without_network(self):
-        state = {"services": {"arr": {"fingerprints": {"x": "y"}}}}
+        state = {"mgmt": {"arr": {"fingerprints": {"x": "y"}}}}
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self._deploy({}, state).assert_not_called()
-        self.assertEqual(state["services"], {})
+        self.assertEqual(state["mgmt"], {})
         self.assertIn("arr removed from config", out.getvalue())
 
     def test_diff_shows_dropped_service_without_network(self):
@@ -81,10 +81,10 @@ class GatingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = os.path.join(tmp, "state.json")
             with open(state_file, "w") as f:
-                json.dump({"services": {"beszel": {}}}, f)
+                json.dump({"mgmt": {"beszel": {}}}, f)
             out = io.StringIO()
             with (
-                mock.patch.object(diff_mod, "diff_services") as d,
+                mock.patch.object(diff_mod, "diff_mgmt") as d,
                 contextlib.redirect_stdout(out),
             ):
                 clean = diff_mod.show_diff({"stateFile": state_file}, "/tmp")
@@ -92,14 +92,14 @@ class GatingTest(unittest.TestCase):
             self.assertFalse(clean)
             self.assertIn("beszel removed from config", out.getvalue())
             with open(state_file) as f:
-                self.assertEqual(json.load(f), {"services": {"beszel": {}}})
+                self.assertEqual(json.load(f), {"mgmt": {"beszel": {}}})
 
     def test_present_section_runs(self):
-        self._deploy({"services": jellyfin()}, {}).assert_called_once()
+        self._deploy({"mgmt": jellyfin()}, {}).assert_called_once()
 
     def test_diff_skips_absent_section(self):
         with (
-            mock.patch.object(diff_mod, "diff_services") as d,
+            mock.patch.object(diff_mod, "diff_mgmt") as d,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             diff_mod.show_diff({"stateFile": "/nonexistent/state.json"}, "/tmp")
@@ -108,11 +108,11 @@ class GatingTest(unittest.TestCase):
     def test_diff_renders_service_rows_and_reports_pending(self):
         out = io.StringIO()
         with (
-            mock.patch.object(diff_mod, "diff_services", return_value=[("jellyfin", ["    + x"])]),
+            mock.patch.object(diff_mod, "diff_mgmt", return_value=[("jellyfin", ["    + x"])]),
             contextlib.redirect_stdout(out),
         ):
             clean = diff_mod.show_diff(
-                {"stateFile": "/nonexistent/state.json", "services": jellyfin()}, "/tmp"
+                {"stateFile": "/nonexistent/state.json", "mgmt": jellyfin()}, "/tmp"
             )
         self.assertFalse(clean)
         self.assertIn("jellyfin:", out.getvalue())
@@ -122,9 +122,9 @@ class GatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
-            mock.patch.object(cli, "install_services", return_value=False),
+            mock.patch.object(cli, "install_mgmt", return_value=False),
         ):
-            self.assertFalse(cli._deploy({"services": jellyfin()}, "/tmp"))
+            self.assertFalse(cli._deploy({"mgmt": jellyfin()}, "/tmp"))
 
 
 class ReachabilityTest(unittest.TestCase):
@@ -206,18 +206,18 @@ class AuthAndSecretsTest(unittest.TestCase):
     def test_diff_never_mutates_state(self):
         h = Harness(files={KEY: "k"})
         h.server.on("GET", "/Library/VirtualFolders", [])
-        state = {"services": {}}
+        state = {"mgmt": {}}
         with contextlib.redirect_stdout(io.StringIO()):
-            from tools.services import diff_services
+            from tools.mgmt import diff_mgmt
 
-            with mock.patch("tools.services.Context", h.factory):
-                diff_services(jellyfin(libraries=[]), "/tmp", state)
-        self.assertEqual(state, {"services": {}})
+            with mock.patch("tools.mgmt.Context", h.factory):
+                diff_mgmt(jellyfin(libraries=[]), "/tmp", state)
+        self.assertEqual(state, {"mgmt": {}})
 
 
 class TruncationTest(unittest.TestCase):
     def test_long_server_error_redacted_before_truncation(self):
-        from tools.services.engine import MAX_LINE, Context
+        from tools.mgmt.engine import MAX_LINE, Context
 
         ctx = Context("x", apply=False, state={}, reader=lambda p: "s3cr3t-value-long")
         ctx.secret("/s", "x")
@@ -237,7 +237,7 @@ class HttpErrorDetailTest(unittest.TestCase):
     def test_allowed_status_returns_none(self):
         server = FakeServer()
         client = ApiClient(URL, label="t", opener=server)
-        from tools.services.http import ABSENT
+        from tools.mgmt.http import ABSENT
 
         self.assertIs(client.request("GET", "/missing", allow=(404,)), ABSENT)
 
@@ -264,7 +264,7 @@ class FingerprintKeyTest(unittest.TestCase):
         import os
         import stat
 
-        from tools.services.keys import key_path, load_key
+        from tools.mgmt.keys import key_path, load_key
 
         path = key_path(os.path.join(self.dir, "state.json"))
         self.assertIsNone(load_key(path, create=False))
@@ -276,7 +276,7 @@ class FingerprintKeyTest(unittest.TestCase):
     def test_digest_is_keyed_hmac_not_plain_hash(self):
         import hashlib
 
-        from tools.services.engine import Context
+        from tools.mgmt.engine import Context
 
         a = Context("x", apply=True, state={}, fingerprint_key=b"a" * 64)
         b = Context("x", apply=True, state={}, fingerprint_key=b"b" * 64)
@@ -292,7 +292,7 @@ class FingerprintKeyTest(unittest.TestCase):
         self.assertTrue(a.secret_changed(U, "id", "other"))
 
     def test_without_key_secrets_read_as_changed_and_nothing_recorded(self):
-        from tools.services.engine import Context
+        from tools.mgmt.engine import Context
 
         ctx = Context("x", apply=True, state={"fingerprints": {"id": "zz"}})
         self.assertTrue(ctx.secret_changed(U, "id", "v"))
@@ -315,27 +315,27 @@ class FingerprintKeyTest(unittest.TestCase):
     def test_diff_does_not_create_key_but_deploy_does(self):
         import os
 
-        from tools.services import diff_services, install_services
+        from tools.mgmt import diff_mgmt, install_mgmt
 
-        key = os.path.join(self.dir, "services.key")
+        key = os.path.join(self.dir, "mgmt.key")
         h = Harness(files={KEY: "k"})
         h.server.on("GET", "/Library/VirtualFolders", [])
         with (
-            mock.patch("tools.services.Context", h.factory),
+            mock.patch("tools.mgmt.Context", h.factory),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            diff_services(jellyfin(), "/tmp", {}, key)
+            diff_mgmt(jellyfin(), "/tmp", {}, key)
             self.assertFalse(os.path.exists(key))
-            install_services(jellyfin(), "/tmp", {}, key)
+            install_mgmt(jellyfin(), "/tmp", {}, key)
         self.assertTrue(os.path.exists(key))
 
     def test_diff_leaves_loose_key_mode_and_reports_it(self):
         import os
         import stat
 
-        from tools.services import diff_services, install_services
+        from tools.mgmt import diff_mgmt, install_mgmt
 
-        key = os.path.join(self.dir, "services.key")
+        key = os.path.join(self.dir, "mgmt.key")
         with open(key, "w") as f:
             f.write("k" * 64)
         os.chmod(key, 0o644)
@@ -344,10 +344,10 @@ class FingerprintKeyTest(unittest.TestCase):
         h = Harness(files={KEY: "k"})
         h.server.on("GET", "/Library/VirtualFolders", [])
         with (
-            mock.patch("tools.services.Context", h.factory),
+            mock.patch("tools.mgmt.Context", h.factory),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            out = diff_services(jellyfin(), "/tmp", {}, key)
+            out = diff_mgmt(jellyfin(), "/tmp", {}, key)
             after = os.stat(key)
             self.assertEqual(stat.S_IMODE(after.st_mode), 0o644)
             self.assertEqual(
@@ -355,7 +355,7 @@ class FingerprintKeyTest(unittest.TestCase):
             )
             self.assertEqual(sorted(os.listdir(self.dir)), listing)
             self.assertTrue(any("0644 -> 0600" in r for _, rows in out for r in rows), out)
-            install_services(jellyfin(), "/tmp", {}, key)
+            install_mgmt(jellyfin(), "/tmp", {}, key)
         self.assertEqual(stat.S_IMODE(os.stat(key).st_mode), 0o600)
 
 
@@ -364,20 +364,20 @@ class KeyFileErrorTest(unittest.TestCase):
         import tempfile
 
         self._tmp = tempfile.TemporaryDirectory()
-        self.key = f"{self._tmp.name}/services.key"
+        self.key = f"{self._tmp.name}/mgmt.key"
 
     def tearDown(self):
         self._tmp.cleanup()
 
     def test_truncated_key_is_an_error_row_not_a_crash(self):
-        from tools.services import diff_services, install_services
+        from tools.mgmt import diff_mgmt, install_mgmt
 
         with open(self.key, "w") as f:
             f.write("short")
-        rows = diff_services(jellyfin(), "/tmp", {}, self.key)
+        rows = diff_mgmt(jellyfin(), "/tmp", {}, self.key)
         self.assertTrue(any("empty or truncated" in r for _, rs in rows for r in rs))
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertFalse(install_services(jellyfin(), "/tmp", {}, self.key))
+            self.assertFalse(install_mgmt(jellyfin(), "/tmp", {}, self.key))
 
     def test_deploy_continues_other_sections_on_bad_key(self):
         with open(self.key, "w") as f:
@@ -386,18 +386,18 @@ class KeyFileErrorTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
-            mock.patch.object(cli, "services_key_path", return_value=self.key),
+            mock.patch.object(cli, "mgmt_key_path", return_value=self.key),
             mock.patch.object(cli, "install_flatpak_packages", return_value=True) as fp,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            ok = cli._deploy({"services": jellyfin()}, "/tmp")
+            ok = cli._deploy({"mgmt": jellyfin()}, "/tmp")
         self.assertFalse(ok)
         fp.assert_called_once()
 
     def test_create_race_uses_the_winners_key(self):
         import os
 
-        from tools.services import keys
+        from tools.mgmt import keys
 
         real_link = os.link
 
@@ -408,7 +408,7 @@ class KeyFileErrorTest(unittest.TestCase):
 
         with mock.patch.object(keys.os, "link", racing_link):
             self.assertEqual(keys.load_key(self.key, create=True), b"w" * 64)
-        self.assertEqual(os.listdir(self._tmp.name), ["services.key"])
+        self.assertEqual(os.listdir(self._tmp.name), ["mgmt.key"])
         self.assertIs(os.link, real_link)
 
 

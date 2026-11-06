@@ -306,7 +306,7 @@ class WatchCommandTest(unittest.TestCase):
             state = self._state_config(d)
 
             def deploy(*_):
-                for path in (state, state + ".tmp", os.path.join(d, "state", "services.key")):
+                for path in (state, state + ".tmp", os.path.join(d, "state", "mgmt.key")):
                     with open(path, "a") as f:
                         f.write("x")
                 return True

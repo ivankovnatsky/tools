@@ -7,9 +7,9 @@ import click
 from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
-from tools.services import has_work as services_has_work
-from tools.services import install_services, release_services
-from tools.services.keys import key_path as services_key_path
+from tools.mgmt import has_work as mgmt_has_work
+from tools.mgmt import install_mgmt, release_mgmt
+from tools.mgmt.keys import key_path as mgmt_key_path
 from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
@@ -302,16 +302,16 @@ def _run_sections(
         )
 
     # Talks to service APIs; gated so an absent section makes no network calls.
-    if "services" in active and services_has_work(config.get("services")):
-        success &= install_services(
-            config.get("services"),
+    if "mgmt" in active and mgmt_has_work(config.get("mgmt")):
+        success &= install_mgmt(
+            config.get("mgmt"),
             config_dir,
             state,
-            services_key_path(state_file) if state_file else None,
+            mgmt_key_path(state_file) if state_file else None,
             **sops_section.secrets_dir_kwargs(config.get("sops")),
         )
-    elif "services" in active:
-        release_services(config.get("services"), state)
+    elif "mgmt" in active:
+        release_mgmt(config.get("mgmt"), state)
 
     # Last: dock entries point at apps brew casks may have just installed.
     # Restarts wait for both: a Dock killed mid-deploy can drop a later
@@ -435,7 +435,7 @@ def _written_paths(config: dict) -> set[str]:
     """Paths every deploy rewrites, which a watch must not react to."""
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
     state_file = os.path.realpath(state_file)
-    return {state_file, os.path.realpath(services_key_path(state_file))}
+    return {state_file, os.path.realpath(mgmt_key_path(state_file))}
 
 
 def _watch_run(

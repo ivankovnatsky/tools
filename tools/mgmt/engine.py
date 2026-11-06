@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from tools.log import Color, log
-from tools.services.http import ApiClient, InvalidSpec, ServiceError, norm_url
+from tools.mgmt.http import ApiClient, InvalidSpec, ServiceError, norm_url
 from tools.util import run_command as _run_command
 
 MAX_LINE = 400

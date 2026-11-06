@@ -1,4 +1,4 @@
-"""`services:` section: reconcile running services through their HTTP APIs.
+"""`mgmt:` section: reconcile running services through their HTTP APIs.
 
 Each service module exposes ``parse(raw, base_dir) -> Spec`` (validation, the
 only step that sees config-shaped data) and ``reconcile(spec, ctx)`` (API
@@ -10,10 +10,10 @@ import copy
 from typing import Callable, Dict, List, Optional, Tuple
 
 from tools.log import Color, log
-from tools.services import arr, beszel, forgejo, jellyfin, nextdns, syncthing
-from tools.services.engine import Context
-from tools.services.http import ServiceError
-from tools.services.keys import KeyFileError, load_key, loose_mode
+from tools.mgmt import arr, beszel, forgejo, jellyfin, nextdns, syncthing
+from tools.mgmt.engine import Context
+from tools.mgmt.http import ServiceError
+from tools.mgmt.keys import KeyFileError, load_key, loose_mode
 
 # Order matters only for readability of output; services are independent.
 SERVICES = {
@@ -30,7 +30,7 @@ def has_work(config) -> bool:
     """Gate: an absent or empty section means no-op and no network calls.
 
     State is not consulted here: a dropped service only needs
-    `release_services`, which makes no network calls.
+    `release_mgmt`, which makes no network calls.
     """
     if not isinstance(config, dict):
         return bool(config)  # malformed: run so it is reported, not ignored
@@ -45,7 +45,7 @@ def _released(config, state: Dict, apply: bool) -> List[Tuple[str, List[str]]]:
     if config is None:
         config = {}
     if not isinstance(config, dict):
-        return []  # malformed: reported by run_services, nothing released
+        return []  # malformed: reported by run_mgmt, nothing released
     results = []
     for name in sorted(state):
         if name in SERVICES and config.get(name) is None:
@@ -58,17 +58,17 @@ def _released(config, state: Dict, apply: bool) -> List[Tuple[str, List[str]]]:
     return results
 
 
-def release_services(config, state: Dict) -> None:
+def release_mgmt(config, state: Dict) -> None:
     """Deploy side of a dropped section: forget its state, touch nothing remote."""
-    _released(config, state.get("services", {}), apply=True)
+    _released(config, state.get("mgmt", {}), apply=True)
 
 
 def released_rows(config, state: Dict) -> List[Tuple[str, List[str]]]:
-    rows = _released(config, copy.deepcopy(state.get("services", {})), apply=False)
+    rows = _released(config, copy.deepcopy(state.get("mgmt", {})), apply=False)
     return [(name, [f"  {row}" for row in r]) for name, r in rows]
 
 
-def run_services(
+def run_mgmt(
     config: Dict,
     state: Dict,
     *,
@@ -90,12 +90,12 @@ def run_services(
     results: List[Tuple[str, List[str]]] = []
     ok = True
     if not isinstance(config, dict):
-        return [("services", ["  ! services must be a mapping"])], False
+        return [("mgmt", ["  ! mgmt must be a mapping"])], False
     for name in config:
         if name not in SERVICES and config[name] is not None:
             results.append((name, [f"  ! unknown service {name!r}"]))
             if apply:
-                log(f"services: unknown service {name!r}", Color.RED)
+                log(f"mgmt: unknown service {name!r}", Color.RED)
             ok = False
     for name, module in SERVICES.items():
         if config.get(name) is None:  # absent or null: unmanaged
@@ -119,7 +119,7 @@ def run_services(
     return results, ok
 
 
-def diff_services(
+def diff_mgmt(
     config: Dict,
     config_dir: str,
     state: Dict,
@@ -127,13 +127,13 @@ def diff_services(
     secrets_dir: Optional[str] = None,
     secrets_dir_error: Optional[str] = None,
 ) -> List[Tuple[str, List[str]]]:
-    scratch = copy.deepcopy(state.get("services", {}))
+    scratch = copy.deepcopy(state.get("mgmt", {}))
     # diff never creates the key: without one every masked secret reads as changed.
     try:
         key = load_key(key_file, create=False) if key_file else None
     except KeyFileError as e:
-        return [("services", [f"    ! {e}"])]
-    results, _ = run_services(
+        return [("mgmt", [f"    ! {e}"])]
+    results, _ = run_mgmt(
         config,
         scratch,
         apply=False,
@@ -146,11 +146,11 @@ def diff_services(
     mode = loose_mode(key_file) if key and key_file else None
     if mode is not None:
         # diff is read-only; deploy tightens it.
-        out.insert(0, ("services", [f"    ~ {key_file} mode {mode:04o} -> 0600"]))
+        out.insert(0, ("mgmt", [f"    ~ {key_file} mode {mode:04o} -> 0600"]))
     return out
 
 
-def install_services(
+def install_mgmt(
     config: Dict,
     config_dir: str,
     state: Dict,
@@ -162,11 +162,11 @@ def install_services(
         key = load_key(key_file, create=True) if key_file else None
     except KeyFileError as e:
         # Without a usable key masked secrets would be re-pushed every run.
-        log(f"services: {e}", Color.RED)
+        log(f"mgmt: {e}", Color.RED)
         return False
-    _, ok = run_services(
+    _, ok = run_mgmt(
         config,
-        state.setdefault("services", {}),
+        state.setdefault("mgmt", {}),
         apply=True,
         base_dir=config_dir,
         fingerprint_key=key,
@@ -174,5 +174,5 @@ def install_services(
         secrets_dir_error=secrets_dir_error,
     )
     if not ok:
-        log("services: one or more services failed (see ! rows above)", Color.RED)
+        log("mgmt: one or more services failed (see ! rows above)", Color.RED)
     return ok

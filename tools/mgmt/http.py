@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-USER_AGENT = "tools-services"
+USER_AGENT = "tools-mgmt"
 _RETRY_STATUSES = {502, 503, 504}
 _SAFE_METHODS = {"GET", "HEAD"}
 

@@ -5,8 +5,8 @@ import json
 import urllib.error
 import urllib.parse
 
-from tools.services import run_services
-from tools.services.engine import Context
+from tools.mgmt import run_mgmt
+from tools.mgmt.engine import Context
 
 
 class FakeResponse:
@@ -106,8 +106,6 @@ class Harness:
     def run(self, config, state=None, apply=True, **secrets):
         state = {} if state is None else state
         secrets = secrets or {"secrets_dir": "/secrets"}
-        results, ok = run_services(
-            config, state, apply=apply, context_factory=self.factory, **secrets
-        )
+        results, ok = run_mgmt(config, state, apply=apply, context_factory=self.factory, **secrets)
         rows = [row for _, rows in results for row in rows]
         return rows, ok, state

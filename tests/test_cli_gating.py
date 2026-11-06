@@ -92,35 +92,35 @@ class DeployGatingTest(unittest.TestCase):
 
         curl.assert_called_once()
 
-    def test_launchd_and_services_get_sops_secrets_dir(self):
+    def test_launchd_and_mgmt_get_sops_secrets_dir(self):
         config = {
             "sops": {
                 "secretsDir": "/state/secrets",
                 "secrets": {"t": {"key": "a", "sopsFile": "/f"}},
             },
             "launchd": {"services": {"s": {"command": "x"}}},
-            "services": {"nextdns": {}},
+            "mgmt": {"nextdns": {}},
         }
         with (
             mock.patch.object(cli, "install_launchd", return_value=True) as ld,
-            mock.patch.object(cli, "install_services", return_value=True) as svc,
+            mock.patch.object(cli, "install_mgmt", return_value=True) as svc,
         ):
-            self._deploy(config, {}, ("launchd", "services"))
+            self._deploy(config, {}, ("launchd", "mgmt"))
 
         for call in (ld, svc):
             self.assertEqual(call.call_args.kwargs["secrets_dir"], "/state/secrets")
 
-    def test_invalid_sops_reaches_launchd_and_services_as_none(self):
+    def test_invalid_sops_reaches_launchd_and_mgmt_as_none(self):
         config = {
             "sops": {"secretsDir": "rel", "secrets": {"t": {"key": "a", "sopsFile": "/f"}}},
             "launchd": {"services": {"s": {"command": "x"}}},
-            "services": {"nextdns": {}},
+            "mgmt": {"nextdns": {}},
         }
         with (
             mock.patch.object(cli, "install_launchd", return_value=True) as ld,
-            mock.patch.object(cli, "install_services", return_value=True) as svc,
+            mock.patch.object(cli, "install_mgmt", return_value=True) as svc,
         ):
-            self._deploy(config, {}, ("launchd", "services"))
+            self._deploy(config, {}, ("launchd", "mgmt"))
 
         for call in (ld, svc):
             self.assertIsNone(call.call_args.kwargs["secrets_dir"])
@@ -140,13 +140,13 @@ class DeployGatingTest(unittest.TestCase):
                 "stateFile": f"{d}/state.json",
                 "sops": sops_raw,
                 "launchd": {"services": {"s": {"command": "x"}}},
-                "services": {"nextdns": {}},
+                "mgmt": {"nextdns": {}},
             }
             with (
                 mock.patch.object(diff, "diff_launchd", return_value=[]) as ld,
-                mock.patch.object(diff, "diff_services", return_value=[]) as svc,
+                mock.patch.object(diff, "diff_mgmt", return_value=[]) as svc,
             ):
-                diff.show_diff(config, d, ("launchd", "services"))
+                diff.show_diff(config, d, ("launchd", "mgmt"))
 
         for call in (ld, svc):
             self.assertEqual(call.call_args.kwargs["secrets_dir"], "/state/secrets")

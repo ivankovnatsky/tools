@@ -3,7 +3,7 @@ import io
 import json
 import unittest
 
-from services_fakes import Harness
+from mgmt_fakes import Harness
 
 URL = "http://svc.example.com"
 LOCAL = "-".join(["AAAAAAA"] * 8)

@@ -2,7 +2,7 @@ import contextlib
 import io
 import unittest
 
-from services_fakes import Harness
+from mgmt_fakes import Harness
 
 URL = "http://svc.example.com"
 KEY = "/secrets/jf"

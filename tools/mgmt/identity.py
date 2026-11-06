@@ -8,7 +8,7 @@ same identity are an error before any write.
 import re
 from typing import Any, Callable, Dict, Hashable, Iterable, List, Optional, Type
 
-from tools.services.http import BadResponse, InvalidSpec, ServiceError, norm_path
+from tools.mgmt.http import BadResponse, InvalidSpec, ServiceError, norm_path
 
 Canon = Callable[[Any], Hashable]
 

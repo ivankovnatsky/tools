@@ -12,7 +12,7 @@ class KeyFileError(Exception):
 
 def key_path(state_file: str) -> str:
     """The key lives next to the state file, never inside it."""
-    return os.path.join(os.path.dirname(os.path.abspath(state_file)), "services.key")
+    return os.path.join(os.path.dirname(os.path.abspath(state_file)), "mgmt.key")
 
 
 def load_key(path: str, create: bool) -> Optional[bytes]:

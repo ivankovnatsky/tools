@@ -180,10 +180,10 @@ dock:
       display: stack
       sort: dateadded
 
-# Service settings over HTTP APIs. See README "Services". Every *File is a
+# Service settings over HTTP APIs. See README "mgmt". Every *File is a
 # path (e.g. a sops-decrypted secret); inline secrets are rejected. Each
 # service also takes timeout / retries / retryDelay.
-services:
+mgmt:
   arr:
     radarr: # sonarr and lidarr take the same keys
       baseUrl: http://127.0.0.1:7878

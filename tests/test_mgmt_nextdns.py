@@ -3,9 +3,9 @@ import io
 import json
 import unittest
 
-from services_fakes import Harness
+from mgmt_fakes import Harness
 
-from tools.services.nextdns import matches
+from tools.mgmt.nextdns import matches
 
 URL = "http://svc.example.com"
 PROFILE = {
@@ -229,7 +229,7 @@ class NextDnsTest(unittest.TestCase):
         self.assertEqual(self.h.server.calls, [])
 
     def test_relative_profile_file_resolves_against_base_dir(self):
-        from tools.services import nextdns
+        from tools.mgmt import nextdns
 
         spec = nextdns.parse(
             {"profiles": {"p": {"profileFile": "nd/p.json", "apiKeyFile": "/k"}}}, "/cfg", "/s"
@@ -348,7 +348,7 @@ class NextDnsTest(unittest.TestCase):
         self.assertEqual(len(self.h.server.made("GET", "/profiles")), 1)
 
     def test_profile_id_dir_defaults_to_sops_secrets_dir(self):
-        from tools.services import nextdns
+        from tools.mgmt import nextdns
 
         raw = {"profiles": {"p": {"profileFile": "/p.json", "apiKeyFile": "/k"}}}
         spec = nextdns.parse(raw, None, "/state/secrets")
@@ -361,7 +361,7 @@ class NextDnsTest(unittest.TestCase):
         self.assertTrue(ok, rows)
         self.assertEqual(self.h.server.made("GET", "/profiles"), [])
 
-    def test_invalid_sops_fails_the_profile_through_run_services(self):
+    def test_invalid_sops_fails_the_profile_through_run_mgmt(self):
         from tools.user import sops
 
         secrets = sops.secrets_dir_kwargs({"secretsDir": "rel"})
@@ -371,8 +371,8 @@ class NextDnsTest(unittest.TestCase):
         self.assertEqual(self.h.server.calls, [])
 
     def test_default_profile_id_dir_needs_valid_sops(self):
-        from tools.services import nextdns
-        from tools.services.http import InvalidSpec
+        from tools.mgmt import nextdns
+        from tools.mgmt.http import InvalidSpec
 
         raw = {"profiles": {"p": {"profileFile": "/p.json", "apiKeyFile": "/k"}}}
         with self.assertRaisesRegex(InvalidSpec, r"sops.secretsDir \(no sops section\)"):

@@ -3,8 +3,8 @@
 import os
 from typing import Any, Dict, Iterable, List, Optional
 
-from tools.services.engine import Endpoint
-from tools.services.http import InvalidSpec
+from tools.mgmt.engine import Endpoint
+from tools.mgmt.http import InvalidSpec
 
 # Common to every service (`prune` lifts the delete-everything guard).
 ENDPOINT_KEYS = {"baseUrl", "baseUrlFiles", "timeout", "retries", "retryDelay", "prune"}
