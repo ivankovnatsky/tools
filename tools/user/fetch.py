@@ -54,9 +54,10 @@ def _https(url) -> bool:
         return False
     try:
         parts = urllib.parse.urlsplit(url)
+        parts.port  # raises on a malformed port
     except ValueError:
         return False
-    return parts.scheme == "https" and bool(parts.netloc)
+    return parts.scheme == "https" and bool(parts.hostname)
 
 
 def parse(raw) -> Tuple[List[Entry], List[str]]:
@@ -261,8 +262,12 @@ def download(e: Entry, opener: Callable, expect=None) -> str:
         got = digest.hexdigest()
         if e.sha256 and got != e.sha256:
             raise FetchError(f"sha256 mismatch: expected {e.sha256}, got {got}")
-        if expect is _ABSENT and os.path.lexists(e.target):
-            raise FetchError("target appeared during download; not replacing it")
+        if expect is _ABSENT:
+            try:
+                fsutil._publish_exclusive(tmp, e.target)
+            except FileExistsError:
+                raise FetchError("target appeared during download; not replacing it") from None
+            return got
         if isinstance(expect, str) and (os.path.islink(e.target) or _file_hash(e.target) != expect):
             raise FetchError("target changed during download; not replacing it")
         os.replace(tmp, e.target)

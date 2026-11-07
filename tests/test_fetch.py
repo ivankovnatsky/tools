@@ -387,6 +387,11 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(self.read(), b"edited")
         self.assertEqual(stat.S_IMODE(os.stat(self.target).st_mode), 0o600)
 
+    def test_bad_port_is_config_error(self):
+        entries, errors = fetch.parse({self.target: "https://example.com:not-a-port/f"})
+        self.assertEqual(entries, [])
+        self.assertEqual(len(errors), 1)
+
     def test_move_from_fetch_to_files(self):
         self.deploy({self.target: URL})
         src = os.path.join(self.tmp, "src")
