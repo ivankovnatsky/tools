@@ -166,7 +166,10 @@ def _parse_mode(value) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, str):
-        return int(value, 8)
+        mode = int(value, 8)
+        if not 0 <= mode <= 0o7777:
+            raise ValueError(f"files: mode {value!r} must be between 0000 and 7777")
+        return mode
     raise TypeError(
         f'files: mode must be a quoted octal string (e.g. "0644"), got {value!r} '
         f"({type(value).__name__}); unquoted YAML ints are ambiguous"

@@ -26,9 +26,12 @@ def parse_mode(value, section: str) -> Optional[int]:
         return None
     if isinstance(value, str):
         try:
-            return int(value, 8)
+            mode = int(value, 8)
         except ValueError:
             raise ValueError(f"{section}: invalid mode {value!r}") from None
+        if not 0 <= mode <= 0o7777:
+            raise ValueError(f"{section}: mode {value!r} must be between 0000 and 7777")
+        return mode
     raise TypeError(
         f'{section}: mode must be a quoted octal string (e.g. "0600"), got {value!r} '
         f"({type(value).__name__}); unquoted YAML ints are ambiguous"
