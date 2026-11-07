@@ -192,6 +192,8 @@ def _movable():
 
     return {
         "files": (lambda st: st.setdefault("files", {}), files),
+        # fetch records are files records plus a url.
+        "fetch": (lambda st: st.setdefault("fetch", {}).setdefault("installed", {}), files),
         "sops": (lambda st: st.setdefault("sops", {}).setdefault("installed", {}), sops),
         "templates": (
             lambda st: st.setdefault("templates", {}).setdefault("installed", {}),
@@ -200,17 +202,20 @@ def _movable():
     }
 
 
-def _declared(files_entries, sops_raw, templates_raw, config_dir):
+def _declared(files_entries, sops_raw, templates_raw, config_dir, fetch_raw=None):
     """section -> [(path, name)] declared now, or None on any config error."""
+    from tools.user import fetch
     from tools.user.files import _resolve_entries
 
     entries, files_errors = _resolve_entries(files_entries or [], config_dir)
     parsed_sops = sops.parse_sops(sops_raw)
     tmpls, tmpl_errors = templates.parse_templates(templates_raw, *parsed_sops.secrets_dir())
-    if files_errors or parsed_sops.errors or tmpl_errors:
+    fetched, fetch_errors = fetch.parse(fetch_raw)
+    if files_errors or parsed_sops.errors or tmpl_errors or fetch_errors:
         return None
     return {
         "files": [(e.target, "") for e in entries if not e.directory],
+        "fetch": [(e.target, "") for e in fetched],
         "sops": [(x.path, x.name) for x in parsed_sops.secrets],
         "templates": [(t.target, t.name) for t in tmpls],
     }
@@ -223,6 +228,7 @@ def move_between_sections(
     sops_raw=None,
     templates_raw=None,
     config_dir: str = ".",
+    fetch_raw=None,
 ) -> List[str]:
     """Move state records of paths whose owner changed in config.
 
@@ -233,7 +239,7 @@ def move_between_sections(
     stays refused. Skipped while any of them has config errors. Mutates
     ``state`` and returns ``"<path> (<from> -> <to>)"`` per move.
     """
-    declared_by = _declared(files_entries, sops_raw, templates_raw, config_dir)
+    declared_by = _declared(files_entries, sops_raw, templates_raw, config_dir, fetch_raw)
     if declared_by is None:
         return []
     declared: Dict[str, Tuple[str, str, str]] = {}  # key -> (section, path, name)
@@ -280,8 +286,9 @@ def ownership_conflicts(
     git_repos_raw=None,
     clone_pending: bool = False,
     env_raw=None,
+    fetch_raw=None,
 ) -> Ownership:
-    """Paths every file-writing section (files, sops, templates, env) refuses.
+    """Paths every file-writing section (files, sops, templates, env, fetch) refuses.
 
     A path claimed by more than one of them, declared now or tracked in
     state, is refused by all, so two owners never overwrite each other. A
@@ -346,6 +353,12 @@ def ownership_conflicts(
             claim(path, "env")
     for path in state.get("env", {}).get("files", {}) or {}:
         claim(path, "env")
+    from tools.user import fetch
+
+    for path in fetch.targets(fetch_raw):
+        claim(path, "fetch")
+    for path in state.get("fetch", {}).get("installed", {}) or {}:
+        claim(path, "fetch")
     exact = {
         spelled[path]: "claimed by " + " and ".join(sorted(sections))
         for path, sections in claims.items()

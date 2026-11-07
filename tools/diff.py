@@ -20,6 +20,8 @@ from tools.user.dock import diff_dock
 from tools.user.dock import has_work as dock_has_work
 from tools.user.env import diff_env
 from tools.user.env import has_work as env_has_work
+from tools.user.fetch import diff_fetch
+from tools.user.fetch import has_work as fetch_has_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.git_repos import is_checkout
 from tools.user.launchd import diff_launchd
@@ -48,6 +50,7 @@ ALL_SECTIONS = (
     "sops",
     "templates",
     "files",
+    "fetch",
     "env",
     "skills",
     "links",
@@ -475,6 +478,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         sops_raw=config.get("sops"),
         templates_raw=config.get("templates"),
         config_dir=config_dir,
+        fetch_raw=config.get("fetch"),
     )
     if moves:
         sections.append(("move", [f"~ move {m}" for m in moves]))
@@ -489,6 +493,7 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         git_repos_raw=config.get("gitRepos"),
         clone_pending="gitRepos" in active,
         env_raw=config.get("env"),
+        fetch_raw=config.get("fetch"),
     )
     # Same order as deploy: paths inside a gitRepos destination after the clone.
     inside = secrets_flow.paths_in_repos(
@@ -539,6 +544,11 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         changes = _diff_files(config.get("files", []) or [], config_dir, state, conflicts)
         if changes:
             sections.append(("files", changes))
+
+    if "fetch" in active and fetch_has_work(config.get("fetch"), state):
+        changes = diff_fetch(config.get("fetch"), state, conflicts)
+        if changes:
+            sections.append(("fetch", changes))
 
     if "env" in active and env_has_work(config.get("env"), state):
         changes = diff_env(config.get("env"), state, conflicts)

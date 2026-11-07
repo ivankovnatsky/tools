@@ -24,6 +24,8 @@ from tools.user.dock import install_dock
 from tools.user.env import export_process as env_export_process
 from tools.user.env import has_work as env_has_work
 from tools.user.env import install_env
+from tools.user.fetch import has_work as fetch_has_work
+from tools.user.fetch import install_fetch
 from tools.user.files import install_files
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
@@ -141,6 +143,7 @@ def _run_sections(
         sops_raw=config.get("sops"),
         templates_raw=config.get("templates"),
         config_dir=config_dir,
+        fetch_raw=config.get("fetch"),
     )
     for move in moves:
         log(f"Moved: {move}", Color.GREEN)
@@ -158,6 +161,7 @@ def _run_sections(
             config_dir=config_dir,
             git_repos_raw=config.get("gitRepos"),
             env_raw=config.get("env"),
+            fetch_raw=config.get("fetch"),
         )
 
     # Before anything installs: uv/npm/... must see the session env (e.g.
@@ -272,6 +276,9 @@ def _run_sections(
             sops_section.parse_sops(config.get("sops")).secrets_dir()[0],
         )
 
+    if "fetch" in active and fetch_has_work(config.get("fetch"), state):
+        success &= install_fetch(config.get("fetch"), state, conflicts, update)
+
     if "env" in active and env_has_work(config.get("env"), state):
         success &= install_env(config.get("env"), state, conflicts)
 
@@ -346,7 +353,10 @@ def main(verbose):
 @click.option(
     "--update",
     is_flag=True,
-    help="Also upgrade what is already installed (packages, git checkouts, skill sources).",
+    help=(
+        "Also upgrade what is already installed "
+        "(packages, git checkouts, skill sources, fetched files)."
+    ),
 )
 def deploy(config, scope, approve, update):
     """Apply config to bring system to desired state."""

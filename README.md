@@ -34,6 +34,7 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
     tracked App Store apps.
   - `ollamaModels`: tracked models are pulled again; `flatpak`: tracked apps get
     `flatpak update`.
+  - `fetch`: tracked files without a `sha256` pin are downloaded again.
   - `pi`, `mcp` and `curlShell` have no upgrade step.
 - `--config` accepts a file or a directory and may be repeated; configs are
   deep-merged in order (scalars replace, dicts recurse, lists replace).
@@ -43,7 +44,7 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
-`sops`, `templates`, `files`, `env`, `skills`, `links`, `brew`,
+`sops`, `templates`, `files`, `fetch`, `env`, `skills`, `links`, `brew`,
 `ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `mgmt`.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
@@ -234,7 +235,7 @@ templates:
 
 ## Ownership (files, sops, templates)
 
-- A path declared by two of `files`/`sops`/`templates` is refused by all of them. Moving a path from one section to another moves its state record first (`~ move <path> (files -> templates)`), so the new section takes the file over in the same deploy; a file edited since tools wrote it keeps its old record and stays refused.
+- A path declared by two of `files`/`sops`/`templates`/`fetch`/`env` is refused by all of them. Moving a path between `files`, `sops`, `templates` and `fetch` moves its state record first (`~ move <path> (files -> templates)`), so the new section takes the file over in the same deploy; a file edited since tools wrote it keeps its old record and stays refused.
 - Refused as well: symlinks managed by `links`/`skills`, paths through them or inside their targets, skill copy dirs and the skills cache.
 - Symlinked parents and case (on case-insensitive volumes) are normalized before comparing, so aliases match.
 - A managed path may not be inside another one (for example, a secret named `rendered`).
@@ -332,6 +333,37 @@ links:
 - A missing source is skipped with a warning, so no dangling link is made.
 - A tracked link is repointed or removed only while it still points where
   tools left it, and removals are held while any entry is invalid.
+
+## fetch
+
+`fetch:` downloads files from https URLs, the nix `fetchurl` equivalent (a vim
+spell file, a release binary with no brew formula):
+
+```yaml
+fetch:
+  ~/.config/nvim/spell/uk.utf-8.spl: https://ftp.nluug.nl/vim/runtime/spell/uk.utf-8.spl
+  ~/.local/bin/tool:
+    url: https://example.com/tool-v1.2
+    sha256: 3b0c...   # optional
+    mode: "0755"      # quoted octal, default 0644
+    force: true       # replace an existing file tools did not write
+```
+
+- A missing target is downloaded to a temp file beside it and renamed into
+  place; parent directories are created. A file tools wrote is not downloaded
+  again on a plain deploy. Without `sha256`, a changed `url` or
+  `deploy --update` re-downloads it; with `sha256`, only a changed `sha256`
+  does (a matching file is kept even if its `url` changes).
+- With `sha256`, a download that does not match is not installed, and an
+  untracked file that already matches is adopted without downloading.
+- https only, redirects included; 60s network timeout. A failed download fails
+  the deploy but not the other entries.
+- Ownership follows `files:`: an untracked existing file is replaced only with
+  `force: true`, a file modified since tools wrote it is neither updated nor
+  removed, a dropped entry's file is removed, and removals wait while any entry
+  is malformed.
+- `tools diff` never touches the network: it shows `+ fetch <target> <- <url>`
+  for missing files, `~ fetch` for url/sha256 changes, and removals.
 
 ## Env
 
