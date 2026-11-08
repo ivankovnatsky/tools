@@ -327,7 +327,7 @@ class WatchCommandTest(unittest.TestCase):
                 if not edits:
                     edits.append(1)
                     with open(os.path.join(d, "extra.yaml"), "w") as f:
-                        f.write("a: 1\n")
+                        f.write("vars: {a: 1}\n")
                 return True
 
             result, dep = self._watch(d, deploy)

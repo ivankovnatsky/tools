@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tools.config import ConfigError, deep_merge, load_config, load_config_dir
+from tools.config import (
+    SECTIONS,
+    TOP_LEVEL_KEYS,
+    ConfigError,
+    deep_merge,
+    load_config,
+    load_config_dir,
+)
+from tools.diff import ALL_SECTIONS
 
 
 def _write(path, content):
@@ -56,12 +64,15 @@ class EmptyDesiredStateTest(unittest.TestCase):
 class IncludeTest(unittest.TestCase):
     def test_includes_are_merged_under_the_including_file(self):
         with tempfile.TemporaryDirectory() as d:
-            _write(os.path.join(d, "base.json"), '{"npm": {"packages": {"a": {}}}, "x": 1}')
-            _write(os.path.join(d, "top.json"), '{"include": ["base.json"], "x": 2}')
+            _write(
+                os.path.join(d, "base.json"),
+                '{"npm": {"packages": {"a": {}}}, "stateFile": "/base"}',
+            )
+            _write(os.path.join(d, "top.json"), '{"include": ["base.json"], "stateFile": "/top"}')
 
             loaded = load_config(os.path.join(d, "top.json"))
 
-            self.assertEqual(loaded["x"], 2)
+            self.assertEqual(loaded["stateFile"], "/top")
             self.assertIn("a", loaded["npm"]["packages"])
 
     def test_missing_include_raises(self):
@@ -78,6 +89,75 @@ class IncludeTest(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_config(os.path.join(d, "a.json"))
+
+
+class TopLevelKeysTest(unittest.TestCase):
+    def test_every_section_and_setting_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.json")
+            keys = sorted(TOP_LEVEL_KEYS - {"include"})
+            _write(path, "{" + ", ".join(f'"{k}": null' for k in keys) + "}")
+
+            self.assertEqual(sorted(load_config(path)), keys)
+
+    def test_allowed_keys_follow_the_section_registry(self):
+        self.assertIs(ALL_SECTIONS, SECTIONS)
+        self.assertLessEqual(set(SECTIONS), TOP_LEVEL_KEYS)
+
+    def test_unknown_key_names_key_file_and_valid_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.yaml")
+            _write(path, "npm: {}\nbogus: 1\n")
+
+            with self.assertRaises(ConfigError) as cm:
+                load_config(path)
+
+        msg = str(cm.exception)
+        self.assertIn("'bogus'", msg)
+        self.assertIn(path, msg)
+        self.assertIn("valid keys: ", msg)
+        self.assertIn("mgmt", msg)
+        self.assertIn("stateFile", msg)
+
+    def test_renamed_services_key_hints_mgmt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.yaml")
+            _write(path, "services: {}\n")
+
+            with self.assertRaisesRegex(ConfigError, "use 'mgmt' instead of 'services'"):
+                load_config(path)
+
+    def test_unknown_key_in_included_file_names_that_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            inc = os.path.join(d, "shared", "base.yaml")
+            _write(inc, "services: {}\n")
+            _write(os.path.join(d, "machines", "h.yaml"), "include: [../shared/base.yaml]\n")
+
+            with mock.patch("tools.config._get_hostname", return_value="h"):
+                with self.assertRaises(ConfigError) as cm:
+                    load_config_dir(d)
+
+        self.assertIn(inc, str(cm.exception))
+
+    def test_unknown_key_in_flat_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "a.json"), '{"npm": {}, "variables": {}}')
+
+            with self.assertRaisesRegex(ConfigError, "'variables'"):
+                load_config_dir(d)
+
+    def test_cli_exits_on_unknown_key(self):
+        from tools import cli
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.yaml")
+            _write(path, "services: {}\n")
+
+            with mock.patch.object(cli, "log") as log, self.assertRaises(SystemExit) as cm:
+                cli._load_merged_config([path])
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("'services'", log.call_args[0][0])
 
 
 if __name__ == "__main__":

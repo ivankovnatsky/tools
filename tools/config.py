@@ -5,6 +5,37 @@ from typing import Any, Dict, Optional
 
 SUPPORTED_SUFFIXES = (".json", ".yaml", ".yml", ".toml")
 
+SECTIONS = (
+    "bun",
+    "npm",
+    "uv",
+    "go",
+    "pi",
+    "mcp",
+    "curlShell",
+    "gitRepos",
+    "sops",
+    "templates",
+    "files",
+    "fetch",
+    "env",
+    "skills",
+    "links",
+    "brew",
+    "ollamaModels",
+    "flatpak",
+    "launchd",
+    "defaults",
+    "dock",
+    "mgmt",
+)
+
+# Top-level keys that are not sections. `include` is consumed per file by
+# load_config and never reaches the merged config.
+SETTINGS_KEYS = ("stateFile", "paths", "vars", "include")
+TOP_LEVEL_KEYS = frozenset(SECTIONS + SETTINGS_KEYS)
+_RENAMED_KEYS = {"services": "mgmt"}
+
 
 class ConfigError(Exception):
     """Raised when the config cannot be resolved into a usable desired state."""
@@ -27,6 +58,22 @@ def deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
         else:
             result[key] = overlay_value
     return result
+
+
+def check_top_level_keys(data: Dict[str, Any], source: str) -> None:
+    """Reject top-level keys no section or setting reads."""
+    unknown = sorted((k for k in data if k not in TOP_LEVEL_KEYS), key=str)
+    if not unknown:
+        return
+    hints = "".join(
+        f"; use {_RENAMED_KEYS[key]!r} instead of {key!r} (renamed)"
+        for key in unknown
+        if key in _RENAMED_KEYS
+    )
+    raise ConfigError(
+        f"{source}: unknown top-level key(s) {', '.join(repr(k) for k in unknown)}{hints}"
+        f" (valid keys: {', '.join(sorted(TOP_LEVEL_KEYS))})"
+    )
 
 
 def _load_raw(path: str) -> Dict[str, Any]:
@@ -83,6 +130,7 @@ def load_config(path: str, _seen: Optional[Dict[str, None]] = None) -> Dict[str,
     data = _load_raw(path)
     if not isinstance(data, dict):
         return data
+    check_top_level_keys(data, path)
 
     includes = data.pop("include", None)
     if not includes:

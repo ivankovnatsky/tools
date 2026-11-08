@@ -99,6 +99,9 @@ A config _directory_ supports two layouts:
 Any config file may declare `include: [relative/paths...]`; includes are
 resolved relative to the including file and merged underneath it.
 
+Each file may only use known top-level keys (every section, plus `stateFile`,
+`paths`, `vars`, `include`); anything else fails the load, naming the file.
+
 Notable keys:
 
 - `stateFile` — where ownership state lives (default

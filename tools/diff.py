@@ -5,6 +5,7 @@ import os
 import stat
 from typing import Dict, List
 
+from tools.config import SECTIONS
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
 from tools.mgmt import has_work as mgmt_has_work
@@ -38,30 +39,7 @@ from tools.util import (
     version_changed,
 )
 
-ALL_SECTIONS = (
-    "bun",
-    "npm",
-    "uv",
-    "go",
-    "pi",
-    "mcp",
-    "curlShell",
-    "gitRepos",
-    "sops",
-    "templates",
-    "files",
-    "fetch",
-    "env",
-    "skills",
-    "links",
-    "brew",
-    "ollamaModels",
-    "flatpak",
-    "launchd",
-    "defaults",
-    "dock",
-    "mgmt",
-)
+ALL_SECTIONS = SECTIONS
 
 
 def _emit_change(item: str) -> None:
