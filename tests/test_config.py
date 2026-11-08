@@ -32,7 +32,7 @@ class EmptyDesiredStateTest(unittest.TestCase):
     """An empty config now means 'remove everything tracked', so every path
     that could produce one by accident has to fail loudly instead."""
 
-    def test_empty_flat_dir_is_refused(self):
+    def test_dir_without_machines_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(ConfigError):
                 load_config_dir(d)
@@ -64,11 +64,12 @@ class EmptyDesiredStateTest(unittest.TestCase):
 
             self.assertEqual(loaded, {"npm": {"packages": {}}})
 
-    def test_flat_dir_with_config_loads(self):
+    def test_dir_files_without_machines_are_not_read(self):
         with tempfile.TemporaryDirectory() as d:
             _write(os.path.join(d, "a.json"), '{"npm": {"packages": {}}}')
 
-            self.assertIn("npm", load_config_dir(d))
+            with self.assertRaisesRegex(ConfigError, "machines/"):
+                load_config_dir(d)
 
 
 class IncludeTest(unittest.TestCase):
@@ -149,12 +150,13 @@ class TopLevelKeysTest(unittest.TestCase):
 
         self.assertIn(inc, str(cm.exception))
 
-    def test_unknown_key_in_flat_dir_is_refused(self):
+    def test_unknown_key_in_host_file_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            _write(os.path.join(d, "a.json"), '{"npm": {}, "variables": {}}')
+            _write(os.path.join(d, "machines", "h.json"), '{"npm": {}, "variables": {}}')
 
-            with self.assertRaisesRegex(ConfigError, "'variables'"):
-                load_config_dir(d)
+            with mock.patch("tools.config._get_hostname", return_value="h"):
+                with self.assertRaisesRegex(ConfigError, "'variables'"):
+                    load_config_dir(d)
 
     def test_cli_exits_on_unknown_key(self):
         from tools import cli

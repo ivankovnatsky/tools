@@ -88,12 +88,9 @@ See [examples/config.yaml](examples/config.yaml) for a full annotated example
 and [examples/overrides.yaml](examples/overrides.yaml) for per-host overrides.
 Formats: `.yaml`, `.yml`, `.json`, `.toml`.
 
-A config _directory_ supports two layouts:
-
-- **Host-based**: a `machines/` subdirectory with one `machines/<hostname>.yaml`
-  per host. Only that file and its `include:` files are read.
-- **Flat**: every supported file in the directory, merged in lexicographic
-  order.
+A config _directory_ needs a `machines/` subdirectory with one
+`machines/<hostname>.yaml` per host. Only that file and its `include:` files are
+read; nothing else in the directory is.
 
 Any config file may declare `include: [relative/paths...]`; includes are
 resolved relative to the including file and merged underneath it.

@@ -166,33 +166,24 @@ def _get_hostname() -> str:
 
 
 def load_config_dir(path: str) -> Dict[str, Any]:
-    """Load config from a tools-config directory structure.
+    """Load config for the current host from a tools-config directory.
 
-    Supports two layouts:
-
-    1. **Host-based** (preferred): the directory contains a
-       ``machines/`` subdirectory. The loader detects the current
-       hostname, looks for ``machines/<hostname>.yaml`` (or
-       .yml/.json/.toml), and loads it (with ``include:``
-       resolution). Nothing else in the directory is read; other files
-       come in only through ``include:``.
-
-    2. **Flat**: no ``machines/`` subdirectory. All supported config
-       files are loaded in lexicographic order and deep-merged (the
-       original behaviour).
-
-    Merge rules: scalars replace, dicts recurse, lists replace.
-    Hidden files (names starting with '.') are skipped.
+    The directory must contain ``machines/``. The loader detects the
+    current hostname, loads ``machines/<hostname>.yaml`` (or
+    .yml/.json/.toml) and the files it names in ``include:``. Nothing else
+    in the directory is read.
     """
     if not os.path.isdir(path):
         raise NotADirectoryError(f"Not a directory: {path}")
 
     machines_dir = os.path.join(path, "machines")
+    if not os.path.isdir(machines_dir):
+        raise ConfigError(
+            f"No machines/ directory in {path}; pass a config file or a "
+            "directory with machines/<hostname>.yaml"
+        )
 
-    if os.path.isdir(machines_dir):
-        return _load_host_config(path, machines_dir)
-
-    return _load_flat_dir(path)
+    return _load_host_config(path, machines_dir)
 
 
 def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
@@ -213,31 +204,6 @@ def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
         raise ConfigError(f"No machine config found for hostname {hostname!r} in {machines_dir}")
 
     return load_config(host_file)
-
-
-def _load_flat_dir(path: str) -> Dict[str, Any]:
-    """Load and deep-merge every supported config file in a flat directory."""
-    entries = sorted(
-        name
-        for name in os.listdir(path)
-        if not name.startswith(".")
-        and os.path.splitext(name)[1].lower() in SUPPORTED_SUFFIXES
-        and os.path.isfile(os.path.join(path, name))
-    )
-
-    if not entries:
-        # An empty desired state is now "remove everything tracked", so a
-        # mistyped --config path must not be read as a valid instruction.
-        raise ConfigError(f"No config files found in {path}")
-
-    merged: Dict[str, Any] = {}
-    for name in entries:
-        loaded = load_config(os.path.join(path, name))
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Config file {name} did not produce a mapping at top level")
-        merged = deep_merge(merged, loaded)
-
-    return merged
 
 
 # --------------------------------------------------------------------------

@@ -287,6 +287,7 @@ class WatchCommandTest(unittest.TestCase):
         with (
             mock.patch.object(cli, "watch_loop", side_effect=loop),
             mock.patch.object(cli, "_deploy", side_effect=deploy or (lambda *a: True)) as dep,
+            mock.patch("tools.config._get_hostname", return_value="h"),
         ):
             result = CliRunner().invoke(
                 cli.main, ["watch", "--config", d, "--approve", "--debounce", "1"]
@@ -296,7 +297,8 @@ class WatchCommandTest(unittest.TestCase):
     def _state_config(self, d):
         os.makedirs(os.path.join(d, "state"))
         state = os.path.join(d, "state", "state.json")
-        with open(os.path.join(d, "config.yaml"), "w") as f:
+        os.makedirs(os.path.join(d, "machines"))
+        with open(os.path.join(d, "machines", "h.yaml"), "w") as f:
             f.write(f"stateFile: {state}\n")
         return state
 
@@ -337,7 +339,8 @@ class WatchCommandTest(unittest.TestCase):
     def test_malformed_yaml_keeps_watching(self):
         with tempfile.TemporaryDirectory() as d:
             d = os.path.realpath(d)
-            with open(os.path.join(d, "config.yaml"), "w") as f:
+            os.makedirs(os.path.join(d, "machines"))
+            with open(os.path.join(d, "machines", "h.yaml"), "w") as f:
                 f.write("a: [\n")
             result, dep = self._watch(d)
         self.assertEqual(result.exit_code, 0, result.output)
