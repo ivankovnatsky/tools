@@ -91,8 +91,7 @@ Formats: `.yaml`, `.yml`, `.json`, `.toml`.
 A config _directory_ supports two layouts:
 
 - **Host-based**: a `machines/` subdirectory with one `machines/<hostname>.yaml`
-  per host. Top-level files (e.g. a nix-generated paths JSON) are merged
-  underneath the host config.
+  per host. Only that file and its `include:` files are read.
 - **Flat**: every supported file in the directory, merged in lexicographic
   order.
 

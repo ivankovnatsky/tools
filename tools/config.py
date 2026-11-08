@@ -174,9 +174,8 @@ def load_config_dir(path: str) -> Dict[str, Any]:
        ``machines/`` subdirectory. The loader detects the current
        hostname, looks for ``machines/<hostname>.yaml`` (or
        .yml/.json/.toml), and loads it (with ``include:``
-       resolution). Top-level files in the directory (e.g. a
-       nix-generated ``99-nix-paths.json``) are deep-merged
-       underneath the host config (host values win).
+       resolution). Nothing else in the directory is read; other files
+       come in only through ``include:``.
 
     2. **Flat**: no ``machines/`` subdirectory. All supported config
        files are loaded in lexicographic order and deep-merged (the
@@ -213,28 +212,7 @@ def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
         # now reads as "remove everything we track" rather than "nothing to do".
         raise ConfigError(f"No machine config found for hostname {hostname!r} in {machines_dir}")
 
-    # Load top-level files first (e.g. nix-generated paths JSON)
-    merged: Dict[str, Any] = {}
-    top_level = sorted(
-        name
-        for name in os.listdir(config_dir)
-        if not name.startswith(".")
-        and os.path.splitext(name)[1].lower() in SUPPORTED_SUFFIXES
-        and os.path.isfile(os.path.join(config_dir, name))
-    )
-    for name in top_level:
-        loaded = load_config(os.path.join(config_dir, name))
-        # Same input, same outcome as the flat layout: reject rather than
-        # silently skip.
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Config file {name} did not produce a mapping at top level")
-        merged = deep_merge(merged, loaded)
-
-    # Host config (with includes) merged on top — host values win
-    host_config = load_config(host_file)
-    merged = deep_merge(merged, host_config)
-
-    return merged
+    return load_config(host_file)
 
 
 def _load_flat_dir(path: str) -> Dict[str, Any]:

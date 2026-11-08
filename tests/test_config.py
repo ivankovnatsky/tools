@@ -54,6 +54,16 @@ class EmptyDesiredStateTest(unittest.TestCase):
 
             self.assertIn("npm", loaded)
 
+    def test_root_files_beside_machines_are_not_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "machines", "thishost.json"), '{"npm": {"packages": {}}}')
+            _write(os.path.join(d, "treefmt.toml"), '[formatter.nix]\ncommand = "nixfmt"\n')
+
+            with mock.patch("tools.config._get_hostname", return_value="thishost"):
+                loaded = load_config_dir(d)
+
+            self.assertEqual(loaded, {"npm": {"packages": {}}})
+
     def test_flat_dir_with_config_loads(self):
         with tempfile.TemporaryDirectory() as d:
             _write(os.path.join(d, "a.json"), '{"npm": {"packages": {}}}')
