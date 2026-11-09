@@ -14,7 +14,7 @@ Config shape::
       currentHost:                   # `defaults -currentHost write ...` (<domain>.<UUID>.plist)
         com.example.app:
           k: 1
-      system:                        # `sudo -n defaults write <path> ...`
+      system:                        # as root only: `sudo tools deploy --scope defaults`
         /Library/Preferences/com.example.app:
           Enabled: true
       restart:                       # killed after a change in that domain
@@ -42,6 +42,10 @@ symlink repointed elsewhere leaves the old plist restored or deleted there
 and the new one gets its own prior. The provider takes parsed data and a
 `DefaultsCLI` runner, so any config frontend can drive it and tests can
 mock every call.
+
+Each run owns some scopes: the login user `user` and `currentHost`, root
+(`sudo tools deploy`) only `system`. Keys and state of the other scopes are
+never written; diff as the user still previews `system` keys read-only.
 """
 
 import copy
@@ -53,12 +57,16 @@ import sys
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
-from tools import fsutil
+from tools import fsutil, runmode
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin_optional
 from tools.util import run_command
 
 SCOPES = ("user", "currentHost", "system")
+USER_SCOPES = ("user", "currentHost")
+ROOT_SCOPES = ("system",)
+ROOT_HINT = "run sudo tools deploy --scope defaults"
+HOME_ERROR = "is under the user's home; root never writes in user space"
 _SECTION_KEYS = set(SCOPES) | {"restart"}
 
 # Owned by the dock section; two writers would fight over the layout.
@@ -517,64 +525,82 @@ class _Restarts:
 class DefaultsCLI:
     """Every subprocess the defaults and dock providers make goes through here.
 
-    `allow_sudo` is False for diff: a dry run never escalates, so a system
-    plist unreadable to the user is reported instead of read.
+    Writes are gated by mode: `system` only as root, the user's scopes only as
+    the user. A plist the caller can't read is reported, never escalated.
     """
 
     defaults: str
     killall: Optional[str] = None
-    sudo: Optional[str] = None
     run: Callable = run_command
-    allow_sudo: bool = False
     is_root: bool = False
+    home: Optional[str] = None  # the invoking user's home; root never writes under it
+    login: Optional[str] = None  # the invoking user; root restarts only their processes
     readable: Callable[[str], bool] = lambda p: os.access(p, os.R_OK)
     exists: Callable[[str], bool] = os.path.exists
 
     @classmethod
-    def for_host(cls, allow_sudo: bool) -> Optional["DefaultsCLI"]:
+    def for_host(cls) -> Optional["DefaultsCLI"]:
         defaults = system_bin_optional("defaults")
         if not defaults:
             return None
+        is_root = os.geteuid() == 0
+        try:
+            inv = runmode.invoker()
+            home, login = inv.home, inv.login
+        except runmode.RootModeError:
+            home = login = None
         return cls(
             defaults=defaults,
             killall=system_bin_optional("killall"),
-            sudo=system_bin_optional("sudo"),
-            allow_sudo=allow_sudo,
-            is_root=os.geteuid() == 0,
+            is_root=is_root,
+            home=home,
+            login=login,
         )
 
-    def _prefix(self, scope: str, privileged: bool) -> List[str]:
+    @property
+    def scopes(self) -> Tuple[str, ...]:
+        """The scopes this run may write."""
+        return ROOT_SCOPES if self.is_root else USER_SCOPES
+
+    def _prefix(self, scope: str) -> List[str]:
         if scope == "currentHost":
             return [self.defaults, "-currentHost"]
-        if scope == "system" and privileged and not self.is_root:
-            if not self.sudo:
-                raise DefaultsError("sudo not found")
-            # -n: output is captured, so an interactive password prompt would hang unseen.
-            return [self.sudo, "-n", self.defaults]
         return [self.defaults]
+
+    def in_home(self, *paths: Optional[str]) -> Optional[str]:
+        """As root, the first path under the user's home (or the home itself, unknown)."""
+        if not self.is_root:
+            return None
+        if not self.home:
+            return "(unknown user home)"
+        # `defaults` opens <domain>.plist, which may itself be a symlink into the home.
+        candidates = [c for p in paths if p for c in (p, p + ".plist")]
+        return next((p for p in candidates if runmode.under_home(p, self.home)), None)
+
+    def _writable(self, scope: str, domain: str, what: str) -> None:
+        if scope in self.scopes:
+            if self.in_home(domain):
+                raise DefaultsError(f"{what}: {HOME_ERROR}")
+            return
+        if scope == "system":
+            raise DefaultsError(f"{what}: system defaults need root; {ROOT_HINT}")
+        raise DefaultsError(f"{what}: root never writes user preferences; run without sudo")
 
     def _check(self, cmd: List[str], what: str) -> str:
         rc, stdout, stderr = self.run(cmd)
         if rc != 0:
             msg = (stderr or stdout or "").strip() or f"exit {rc}"
-            if cmd[0] == self.sudo and "password" in msg:
-                msg += " (run `sudo -v` first)"
             raise DefaultsError(f"{what}: {msg}")
         return stdout
 
     def export(self, scope: str, domain: str) -> Dict:
-        privileged = False
         if scope == "system":
             plist = domain + ".plist"
             # `defaults export` prints an empty dict for an unreadable file, which
             # would read as "no prior value" and skip a later restore.
             if self.exists(plist) and not self.readable(plist):
-                if not self.allow_sudo:
-                    raise DefaultsError(f"{plist} is not readable without sudo")
-                privileged = True
-        out = self._check(
-            self._prefix(scope, privileged) + ["export", domain, "-"], f"export {domain}"
-        )
+                raise DefaultsError(f"{plist} is not readable")
+        out = self._check(self._prefix(scope) + ["export", domain, "-"], f"export {domain}")
         try:
             data = plistlib.loads(out.encode())
         except Exception as e:
@@ -584,19 +610,26 @@ class DefaultsCLI:
         return data
 
     def write(self, scope: str, domain: str, key: str, value) -> None:
-        self._check(
-            self._prefix(scope, True) + ["write", domain, key, to_xml(value)],
-            f"write {domain} {key}",
-        )
+        what = f"write {domain} {key}"
+        self._writable(scope, domain, what)
+        self._check(self._prefix(scope) + ["write", domain, key, to_xml(value)], what)
 
     def delete(self, scope: str, domain: str, key: str) -> None:
-        self._check(self._prefix(scope, True) + ["delete", domain, key], f"delete {domain} {key}")
+        what = f"delete {domain} {key}"
+        self._writable(scope, domain, what)
+        self._check(self._prefix(scope) + ["delete", domain, key], what)
 
     def restart(self, process: str) -> Optional[str]:
         """Kill process so it relaunches with new prefs. Returns a warning or None."""
         if not self.killall:
             return "killall not found"
-        rc, stdout, stderr = self.run([self.killall, process])
+        cmd = [self.killall, process]
+        if self.is_root:
+            # Root's killall matches every user's process; restart only the invoking user's.
+            if not self.login:
+                return "no invoking user to restart it for"
+            cmd = [self.killall, "-u", self.login, process]
+        rc, stdout, stderr = self.run(cmd)
         if rc != 0:
             return (stderr or stdout or "").strip() or f"exit {rc}"
         return None
@@ -618,18 +651,29 @@ def _tracked_entries(managed: Dict):
                 yield (scope, ident, key), entry
 
 
-def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -> Dict[str, List]:
+def plan(
+    spec: DefaultsSpec,
+    errors: List[str],
+    state: Dict,
+    cli: DefaultsCLI,
+    scopes: Tuple[str, ...] = SCOPES,
+    preview: Tuple[str, ...] = (),
+) -> Dict[str, List]:
     """Read-only; `result["spec"]` is the identified spec the plan refers to.
     State ids are (scope, plist identity, key); removal targets are the
     declared spelling of that plist if still declared, else the resolved
-    spelling recorded at write time."""
+    spelling recorded at write time. Only keys and state in `scopes` are
+    planned; keys in `preview` are compared too, but never restored or restarted."""
     spec, errors = identify(spec, errors)
     section = migrate_state(copy.deepcopy(state.get("defaults", {}) or {}))
-    tracked = dict(_tracked_entries(section["managed"]))
+    tracked = {
+        sid: entry for sid, entry in _tracked_entries(section["managed"]) if sid[0] in scopes
+    }
     result: Dict = {
         "spec": spec,
         "errors": list(errors),
         "read_errors": [],  # (scope, domain, message)
+        "home_errors": [],  # (scope, domain): root mode, plist under the user's home
         "set": [],  # (DefaultsKey, current)
         "refresh": [],  # DefaultsKey: already equal, state is stale or retargeted
         "restore": [],  # (state id, (scope, target, key), prior)
@@ -650,7 +694,17 @@ def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -
         values = current[(scope, domain)]
         return None if isinstance(values, DefaultsError) else values
 
-    for res in spec.keys:
+    def in_home(scope: str, domain: str, *paths) -> bool:
+        if scope != "system" or not cli.in_home(domain, *paths):
+            return False
+        if (scope, domain) not in result["home_errors"]:
+            result["home_errors"].append((scope, domain))
+        return True
+
+    keys = [res for res in spec.keys if res.scope in scopes or res.scope in preview]
+    for res in keys:
+        if in_home(res.scope, res.domain, res.target):
+            continue
         values = read(res.scope, res.domain)
         if values is None:
             continue
@@ -669,14 +723,16 @@ def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -
 
     # Removals wait for a clean config: an invalid entry looks undesired when
     # it is merely unparsed.
-    desired = {res.sid for res in spec.keys}
-    declared = {(res.scope, res.identity): res.domain for res in spec.keys}
+    desired = {res.sid for res in keys}
+    declared = {(res.scope, res.identity): res.domain for res in keys}
     if not errors:
         for sid in sorted(set(tracked) - desired):
             entry = tracked[sid] or {}
             scope, ident, key = sid
             target = declared.get((scope, ident)) or entry.get("target") or ident
             wid = (scope, target, key)
+            if in_home(scope, target, ident, entry.get("target")):
+                continue
             values = read(scope, target)
             if values is None:
                 continue
@@ -691,7 +747,7 @@ def plan(spec: DefaultsSpec, errors: List[str], state: Dict, cli: DefaultsCLI) -
             else:
                 result["restore"].append((sid, wid, prior))
 
-    changed = [res.sid[:2] for res, _ in result["set"]]
+    changed = [res.sid[:2] for res, _ in result["set"] if res.scope in scopes]
     changed += [sid[:2] for sid, _, _ in result["restore"]]
     changed += [sid[:2] for sid, _ in result["delete"]]
     restarts = _Restarts.build(spec, section["restart"])
@@ -715,8 +771,7 @@ def _removal(cur, prior, ours: List) -> Optional[str]:
 
 def _label(scope: str, domain: str, key: str) -> str:
     where = domain if scope == "user" else f"{scope}:{domain}"
-    suffix = " (sudo)" if scope == "system" else ""
-    return f"{where} {key}{suffix}"
+    return f"{where} {key}"
 
 
 # --------------------------------------------------------------------------
@@ -748,7 +803,7 @@ def run_restarts(restarts: List[str], cli: Optional[DefaultsCLI] = None) -> None
     """Kill each queued process once, after every section has written."""
     if not restarts:
         return
-    cli = cli or DefaultsCLI.for_host(allow_sudo=False)
+    cli = cli or DefaultsCLI.for_host()
     for proc in restarts:
         warning = "`defaults` binary not found" if cli is None else cli.restart(proc)
         if warning:
@@ -783,7 +838,7 @@ def _apply_defaults(
     queue: List[str],
     persist: Callable[[], None],
 ) -> bool:
-    p = plan(spec, errors, state, cli)
+    p = plan(spec, errors, state, cli, cli.scopes)
     spec = p["spec"]
     section = migrate_state(state.setdefault("defaults", {}))
     managed = section["managed"]
@@ -794,6 +849,9 @@ def _apply_defaults(
         success = False
     for scope, domain, msg in p["read_errors"]:
         log(f"defaults: skipping {scope}:{domain}: {msg}", Color.RED)
+        success = False
+    for scope, domain in p["home_errors"]:
+        log(f"defaults: skipping {scope}:{domain}: {HOME_ERROR}", Color.RED)
         success = False
 
     restarts = _Restarts.build(spec, section["restart"])
@@ -881,7 +939,10 @@ def _apply_defaults(
     new_restart: Dict = {}
     for scope, idents in sorted(managed.items()):
         for ident in sorted(idents):
-            procs = restarts.entry(scope, ident)
+            if scope not in cli.scopes:
+                procs = (section["restart"].get(scope) or {}).get(ident)
+            else:
+                procs = restarts.entry(scope, ident)
             if procs:
                 new_restart.setdefault(scope, {})[ident] = procs
     section["restart"] = new_restart
@@ -903,12 +964,25 @@ def preview_defaults(
     cli: DefaultsCLI,
     restarts: Optional[List[str]] = None,
 ) -> List[str]:
-    p = plan(spec, errors, state, cli)
+    preview = () if cli.is_root else ROOT_SCOPES
+    p = plan(spec, errors, state, cli, cli.scopes, preview)
+    # Keys this run can't write are a note, not a change: deploy would not touch them.
+    pending = [res for res, _cur in p["set"] if res.scope not in cli.scopes]
+    unreadable = [r for r in p["read_errors"] if r[0] not in cli.scopes]
+    if pending:
+        log(f"defaults: {len(pending)} system key(s) differ; {ROOT_HINT}", Color.YELLOW)
+    for scope, domain, msg in unreadable:
+        log(f"defaults: cannot read {scope}:{domain}: {msg}; {ROOT_HINT}", Color.YELLOW)
     changes = [f"  ! {err}" for err in p["errors"]]
     changes += [
-        f"  ? cannot read {scope}:{domain}: {msg}" for scope, domain, msg in p["read_errors"]
+        f"  ? cannot read {scope}:{domain}: {msg}"
+        for scope, domain, msg in p["read_errors"]
+        if scope in cli.scopes
     ]
+    changes += [f"  ! {scope}:{domain} {HOME_ERROR}" for scope, domain in p["home_errors"]]
     for res, cur in p["set"]:
+        if res.scope not in cli.scopes:
+            continue
         label = _label(*res.id)
         if cur is MISSING:
             changes.append(f"  + write {label} = {fmt_value(res.value)}")
@@ -934,6 +1008,16 @@ def preview_defaults(
 # --------------------------------------------------------------------------
 
 
+def _note_unmanaged(spec: DefaultsSpec, cli: DefaultsCLI) -> None:
+    others = [res for res in spec.keys if res.scope not in cli.scopes]
+    if not others:
+        return
+    if cli.is_root:
+        debug(f"defaults: {len(others)} user key(s) skipped as root; run without sudo")
+    else:
+        log(f"defaults: {len(others)} system key(s) not managed as user; {ROOT_HINT}", Color.YELLOW)
+
+
 def has_work(raw, state: Dict) -> bool:
     return raw is not None or bool(_managed(state))
 
@@ -948,11 +1032,12 @@ def install_defaults(
     if sys.platform != "darwin":
         log("defaults: skipping, not macOS", Color.YELLOW)
         return True
-    cli = cli or DefaultsCLI.for_host(allow_sudo=True)
+    cli = cli or DefaultsCLI.for_host()
     if cli is None:
         log("defaults: `defaults` binary not found, skipping", Color.RED)
         return False
     spec, errors = parse_defaults(raw)
+    _note_unmanaged(spec, cli)
     return apply_defaults(spec, errors, state, cli, restarts, persist)
 
 
@@ -961,7 +1046,7 @@ def diff_defaults(
 ) -> List[str]:
     if sys.platform != "darwin":
         return []
-    cli = cli or DefaultsCLI.for_host(allow_sudo=False)
+    cli = cli or DefaultsCLI.for_host()
     if cli is None:
         return ["  ? `defaults` binary not found, cannot diff"]
     spec, errors = parse_defaults(raw)

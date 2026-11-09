@@ -724,7 +724,7 @@ def install_dock(
     if sys.platform != "darwin":
         log("dock: skipping, not macOS", Color.YELLOW)
         return True
-    cli = cli or DefaultsCLI.for_host(allow_sudo=False)
+    cli = cli or DefaultsCLI.for_host()
     if cli is None:
         log("dock: `defaults` binary not found, skipping", Color.RED)
         return False
@@ -741,7 +741,7 @@ def diff_dock(
 ) -> List[str]:
     if sys.platform != "darwin":
         return []
-    cli = cli or DefaultsCLI.for_host(allow_sudo=False)
+    cli = cli or DefaultsCLI.for_host()
     if cli is None:
         return ["  ? `defaults` binary not found, cannot diff"]
     spec, errors = parse_dock(raw)

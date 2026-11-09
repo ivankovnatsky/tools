@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from fake_defaults import SUDO, FakeDefaults
+from fake_defaults import FakeDefaults
 
 from tools import cli as cli_mod
 from tools import fsutil
@@ -237,6 +237,7 @@ class DefaultsTestBase(unittest.TestCase):
     def setUp(self):
         self.fake = FakeDefaults()
         self.state = {}
+        self.root = False
         home = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, home)
         os.makedirs(os.path.join(home, "Library", "Preferences", "ByHost"))
@@ -246,12 +247,12 @@ class DefaultsTestBase(unittest.TestCase):
 
     def deploy(self, raw):
         spec, errors = parse_defaults(raw)
-        return defaults.apply_defaults(spec, errors, self.state, self.fake.cli())
+        return defaults.apply_defaults(spec, errors, self.state, self.fake.cli(self.root))
 
     def diff(self, raw, **kwargs):
         spec, errors = parse_defaults(raw)
         return defaults.preview_defaults(
-            spec, errors, self.state, self.fake.cli(allow_sudo=False, **kwargs)
+            spec, errors, self.state, self.fake.cli(self.root, **kwargs)
         )
 
     def managed(self):
@@ -784,39 +785,122 @@ class SystemScopeTest(DefaultsTestBase):
     DOMAIN = "/Library/Preferences/com.example.app"
     RAW = {"system": {DOMAIN: {"Mode": "Automatic"}}}
 
-    def test_writes_through_sudo_n(self):
+    def test_root_writes_system_keys_directly(self):
+        self.root = True
         self.assertEqual(
-            self.diff(self.RAW), [f'  + write system:{self.DOMAIN} Mode (sudo) = "Automatic"']
+            self.diff(self.RAW), [f'  + write system:{self.DOMAIN} Mode = "Automatic"']
         )
         self.assertTrue(self.deploy(self.RAW))
         write = next(c for c in self.fake.calls if "write" in c)
-        self.assertEqual(write[:3], [SUDO, "-n", "/usr/bin/defaults"])
-        # Reading a readable plist never escalates.
-        export = next(c for c in self.fake.calls if "export" in c)
-        self.assertEqual(export[0], "/usr/bin/defaults")
+        self.assertEqual(write[0], "/usr/bin/defaults")
+        self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {"Mode": "Automatic"})
+        self.assertEqual([list(keys) for keys in self.managed()["system"].values()], [["Mode"]])
 
-    def test_root_writes_without_sudo(self):
-        spec, errors = parse_defaults(self.RAW)
-        defaults.apply_defaults(spec, errors, self.state, self.fake.cli(is_root=True))
-        self.assertFalse(any(c[0] == SUDO for c in self.fake.calls))
+    def test_user_previews_system_keys_but_never_writes_them(self):
+        raw = {**self.RAW, "user": {"com.example.app": {"k": 1}}}
+        with mock.patch.object(defaults, "log") as log:
+            self.assertEqual(self.diff(raw), ["  + write com.example.app k = 1"])
+            self.assertEqual(self.diff(self.RAW), [])
+            self.assertTrue(defaults.install_defaults(raw, self.state, self.fake.cli()))
+        notes = [c.args[0] for c in log.call_args_list]
+        self.assertIn(
+            "defaults: 1 system key(s) differ; run sudo tools deploy --scope defaults", notes
+        )
+        self.assertIn(
+            "defaults: 1 system key(s) not managed as user; run sudo tools deploy --scope defaults",
+            notes,
+        )
+        self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {})
+        self.assertEqual(list(self.managed()), ["user"])
 
-    def test_sudo_needing_password_fails_cleanly(self):
-        self.fake.sudo_ok = False
-        self.assertFalse(self.deploy(self.RAW))
-        self.assertEqual(self.managed(), {})
+    def test_root_never_writes_user_preferences(self):
+        self.root = True
+        raw = {**self.RAW, "user": {"com.example.app": {"k": 1}}}
+        self.assertEqual(self.diff(raw), [f'  + write system:{self.DOMAIN} Mode = "Automatic"'])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.fake.domain("com.example.app"), {})
+        self.assertEqual(list(self.managed()), ["system"])
+        with self.assertRaises(defaults.DefaultsError):
+            self.fake.cli(True).write("user", "com.example.app", "k", 1)
+        with self.assertRaises(defaults.DefaultsError):
+            self.fake.cli(False).write("system", self.DOMAIN, "k", 1)
+        self.assertFalse(any("write" in c and "com.example.app" in c for c in self.fake.calls))
 
-    def test_unreadable_plist_is_not_read_in_diff(self):
+    def test_root_refuses_system_domains_under_the_users_home(self):
+        self.root = True
+        home = os.path.expanduser("~")
+        link = home + "-link"
+        os.symlink(home, link)
+        self.addCleanup(os.unlink, link)
+        inside = [
+            os.path.join(home, "Prefs", "evil"),
+            os.path.join(home.upper(), "Prefs", "evil"),
+            os.path.join(link, "evil"),
+        ]
+        for domain in inside:
+            with self.subTest(domain=domain):
+                self.fake.calls.clear()
+                self.state = {}
+                raw = {"system": {domain: {"k": 1}, self.DOMAIN: {"Mode": "Automatic"}}}
+                self.assertIn(f"  ! system:{domain} {defaults.HOME_ERROR}", self.diff(raw))
+                self.assertFalse(self.deploy(raw))
+                self.assertFalse(any(domain in c for c in self.fake.calls))
+                self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {"Mode": "Automatic"})
+        with self.assertRaises(defaults.DefaultsError):
+            self.fake.cli(True).write("system", inside[1], "k", 1)
+
+    def test_root_refuses_a_plist_symlinked_into_the_home(self):
+        self.root = True
+        shared = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, shared)
+        victim = os.path.join(os.path.expanduser("~"), "victim.plist")
+        open(victim, "w").close()
+        domain = os.path.join(shared, "foo")
+        os.symlink(victim, domain + ".plist")
+        raw = {"system": {domain: {"k": 1}, self.DOMAIN: {"Mode": "Automatic"}}}
+        self.assertIn(f"  ! system:{domain} {defaults.HOME_ERROR}", self.diff(raw))
+        self.assertFalse(self.deploy(raw))
+        self.assertFalse(any(domain in c for c in self.fake.calls))
+        self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {"Mode": "Automatic"})
+        for call in (
+            lambda cli: cli.write("system", domain, "k", 1),
+            lambda cli: cli.delete("system", domain, "k"),
+        ):
+            with self.assertRaises(defaults.DefaultsError):
+                call(self.fake.cli(True))
+
+    def test_root_never_restores_a_tracked_domain_under_the_home(self):
+        self.root = True
+        domain = os.path.join(os.path.expanduser("~"), "evil")
+        entry = {"prior": None, "written": defaults.to_xml(1), "target": domain}
+        self.state = {"defaults": {"managed": {"system": {domain: {"k": entry}}}}}
+        self.assertIn(f"  ! system:{domain} {defaults.HOME_ERROR}", self.diff({}))
+        self.assertFalse(self.deploy({}))
+        self.assertFalse(any("delete" in c for c in self.fake.calls))
+        self.assertIn("k", self.managed()["system"][domain])
+
+    def test_other_mode_state_is_never_restored(self):
+        self.root = True
+        self.deploy(self.RAW)
+        self.root = False
+        self.assertEqual(self.diff({}), [])
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(len(self.managed()["system"]), 1)
+        self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {"Mode": "Automatic"})
+
+    def test_unreadable_plist_is_reported(self):
+        with mock.patch.object(defaults, "log") as log:
+            changes = self.diff(self.RAW, exists=lambda p: True, readable=lambda p: False)
+        self.assertEqual(changes, [])
+        self.assertIn("is not readable", log.call_args_list[0].args[0])
+        self.root = True
         changes = self.diff(self.RAW, exists=lambda p: True, readable=lambda p: False)
         self.assertEqual(len(changes), 1)
-        self.assertIn("not readable without sudo", changes[0])
-        self.assertFalse(any(c[0] == SUDO for c in self.fake.calls))
-
-    def test_unreadable_plist_is_read_with_sudo_in_deploy(self):
+        self.assertIn("is not readable", changes[0])
         spec, errors = parse_defaults(self.RAW)
-        cli = self.fake.cli(exists=lambda p: True, readable=lambda p: False)
-        self.assertTrue(defaults.apply_defaults(spec, errors, self.state, cli))
-        export = next(c for c in self.fake.calls if "export" in c)
-        self.assertEqual(export[:2], [SUDO, "-n"])
+        cli = self.fake.cli(True, exists=lambda p: True, readable=lambda p: False)
+        self.assertFalse(defaults.apply_defaults(spec, errors, self.state, cli))
+        self.assertFalse(any("export" in c for c in self.fake.calls))
 
 
 class RestoreTest(DefaultsTestBase):
@@ -871,33 +955,24 @@ class RestoreTest(DefaultsTestBase):
         self.assertEqual(self.managed(), {})
 
     def test_absent_prior_current_host_and_system_delete(self):
-        raw = {
-            "currentHost": {"com.example.app": {"k": 1}},
-            "system": {"/Library/Preferences/com.example.sys": {"k": 1}},
-        }
-        self.deploy(raw)
+        self.deploy({"currentHost": {"com.example.app": {"k": 1}}})
+        self.root = True
+        self.deploy({"system": {"/Library/Preferences/com.example.sys": {"k": 1}}})
         self.assertEqual(
-            self.diff({}),
-            [
-                "  - delete currentHost:com.example.app k",
-                "  - delete system:/Library/Preferences/com.example.sys k (sudo)",
-            ],
+            self.diff({}), ["  - delete system:/Library/Preferences/com.example.sys k"]
         )
+        self.root = False
+        self.assertEqual(self.diff({}), ["  - delete currentHost:com.example.app k"])
         self.fake.calls.clear()
+        self.assertTrue(self.deploy({}))
+        self.root = True
         self.assertTrue(self.deploy({}))
         self.assertIn(
             ["/usr/bin/defaults", "-currentHost", "delete", "com.example.app", "k"],
             self.fake.calls,
         )
         self.assertIn(
-            [
-                SUDO,
-                "-n",
-                "/usr/bin/defaults",
-                "delete",
-                "/Library/Preferences/com.example.sys",
-                "k",
-            ],
+            ["/usr/bin/defaults", "delete", "/Library/Preferences/com.example.sys", "k"],
             self.fake.calls,
         )
         self.assertEqual(self.fake.domain("com.example.app", "currentHost"), {})
@@ -1052,6 +1127,8 @@ class RestartTest(DefaultsTestBase):
             {"com.example.app": ["Finder"], "/Library/Preferences/com.example.sys": ["Dock"]},
         )
         self.deploy(raw)
+        self.root = True
+        self.deploy(raw)
         kills = [v for v in self.fake.writes() if v[0] == "killall"]
         self.assertEqual(kills, [("killall", "Finder"), ("killall", "Dock")])
 
@@ -1118,6 +1195,26 @@ class RestartTest(DefaultsTestBase):
     def test_process_not_running_is_a_warning(self):
         self.fake.running = set()
         self.assertTrue(self.deploy(self.RAW))
+
+    def test_user_mode_restart_is_plain_killall(self):
+        self.fake.cli().restart("Dock")
+        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "Dock"]])
+
+    def test_root_restarts_only_the_invoking_users_process(self):
+        self.fake.cli(True, login="me").restart("Dock")
+        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "-u", "me", "Dock"]])
+        self.fake.calls.clear()
+        warning = self.fake.cli(True, login=None).restart("Dock")
+        self.assertIn("no invoking user", warning)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_root_deploy_restart_is_scoped_to_the_user(self):
+        self.root = True
+        raw = {"system": {"/Library/Preferences/com.example.sys": {"k": 1}},
+               "restart": {"/Library/Preferences/com.example.sys": "Dock"}}  # fmt: skip
+        self.assertTrue(self.deploy(raw))
+        kills = [c for c in self.fake.calls if c[0] == "/usr/bin/killall"]
+        self.assertEqual(kills, [["/usr/bin/killall", "-u", "me", "Dock"]])
 
 
 class FailureTest(DefaultsTestBase):
@@ -1322,7 +1419,7 @@ class CliGatingTest(unittest.TestCase):
             }
             with (
                 mock.patch.object(defaults.sys, "platform", "darwin"),
-                mock.patch.object(defaults.DefaultsCLI, "for_host", return_value=fake.cli(False)),
+                mock.patch.object(defaults.DefaultsCLI, "for_host", return_value=fake.cli()),
             ):
                 self.assertFalse(show_diff(config, tmp, ("defaults",)))
             self.assertFalse(os.path.exists(config["stateFile"]))

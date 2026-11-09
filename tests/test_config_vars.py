@@ -67,7 +67,7 @@ class ConfigVarsTest(unittest.TestCase):
             "mcp": {"servers": {"x": {"headers": ["Authorization: Bearer ${API_KEY}"]}}},
             "npm": {"packages": {"p": {"postInstall": "cd ${HOME} && login ${TOKEN}"}}},
             "curlShell": {"https://example.test/i.sh": "sh -s -- --dir ${HOME}"},
-            "launchd": {"services": {"s": {"command": "run --home ${HOME}"}}},
+            "launchd": {"agents": {"s": {"command": "run --home ${HOME}"}}},
         }
         out = resolve_config(config, env=env)
         self.assertEqual(out, config)

@@ -5,10 +5,11 @@ Config shape::
     launchd:
       labelPrefix: com.example        # default label is <labelPrefix>.<name>
       logDir: ~/Library/Logs/tools    # optional; per-domain defaults otherwise
-      sudo: false                     # allow `sudo` for system-domain changes
-      services:
+      agents:                         # gui/<uid>, managed by `tools deploy`
+        notes-sync:
+          command: notes-sync --watch
+      daemons:                        # system, managed by `sudo tools deploy`
         caddy:
-          domain: system              # user (default) | system
           waitForPaths: [/Volumes/Storage]
           command: caddy run --config /var/lib/caddy/Caddyfile
           restartOn: [/var/lib/caddy/Caddyfile]
@@ -29,13 +30,14 @@ is booted out and deleted only while its plist still matches what tools
 wrote. State only says which labels tools owns: plist paths are always
 derived from the validated label and domain.
 
-tools never runs as root (it refuses euid 0). User agents are plain file ops
-plus `launchctl ... gui/<uid>`. Daemons need `launchd.sudo: true` and then go
-through `_priv`: `sudo -n install`, `sudo -n launchctl ... system/<label>`,
-`sudo -n rm -f`, and nix-style `mkdir`/`touch`/`chown` for daemon logs with a user.
+Each run manages one domain. As the login user: agents only, as plain file
+ops plus `launchctl ... gui/<uid>`; configured daemons are reported, never
+touched. As root (`sudo tools deploy`, SUDO_USER required): daemons only,
+with `install`, `launchctl ... system/<label>`, `rm` and nix-style log
+`mkdir`/`touch`/`chown` run directly; no daemon write target may sit under
+the user's home. tools never calls sudo itself.
 """
 
-import copy
 import hashlib
 import os
 import plistlib
@@ -50,13 +52,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
+from tools import runmode
 from tools.log import Color, debug, log
 from tools.user.files import _parse_mode
 from tools.util import format_diff_bytes, looks_like_secret, run_command
 
 BASH = "/bin/bash"
 LAUNCHCTL = "/bin/launchctl"
-SUDO = "/usr/bin/sudo"
 
 DOMAINS = ("user", "system")
 PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
@@ -76,10 +78,17 @@ _CALENDAR_KEYS = {
     "weekday": "Weekday",
     "month": "Month",
 }
-_SECTION_KEYS = {"labelPrefix", "logDir", "sudo", "bash", "services"}
+_SECTION_KEYS = {"labelPrefix", "logDir", "bash", "agents", "daemons"}
+_GROUPS = (("agents", "user"), ("daemons", "system"))
+_REMOVED_SECTION_KEYS = {
+    "services": "split into `launchd.agents` (user domain) and `launchd.daemons` (system domain)",
+    "sudo": "removed: daemons are deployed with `sudo tools deploy --scope launchd`",
+}
+_REMOVED_SERVICE_KEYS = {
+    "domain": "removed: put the job under `launchd.agents` or `launchd.daemons`",
+}
 _SERVICE_KEYS = {
     "label",
-    "domain",
     "command",
     "programArguments",
     "environment",
@@ -166,7 +175,6 @@ class Service:
 
 @dataclass
 class Settings:
-    sudo: bool = False
     log_dir: Optional[str] = None
     bash: Optional[str] = None  # overrides Env.bash
     secrets_dir: Optional[str] = None  # sops.secretsDir, for waitForSecrets
@@ -174,16 +182,7 @@ class Settings:
     errors: List[str] = field(default_factory=list)  # section-level: hold every change
 
 
-def _login_user() -> Tuple[int, str]:
-    """(uid, home) of the user tools runs as; launchd agents live in `gui/<uid>`."""
-    uid = os.getuid()
-    try:
-        return uid, pwd.getpwuid(uid).pw_dir
-    except KeyError:
-        return uid, os.path.expanduser("~")
-
-
-DEFAULT_LOG_DIR = "/tmp/log/launchd"
+DEFAULT_LOG_DIR = "/var/log/tools/launchd"
 DEFAULT_AGENT_LOG_DIR = "/tmp/agents/log/launchd"
 
 
@@ -191,32 +190,25 @@ DEFAULT_AGENT_LOG_DIR = "/tmp/agents/log/launchd"
 class Env:
     """Everything the provider touches outside its arguments.
 
-    tools always runs as the login user. System-domain changes go through a
-    fixed set of `sudo -n` commands (see `_priv`), never by running tools as root.
+    `uid`/`home`/`login` are the login user's, also as root (from SUDO_USER).
+    `euid == 0` is root mode: daemons only. Otherwise agents only.
     """
 
     agents_dir: Optional[str] = None  # default <home>/Library/LaunchAgents
     daemons_dir: str = "/Library/LaunchDaemons"
-    # Same defaults as nix-config's home (agents) and darwin (daemons) local.launchd `logDir`.
+    # Agents: nix-config's home local.launchd `logDir`. Daemons: root-only, unlike its /tmp/log.
     user_log_dir: Optional[str] = DEFAULT_AGENT_LOG_DIR
     system_log_dir: str = DEFAULT_LOG_DIR
     bash: str = BASH  # root-owned and stable; `launchd.bash` overrides
     stat: Callable[[str], Any] = os.stat
     lstat: Callable[[str], Any] = os.lstat
-    # Daemon log paths must sit under one of these (or system_log_dir).
-    system_log_roots: Tuple[str, ...] = (
-        "/tmp/log",
-        "/private/tmp/log",
-        "/Library/Logs",
-        "/var/log",
-        "/private/var/log",
-    )
+    # Daemon log paths must sit under one of these (or system_log_dir), and as root every
+    # existing component must also pass `_root_only`.
+    system_log_roots: Tuple[str, ...] = ("/var/log", "/private/var/log")
     # Missing daemon workingDirectories are created as root only under one of these.
     system_dir_roots: Tuple[str, ...] = (
         "/var/lib",
         "/private/var/lib",
-        "/usr/local/var",
-        "/opt/homebrew/var",
         "/Library/Application Support",
     )
     volumes_root: str = "/Volumes"
@@ -227,7 +219,6 @@ class Env:
     home: Optional[str] = None
     login: Optional[str] = None  # login user name; default from uid
     ismount: Callable[[str], bool] = os.path.ismount
-    allow_sudo: bool = False  # set from `launchd.sudo`; the only gate for escalation
     is_darwin: bool = field(default_factory=lambda: sys.platform == "darwin")
     bootout_polls: int = 50
     poll_interval: float = 0.2
@@ -235,9 +226,15 @@ class Env:
 
     def __post_init__(self):
         if self.uid is None:
-            self.uid, home = _login_user()
+            try:
+                inv = runmode.invoker(self.euid)
+            except runmode.RootModeError:
+                inv = runmode.Invoker(True, 0, os.path.expanduser("~"), None)
+            self.uid = inv.uid
             if self.home is None:
-                self.home = home
+                self.home = inv.home
+            if self.login is None:
+                self.login = inv.login
         if self.home is None:
             try:
                 self.home = pwd.getpwuid(self.uid).pw_dir
@@ -253,15 +250,19 @@ class Env:
         if self.user_log_dir is None:
             self.user_log_dir = DEFAULT_AGENT_LOG_DIR
 
+    @property
+    def root(self) -> bool:
+        return self.euid == 0
 
-ROOT_ERROR = (
-    "tools is running as root; run it as your normal user. "
-    "System-domain jobs use `sudo -n` internally when `launchd.sudo: true`"
-)
+    @property
+    def domain(self) -> str:
+        """The one domain this run manages."""
+        return "system" if self.root else "user"
 
 
-def root_refusal(env: Env) -> Optional[str]:
-    return ROOT_ERROR if env.euid == 0 or env.uid == 0 else None
+def mode_error(env: Env) -> Optional[str]:
+    """Why this run can't act at all: root without a non-root user to act for."""
+    return runmode.SUDO_USER_ERROR if env.uid == 0 else None
 
 
 # --------------------------------------------------------------------------
@@ -457,7 +458,7 @@ _SAFE_ACCOUNT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")  # macOS service user
 
 
 def valid_label(label) -> bool:
-    """Labels name files and sudo arguments: no `/`, no `..`, no leading `-`."""
+    """Labels name files and command arguments: no `/`, no `..`, no leading `-`."""
     return isinstance(label, str) and bool(_SAFE_NAME.fullmatch(label)) and ".." not in label
 
 
@@ -466,7 +467,7 @@ def runs_as_root(svc: Service) -> bool:
 
 
 _ROOT_DIRS_ERROR = (
-    "extraDirs mode/owner/group need a root daemon (domain: system, no user): "
+    "extraDirs mode/owner/group need a root daemon (under daemons, no user): "
     "the wrapper's chmod/chown would fail under `set -e` and the job would crash-loop"
 )
 
@@ -478,9 +479,13 @@ def _parse_service(
     home: Optional[str] = None,
     login: Optional[str] = None,
     section_log_dir=None,
+    domain: str = "user",
 ) -> Service:
     if not isinstance(raw, dict):
         raise ValueError("must be a mapping")
+    removed = sorted(set(raw) & set(_REMOVED_SERVICE_KEYS))
+    if removed:
+        raise ValueError("; ".join(f"`{k}` {_REMOVED_SERVICE_KEYS[k]}" for k in removed))
     unknown = set(raw) - _SERVICE_KEYS
     if unknown:
         raise ValueError(f"unknown keys {sorted(unknown)}")
@@ -495,7 +500,6 @@ def _parse_service(
     if not valid_label(label):
         raise ValueError(f"label {label!r} must be reverse-DNS style ([A-Za-z0-9._-])")
 
-    domain = raw.get("domain", "user")
     if domain not in DOMAINS:
         raise ValueError(f"domain must be one of {DOMAINS}, got {domain!r}")
 
@@ -596,7 +600,7 @@ def _parse_service(
         if not isinstance(value, str) or not value:
             raise ValueError(f"{key} must be a non-empty string")
         if domain != "system":
-            raise ValueError(f"{key} only applies to domain: system (agents run as you)")
+            raise ValueError(f"{key} only applies to daemons (agents run as you)")
         setattr(svc, key, value)
 
     if raw.get("processType") is not None:
@@ -674,11 +678,12 @@ def parse_launchd(
         msg = f"launchd must be a mapping, got {type(raw).__name__}"
         return Settings(errors=[msg], **sops), [], [msg]
     settings = Settings(errors=errors, **sops)
-    unknown = set(raw) - _SECTION_KEYS
+    for key in sorted(set(raw) & set(_REMOVED_SECTION_KEYS)):
+        errors.append(f"`launchd.{key}` {_REMOVED_SECTION_KEYS[key]}")
+    unknown = set(raw) - _SECTION_KEYS - set(_REMOVED_SECTION_KEYS)
     if unknown:
         errors.append(f"unknown keys {sorted(unknown)}")
     for key, parse in (
-        ("sudo", lambda v: _bool(v, "sudo")),
         ("logDir", lambda v: _opt_log(v, "logDir", home)),
         ("bash", lambda v: _opt_abs(v, "bash")),
     ):
@@ -693,30 +698,35 @@ def parse_launchd(
         errors.append("labelPrefix must be a non-empty string")
         prefix = None
 
-    services_raw = raw.get("services")
-    if services_raw is None:
-        services_raw = {}
-    if not isinstance(services_raw, dict):
-        errors.append("services must be a mapping of name -> service")
-        return settings, [], list(errors)
+    groups = []
+    for key, domain in _GROUPS:
+        jobs = raw.get(key)
+        if jobs is None:
+            jobs = {}
+        if not isinstance(jobs, dict):
+            errors.append(f"{key} must be a mapping of name -> job")
+            jobs = {}
+        groups.append((key, domain, jobs))
     settings.errors = list(errors)
     errors = list(errors)
 
     services: List[Service] = []
     seen: Dict[str, str] = {}
-    for name in sorted(services_raw):
-        try:
-            svc = _parse_service(
-                str(name), services_raw[name], prefix, home, login, raw.get("logDir")
-            )
-        except ValueError as e:
-            errors.append(f"{name}: {e}")
-            continue
-        if svc.label in seen:
-            errors.append(f"{name}: label {svc.label} already used by {seen[svc.label]}")
-            continue
-        seen[svc.label] = name
-        services.append(svc)
+    for key, domain, jobs in groups:
+        for name in sorted(jobs, key=str):
+            where = f"{key}.{name}"
+            try:
+                svc = _parse_service(
+                    str(name), jobs[name], prefix, home, login, raw.get("logDir"), domain
+                )
+            except ValueError as e:
+                errors.append(f"{where}: {e}")
+                continue
+            if svc.label in seen:
+                errors.append(f"{where}: label {svc.label} already used by {seen[svc.label]}")
+                continue
+            seen[svc.label] = where
+            services.append(svc)
     return settings, services, errors
 
 
@@ -833,7 +843,7 @@ def _log_path_error(path: str, roots: Tuple[str, ...], is_dir: bool = False) -> 
         root = root.rstrip(os.sep)
         if path.startswith(root + os.sep) or (is_dir and path == root):
             return None
-    return f"must be inside {', '.join(roots)} for domain: system"
+    return f"must be inside {', '.join(roots)} for a daemon"
 
 
 def service_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
@@ -861,7 +871,7 @@ def service_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
     if svc.domain == "system" and settings.bash and not _root_only(settings.bash, env):
         errors.append(
             f"{svc.name}: bash {settings.bash} must be root-owned and not group/world-writable "
-            "(with every parent dir) for domain: system"
+            "(with every parent dir) for daemons"
         )
     return errors + system_log_errors(svc, settings, env)
 
@@ -1011,14 +1021,7 @@ def _loads(data: bytes) -> Optional[Dict[str, Any]]:
 
 
 def read_current(path: str, domain: str, env: Env) -> Tuple[bool, Optional[Dict[str, Any]], bool]:
-    """read_plist, falling back to a gated `sudo -n plutil` for a root-only daemon plist."""
-    exists, parsed, readable = read_plist(path)
-    if readable or not exists or not _needs_sudo(domain) or not env.allow_sudo:
-        return exists, parsed, readable
-    rc, out, _err = _run_priv(["/usr/bin/plutil", "-convert", "xml1", "-o", "-", path], domain, env)
-    if rc != 0:
-        return True, None, False
-    return True, _loads(out.encode()), True
+    return read_plist(path)
 
 
 # --------------------------------------------------------------------------
@@ -1034,33 +1037,25 @@ def service_target(label: str, domain: str, env: Env) -> str:
     return f"{domain_target(domain, env)}/{label}"
 
 
-def _needs_sudo(domain: str) -> bool:
-    return domain == "system"
+def can_change(domain: str, env: Env) -> bool:
+    """Only the run's own domain is ever changed: agents as the user, daemons as root."""
+    return domain == env.domain
 
 
-def can_change(domain: str, settings: Settings, env: Env) -> bool:
-    return not _needs_sudo(domain) or env.allow_sudo
+DAEMON_HINT = "run `sudo tools deploy --scope launchd` for daemons"
 
 
-def _priv(cmd: List[str], domain: str, env: Env) -> Optional[List[str]]:
-    """The one escalation gate: sudo only when allowed, and never interactively."""
-    if not _needs_sudo(domain):
-        return cmd
-    if not env.allow_sudo:
-        return None
-    return [SUDO, "-n", *cmd]
+def _run_changing(cmd: List[str], domain: str, env: Env) -> Tuple[int, str, str]:
+    """The one gate for commands that change launchd or files: never the other run's domain."""
+    if not can_change(domain, env):
+        why = DAEMON_HINT if domain == "system" else "agents are user-only; run without sudo"
+        return 1, "", why
+    return env.run(cmd)
 
 
-def _run_priv(cmd: List[str], domain: str, env: Env) -> Tuple[int, str, str]:
-    gated = _priv(cmd, domain, env)
-    if gated is None:
-        return 1, "", "needs root: set `launchd.sudo: true` (tools runs `sudo -n`)"
-    return env.run(gated)
-
-
-def launchctl(args: List[str], domain: str, env: Env, privileged: bool = True):
+def launchctl(args: List[str], domain: str, env: Env, changing: bool = True):
     cmd = [LAUNCHCTL, *args]
-    return _run_priv(cmd, domain, env) if privileged else env.run(cmd)
+    return _run_changing(cmd, domain, env) if changing else env.run(cmd)
 
 
 def is_disabled(label: str, domain: str, env: Env) -> Optional[bool]:
@@ -1169,7 +1164,7 @@ def _set_enabled(label: str, domain: str, enabled: bool, env: Env) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Files (plist + logs), escalated for the system domain
+# Files (plist + logs); daemon files as root
 # --------------------------------------------------------------------------
 
 
@@ -1177,10 +1172,13 @@ INSTALL = "/usr/bin/install"
 
 
 def _write_plist(path: str, data: bytes, domain: str, env: Env, mode: int = 0o644) -> bool:
-    """Write atomically: as the user for agents, `sudo -n install -S` for daemons."""
+    """Write atomically: as the user for agents, `install -S` as root for daemons."""
     parent = os.path.dirname(path)
+    if not can_change(domain, env):
+        log(f"launchd: not writing {path}: {_run_changing([], domain, env)[2]}", Color.RED)
+        return False
     try:
-        if not _needs_sudo(domain):
+        if domain == "user":
             os.makedirs(parent, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tools-", suffix=".plist")
             try:
@@ -1194,13 +1192,21 @@ def _write_plist(path: str, data: bytes, domain: str, env: Env, mode: int = 0o64
                 raise
             return True
 
-        fd, tmp = tempfile.mkstemp(prefix="tools-launchd-", suffix=".plist")
+        # Root-only dir, not $TMPDIR: a user-writable temp file could be swapped
+        # before install copies it. Dot-prefixed and not `.plist`, so launchd skips it.
+        if not os.path.lexists(parent):
+            os.makedirs(parent, 0o755)
+        if os.path.islink(parent) or not os.path.isdir(parent):
+            log(f"launchd: {parent} is not a real directory; not writing {path}", Color.RED)
+            return False
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tools-", suffix=".tmp")
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             # launchd rejects daemon plists not owned by root:wheel.
             cmd = [INSTALL, "-S", "-m", f"{mode:04o}", "-o", "root", "-g", "wheel", tmp, path]
-            rc, _out, err = _run_priv(cmd, domain, env)
+            rc, _out, err = _run_changing(cmd, domain, env)
             if rc != 0:
                 log(f"launchd: install {path} failed: {err.strip()}", Color.RED)
                 return False
@@ -1215,41 +1221,110 @@ def _write_plist(path: str, data: bytes, domain: str, env: Env, mode: int = 0o64
 def _remove_plist(path: str, domain: str, env: Env) -> bool:
     if not os.path.lexists(path):
         return True
-    if not _needs_sudo(domain):
+    if domain == "user" and can_change(domain, env):
         try:
             os.remove(path)
             return True
         except OSError as e:
             log(f"launchd: failed to remove {path}: {e}", Color.RED)
             return False
-    rc, _out, err = _run_priv(["/bin/rm", "-f", path], domain, env)
+    rc, _out, err = _run_changing(["/bin/rm", "-f", path], domain, env)
     if rc != 0:
         log(f"launchd: failed to remove {path}: {err.strip()}", Color.RED)
         return False
     return True
 
 
-def _ensure_logs(item: "Item", settings: Settings, env: Env) -> None:
+def _existing_ancestor(path: str) -> str:
+    current = os.path.normpath(path)
+    while not os.path.lexists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return current
+
+
+def root_dir_error(path: str, env: Env) -> Optional[str]:
+    """Why root must not create or write inside dir `path`: its deepest existing component
+    (and every component above it) must be root-owned and not group/world-writable."""
+    existing = _existing_ancestor(path)
+    if not _root_only(existing, env):
+        return f"{existing} is not root-only (root-owned, not group/world-writable)"
+    return None
+
+
+def _root_dir_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
+    """As root, the dirs a daemon's logs live in must be root-only (checked at plan and apply)."""
+    if not env.root or svc.domain != "system":
+        return []
+    dirs = [log_dir_of(svc, settings, env)]
+    dirs += [os.path.dirname(p) for p in log_paths(svc, settings, env)]
+    errors = []
+    for d in dict.fromkeys(dirs):
+        why = root_dir_error(d, env)
+        if why:
+            errors.append(f"{svc.name}: log dir {d}: {why}")
+    return errors
+
+
+def _secure_mkdirs(path: str, svc: Service, env: Env) -> bool:
+    """Create missing components of `path` one at a time as root; each new one must be a
+    real root-only directory (mkdir never follows a symlink planted at its own path)."""
+    why = root_dir_error(path, env)
+    if why:
+        log(f"launchd: {svc.label}: not creating {path}: {why}", Color.RED)
+        return False
+    existing = _existing_ancestor(path)
+    current = existing
+    for part in os.path.relpath(os.path.normpath(path), existing).split(os.sep):
+        if part in ("", "."):
+            continue
+        current = os.path.join(current, part)
+        if not _run_log_cmd(["/bin/mkdir", "-m", "755", current], svc, env):
+            return False
+        try:
+            st = env.lstat(current)
+        except OSError as e:
+            log(f"launchd: {svc.label}: {current} vanished after mkdir: {e}", Color.RED)
+            return False
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            log(f"launchd: {svc.label}: {current} is not a root-only directory", Color.RED)
+            return False
+    return True
+
+
+def _ensure_logs(item: "Item", settings: Settings, env: Env) -> bool:
     """launchd opens StandardOutPath/StandardErrorPath before exec; pre-create agent logs.
 
-    Daemons get nix's `mkdir` (plus `touch`/`chown` with a user) via sudo. Also creates
+    Daemons get nix's `mkdir` (plus `touch`/`chown` with a user) as root. Also creates
     workingDirectory, which launchd enters before the wrapper runs.
     Sets `item.owned_logs`: agent log files tools created, tracked, or at the
-    generated default path.
+    generated default path. False when a daemon's dirs are not root-only (re-checked
+    here, at apply): the plist must not be written or loaded then.
     """
     svc = item.svc
     tracked = set((item.tracked or {}).get("logs") or [])
     item.owned_logs = sorted(tracked)
-    _ensure_workdir(svc, settings, env)
     if svc.domain != "user":
-        if can_change(svc.domain, settings, env):
-            item.owned_logs = sorted(tracked | set(_daemon_logs(svc, settings, env)))
-        return
+        if not can_change(svc.domain, env):
+            return True
+        errors = _root_dir_errors(svc, settings, env)
+        for err in errors:
+            log(f"launchd: {err}", Color.RED)
+        if errors or not _ensure_workdir(svc, settings, env):
+            return False
+        logs = _daemon_logs(svc, settings, env)
+        if logs is None:
+            return False
+        item.owned_logs = sorted(tracked | set(logs))
+        return True
+    _ensure_workdir(svc, settings, env)
     try:
         specs = log_specs(svc, settings, env)
     except ValueError as e:
         log(f"launchd: {svc.label}: {e}", Color.YELLOW)
-        return
+        return True
     wanted = []
     for p, generated in specs:
         volume = volume_of(p, env.volumes_root)
@@ -1259,6 +1334,7 @@ def _ensure_logs(item: "Item", settings: Settings, env: Env) -> None:
             continue
         wanted.append((p, generated or p in tracked))
     item.owned_logs = sorted(tracked | set(_user_logs(svc, wanted)))
+    return True
 
 
 def log_account(svc: Service) -> Tuple[Optional[str], Optional[str]]:
@@ -1290,12 +1366,7 @@ def _root_mkdir_ok(path: str, env: Env) -> bool:
 
 
 def _dir_exists(path: str, domain: str, env: Env) -> bool:
-    """isdir, asking root (`sudo -n test -d`) for a daemon path the user can't reach."""
-    if os.path.isdir(path):
-        return True
-    if not _needs_sudo(domain) or not env.allow_sudo:
-        return False
-    return _run_priv(["/bin/test", "-d", path], domain, env)[0] == 0
+    return os.path.isdir(path)
 
 
 def workdir_block(svc: Service, env: Env) -> Optional[str]:
@@ -1304,52 +1375,57 @@ def workdir_block(svc: Service, env: Env) -> Optional[str]:
     if svc.domain != "system" or svc.disabled or wd is None or _dir_exists(wd, svc.domain, env):
         return None
     volume = volume_of(wd, env.volumes_root)
-    if (volume and not env.ismount(volume)) or _root_mkdir_ok(wd, env):
+    if volume and not env.ismount(volume):
         return None
+    if _root_mkdir_ok(wd, env):
+        why = root_dir_error(wd, env) if env.root else None
+        return f"workingDirectory {wd} can't be created as root: {why}" if why else None
     return (
         f"workingDirectory {wd} is missing and tools only creates it as root inside an "
         f"existing {', '.join(env.system_dir_roots)}; create it yourself"
     )
 
 
-def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> None:
-    """Create a missing workingDirectory: as the user for agents, `sudo -n mkdir -p` for daemons
-    (only where `_root_mkdir_ok`)."""
+def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> bool:
+    """Create a missing workingDirectory: as the user for agents, root-only `mkdir`s as root
+    for daemons (only where `_root_mkdir_ok`). False when a daemon that will be started
+    is left without it: its plist must not be written or loaded then."""
     wd = svc.working_directory
-    if wd is None or os.path.isdir(wd) or not can_change(svc.domain, settings, env):
-        return
+    if wd is None or os.path.isdir(wd) or not can_change(svc.domain, env):
+        return True
     volume = volume_of(wd, env.volumes_root)
     if volume and not env.ismount(volume):
         log(f"launchd: {svc.label}: {volume} is not mounted; not creating {wd}", Color.YELLOW)
-        return
+        return True
     if svc.domain == "user":
         try:
             os.makedirs(wd, exist_ok=True)
         except OSError as e:
             log(f"launchd: {svc.label}: cannot create {wd}: {e}", Color.YELLOW)
-        return
+        return True
     if _dir_exists(wd, svc.domain, env):
-        return
+        return True
+    if runmode.under_home(wd, env.home):
+        log(f"launchd: {svc.label}: not creating {wd}: root never writes in user space", Color.RED)
+        return svc.disabled
     if not _root_mkdir_ok(wd, env):
         if not svc.disabled:
-            log(f"launchd: {svc.label}: {workdir_block(svc, env) or wd}", Color.YELLOW)
-        return
-    _run_log_cmd(["/bin/mkdir", "-p", wd], svc, env)
+            log(f"launchd: {svc.label}: {workdir_block(svc, env) or wd}", Color.RED)
+        return svc.disabled
+    return _secure_mkdirs(wd, svc, env) or svc.disabled
 
 
-def _daemon_logs(svc: Service, settings: Settings, env: Env) -> List[str]:
-    """nix-config parity: `sudo -n mkdir -p <logDir>` for every daemon (launchd opens the
-    logs before the wrapper runs), then `touch` and `chown user:group` when it has a user.
+def _daemon_logs(svc: Service, settings: Settings, env: Env) -> Optional[List[str]]:
+    """nix-config parity: create <logDir> for every daemon (launchd opens the logs
+    before the wrapper runs), then `touch` and `chown user:group` when it has a user.
+    None when the log dir can't be made safely.
 
     The paths are the string-checked `<logDir>/<name>.log`/`.error.log`; names are
     validated in `plan`.
     """
     log_dir = log_dir_of(svc, settings, env)
-    if os.path.islink(log_dir):
-        log(f"launchd: {svc.label}: {log_dir} is a symlink; not touching its logs", Color.YELLOW)
-        return []
-    if not os.path.isdir(log_dir) and not _run_log_cmd(["/bin/mkdir", "-p", log_dir], svc, env):
-        return []
+    if not _secure_mkdirs(log_dir, svc, env):
+        return None
     user, group = log_account(svc)
     files = [p for p, generated in log_specs(svc, settings, env) if generated]
     links = [p for p in files if os.path.islink(p)]
@@ -1365,7 +1441,7 @@ def _daemon_logs(svc: Service, settings: Settings, env: Env) -> List[str]:
 
 
 def _run_log_cmd(cmd: List[str], svc: Service, env: Env) -> bool:
-    rc, _out, err = _run_priv(cmd, svc.domain, env)
+    rc, _out, err = _run_changing(cmd, svc.domain, env)
     if rc != 0:
         log(f"launchd: {cmd[0]} for {svc.label} logs failed: {err.strip()}", Color.YELLOW)
         return False
@@ -1404,7 +1480,6 @@ class Item:
     tracked: Optional[Dict] = None
     loaded: Optional[bool] = None
     changed_files: List[str] = field(default_factory=list)
-    retire: Optional[Dict] = None  # same label tracked in another domain, removed first
     fix_perms: bool = False  # chmod/chown the plist in place (adopted, or mode drifted)
     owned_logs: Optional[List[str]] = None  # log files tools may re-own; see _ensure_logs
     mode_wrong: bool = False
@@ -1473,26 +1548,16 @@ def _tracked(state: Dict) -> Dict[str, Dict]:
     return _state_entries(state)[0]
 
 
-SHASUM = "/usr/bin/shasum"
-
-
 def _hash(path: str, domain: str = "user", env: Optional[Env] = None) -> Optional[str]:
-    """sha256 of path; None when missing. Root-only daemon files are read via `sudo -n shasum`."""
+    """sha256 of path; None when missing or unreadable."""
     try:
         with open(path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
     except FileNotFoundError:
         return None
     except OSError as e:
-        unreadable = e
-    usable = os.path.isabs(path) and os.path.normpath(path) == path
-    if env is not None and usable and _needs_sudo(domain) and env.allow_sudo:
-        rc, out, _err = _run_priv([SHASUM, "-a", "256", path], domain, env)
-        digest = out.split()[0] if rc == 0 and out.split() else ""
-        if re.fullmatch(r"[0-9a-f]{64}", digest):
-            return digest
-    log(f"launchd: restartOn {path} unreadable ({unreadable}); changes not tracked", Color.YELLOW)
-    return None
+        log(f"launchd: restartOn {path} unreadable ({e}); changes not tracked", Color.YELLOW)
+        return None
 
 
 def _file_hashes(
@@ -1521,12 +1586,19 @@ def _shared_logs(services: List[Service], settings: Settings, env: Env) -> Dict[
 def plan(settings: Settings, services: List[Service], state: Dict, env: Env, errors=()) -> Plan:
     p = Plan(errors=list(errors))
     if settings.errors:
-        # A broken section (e.g. a `sudo` typo) could change every job: hold them all.
+        # A broken section (e.g. a `logDir` typo) could change every job: hold them all.
         for err in settings.errors:
             if err not in p.errors:
                 p.errors.append(err)
         return p
     tracked, malformed = _state_entries(state)
+    clash = _shared_logs(services, settings, env)
+    services = [s for s in services if can_change(s.domain, env)]
+    for label in sorted(tracked):
+        domain = tracked[label].get("domain", "user")
+        if domain != env.domain:
+            p.ignored.append((label, f"{domain} job in this state; left alone"))
+            del tracked[label]
     desired_labels = {s.label for s in services}
     for label in malformed:
         reason = "malformed state entry, ignored"
@@ -1534,7 +1606,6 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             p.unknown.append((repr(label), f"{reason}; job held: {_FIX_STATE}"))
         else:
             p.ignored.append((repr(label), reason))
-    clash = _shared_logs(services, settings, env)
 
     for svc in services:
         if svc.label in malformed:
@@ -1549,7 +1620,9 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
         except (TypeError, OverflowError, ValueError) as e:
             p.errors.append(f"{svc.name}: cannot build plist: {e}")
             continue
-        log_errors = service_errors(svc, settings, env)
+        log_errors = service_errors(svc, settings, env) + home_errors(svc, settings, env)
+        if not log_errors:
+            log_errors = _root_dir_errors(svc, settings, env)
         if log_errors:
             p.errors += log_errors
             continue
@@ -1566,21 +1639,6 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             restart_hashes=_file_hashes(svc.restart_on, svc.domain, env),
             tracked=tracked.get(svc.label),
         )
-        if item.tracked is not None and item.tracked.get("domain", "user") != svc.domain:
-            # Same label, new domain: the old job must be gone before this one exists.
-            old = Plan()
-            _plan_removal(old, svc.label, item.tracked, settings, env)
-            if old.errors or old.unknown:
-                p.errors += old.errors
-                p.unknown += old.unknown
-                continue
-            if old.forget and old.forget[0][2] not in ("already gone", "never written"):
-                old_domain = item.tracked.get("domain", "user")
-                p.blocked.append((svc.label, f"old {old_domain} job: {old.forget[0][2]}"))
-                continue
-            if old.remove:
-                item.retire = item.tracked
-            item.tracked = None
         exists, current, readable = read_current(path, svc.domain, env)
         if not readable:
             p.unknown.append((svc.label, f"{path} unreadable; {_FIX_UNREADABLE}"))
@@ -1621,9 +1679,6 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             continue
 
         if bucket is not None and bucket is not p.adopt:
-            if not can_change(svc.domain, settings, env):
-                p.errors.append(_sudo_error(svc.label))
-                continue
             bucket.append(item)
             continue
 
@@ -1649,9 +1704,7 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             target = p.load
         elif not svc.disabled and item.changed_files:
             target = p.restart
-        if (target is not None or item.fix_perms) and not can_change(svc.domain, settings, env):
-            p.errors.append(_sudo_error(svc.label))
-        elif target is None:
+        if target is None:
             (p.adopt if adopting else p.ok).append(item)
         else:
             target.append(item)
@@ -1730,14 +1783,12 @@ def _plan_removal(p: Plan, label: str, entry: Dict, settings: Settings, env: Env
         and not live.loaded
     ):
         p.forget.append((label, entry, "already gone"))
-    elif not can_change(domain, settings, env):
-        p.errors.append(_sudo_error(label))
     else:
         p.remove.append((label, entry))
 
 
 _FIX_STATE = "fix or delete this entry under launchd.services in the state file"
-_FIX_UNREADABLE = "set `launchd.sudo: true` and run `sudo -v` so tools can read it"
+_FIX_UNREADABLE = "check its owner and permissions"
 
 
 def _foreign(live: Status, path: str) -> bool:
@@ -1745,8 +1796,23 @@ def _foreign(live: Status, path: str) -> bool:
     return live.loaded and bool(live.path) and os.path.normpath(live.path) != path
 
 
-def _sudo_error(label: str) -> str:
-    return f"{label}: system domain needs root; set `launchd.sudo: true` (tools runs `sudo -n`)"
+def home_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
+    """As root, every path tools writes for a daemon must be outside the user's home."""
+    if not env.root or svc.domain != "system":
+        return []
+    targets = [
+        ("plist", plist_path(svc, svc.domain, env)),
+        ("logDir", log_dir_of(svc, settings, env)),
+    ]
+    targets += [("log", path) for path in log_paths(svc, settings, env)]
+    # An existing one is only entered (as the job's user); tools would have to create a missing one.
+    if svc.working_directory and not os.path.isdir(svc.working_directory):
+        targets.append(("workingDirectory", svc.working_directory))
+    return [
+        f"{svc.name}: {what} {path} is under {env.home}; root never writes in user space"
+        for what, path in targets
+        if runmode.under_home(path, env.home)
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1816,7 +1882,10 @@ def _activate(item: Item, env: Env, new: bool) -> Tuple[Optional[str], bool]:
 def _fix_perms(item: Item, env: Env) -> bool:
     """Plist mode and owner as tools would have written them, never through a symlink."""
     svc, path, mode = item.svc, item.path, _plist_mode(item.svc)
-    if not _needs_sudo(svc.domain):
+    if not can_change(svc.domain, env):
+        log(f"launchd: not fixing {path}: {_run_changing([], svc.domain, env)[2]}", Color.RED)
+        return False
+    if svc.domain == "user":
         try:
             fd = _open_regular(path, os.O_RDONLY)
             try:
@@ -1830,13 +1899,15 @@ def _fix_perms(item: Item, env: Env) -> bool:
     if os.path.islink(path):
         log(f"launchd: {path} is a symlink; not fixing permissions", Color.RED)
         return False
-    # Same content, so reinstalling sets root:wheel and the mode without sudo chmod/chown.
+    # Same content, so reinstalling sets root:wheel and the mode in one step.
     return _write_plist(path, item.data, svc.domain, env, mode)
 
 
 def _converge(item: Item, settings: Settings, env: Env, services: Dict, write: bool, new: bool):
     """Shared steps for every job that needs launchd work; records each step that succeeded."""
-    _ensure_logs(item, settings, env)
+    if not _ensure_logs(item, settings, env):
+        _record_logs(services, item)
+        return False
     if write:
         if not _write_plist(item.path, item.data, item.svc.domain, env, _plist_mode(item.svc)):
             _record_logs(services, item)
@@ -1928,7 +1999,7 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
     for label, reason in p.ignored:
         log(f"launchd: {label}: {reason}", Color.YELLOW)
 
-    # Removals first: a label moving domains or a renamed job may share a port.
+    # Removals first: a renamed job may share a port.
     # Held while anything is in error, as an unparsed entry only looks undesired.
     if not p.errors:
         for label, entry, reason in p.forget:
@@ -1937,22 +2008,6 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
             services.pop(label, None)
         for label, entry in p.remove:
             success &= _retire(label, entry, services, env)
-
-    # A domain move retires the old job first; if that fails the label stays
-    # tracked at its old path and nothing is created under it this run.
-    stuck = set()
-    every = p.create + p.update + p.adopt + p.load + p.unload + p.enable + p.disable + p.retry
-    for item in every + p.restart + p.ok:
-        if item.retire is None:
-            continue
-        if not _retire(item.svc.label, item.retire, services, env):
-            log(f"launchd: {item.svc.label}: old job not retired; not moving it", Color.RED)
-            stuck.add(id(item))
-            success = False
-    if stuck:
-        for name in ("create", "update", "adopt", "load", "unload", "enable", "disable",
-                     "restart", "retry", "ok"):  # fmt: skip
-            setattr(p, name, [i for i in getattr(p, name) if id(i) not in stuck])
 
     steps = (
         (p.create, True, True, "Created"),
@@ -1971,8 +2026,7 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
                 success = False
 
     for item in p.adopt:
-        _ensure_logs(item, settings, env)
-        if _fix_perms(item, env):
+        if _ensure_logs(item, settings, env) and _fix_perms(item, env):
             _record(services, item)
         else:
             success = False
@@ -1991,7 +2045,9 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
 
     for item in p.ok:
         # Logs again: a volume may have mounted since the last run.
-        _ensure_logs(item, settings, env)
+        if not _ensure_logs(item, settings, env):
+            success = False
+            continue
         if item.fix_perms and not _fix_perms(item, env):
             success = False
             continue
@@ -2005,11 +2061,19 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _with_sudo(env: Env, settings: Settings) -> Env:
-    # copy, not dataclasses.replace: __post_init__ would re-derive defaults.
-    env = copy.copy(env)
-    env.allow_sudo = settings.sudo
-    return env
+def _note_unmanaged(services: List[Service], env: Env) -> None:
+    """Say which configured jobs this run leaves to the other mode."""
+    others = [s for s in services if not can_change(s.domain, env)]
+    if not others:
+        return
+    if env.root:
+        debug(f"launchd: {len(others)} agent(s) skipped as root; run tools deploy without sudo")
+    else:
+        log(
+            f"launchd: {len(others)} daemon(s) not managed as user; "
+            "run sudo tools deploy --scope launchd",
+            Color.YELLOW,
+        )
 
 
 def install_launchd(
@@ -2023,7 +2087,7 @@ def install_launchd(
     if not env.is_darwin:
         log("launchd: skipping, not macOS", Color.YELLOW)
         return True
-    refusal = root_refusal(env)
+    refusal = mode_error(env)
     if refusal:
         log(f"launchd: {refusal}", Color.RED)
         return False
@@ -2034,7 +2098,7 @@ def install_launchd(
     settings, services, errors = parse_launchd(
         raw, env.home, env.login, secrets_dir, secrets_dir_error
     )
-    env = _with_sudo(env, settings)
+    _note_unmanaged(services, env)
     p = plan(settings, services, state, env, errors)
     ok = apply(settings, p, state, env)
     work = (p.create, p.update, p.load, p.unload, p.enable, p.disable, p.restart, p.retry, p.remove)
@@ -2062,13 +2126,13 @@ def diff_launchd(
     env = env or Env()
     if not env.is_darwin:
         return []
-    refusal = root_refusal(env) or state_error(state)
+    refusal = mode_error(env) or state_error(state)
     if refusal:
         return [f"  ! {refusal}"]
     settings, services, errors = parse_launchd(
         raw, env.home, env.login, secrets_dir, secrets_dir_error
     )
-    env = _with_sudo(env, settings)
+    _note_unmanaged(services, env)
     p = plan(settings, services, state, env, errors)
 
     def name(item_or_label, domain=None) -> str:
@@ -2076,8 +2140,7 @@ def diff_launchd(
             label, domain = item_or_label.svc.label, item_or_label.svc.domain
         else:
             label = item_or_label
-        suffix = " (sudo)" if _needs_sudo(domain) else ""
-        return f"{domain}/{label}{suffix}"
+        return f"{domain}/{label}"
 
     changes = [f"  ! {err}" for err in p.errors]
     changes += [f"  ! skip {label}: {reason}" for label, reason in p.blocked]
@@ -2092,10 +2155,6 @@ def diff_launchd(
         if reason not in ("already gone", "never written"):
             held = "  ! held: forget" if p.errors else "  ~ forget"
             changes.append(f"{held} {label} ({reason})")
-    lists = (p.create, p.update, p.adopt, p.load, p.unload, p.enable, p.disable, p.restart)
-    for item in [i for lst in lists + (p.retry, p.ok) for i in lst]:
-        if item.retire is not None:
-            changes.append(f"  - remove {name(item.svc.label, item.retire.get('domain', 'user'))}")
     for item in p.create:
         changes.append(f"  + create {name(item)} -> {item.path}")
     changes += [f"  ~ adopt {name(i)} (identical plist)" for i in p.adopt]
@@ -2125,12 +2184,12 @@ def diff_launchd(
 def status_rows(raw, state: Dict, env: Optional[Env] = None) -> List[Tuple[str, str, Status]]:
     """(label, domain, Status) for every configured or tracked job. Read-only.
 
-    Raises PermissionError when tools runs as root.
+    Raises PermissionError when root has no SUDO_USER to act for.
     """
     env = env or Env()
     if not env.is_darwin:
         return []
-    refusal = root_refusal(env)
+    refusal = mode_error(env)
     if refusal:
         raise PermissionError(refusal)
     _settings, services, _errors = parse_launchd(raw, env.home, env.login)
@@ -2148,7 +2207,10 @@ def has_work(raw, state: Dict) -> bool:
         return True
     if raw is not None and not isinstance(raw, dict):
         return True
-    services = (raw or {}).get("services")
-    if services is not None and not isinstance(services, dict):
+    raw = raw or {}
+    if set(raw) - {"labelPrefix", "logDir", "bash", "agents", "daemons"}:
         return True
-    return bool(services or (section or {}).get("services"))
+    for key, _domain in _GROUPS:
+        if raw.get(key) is not None and not isinstance(raw[key], dict):
+            return True
+    return bool(raw.get("agents") or raw.get("daemons") or (section or {}).get("services"))

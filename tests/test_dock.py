@@ -41,7 +41,7 @@ class DockTestBase(unittest.TestCase):
 
     def diff(self, raw):
         spec, errors = parse_dock(raw)
-        return dock.preview_dock(spec, errors, self.state, self.fake.cli(False), self.fs)
+        return dock.preview_dock(spec, errors, self.state, self.fake.cli(), self.fs)
 
     def live(self, key="persistent-apps"):
         return self.fake.domain("com.apple.dock").get(key)

@@ -4,6 +4,7 @@ import plistlib
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ UID = 501
 
 
 class FakeSystem:
-    """Stand-in for launchctl/sudo: tracks loaded and disabled jobs, acts out file ops."""
+    """Stand-in for launchctl: tracks loaded and disabled jobs, acts out file ops."""
 
     def __init__(self):
         self.calls = []
@@ -26,7 +27,7 @@ class FakeSystem:
         self.disabled = set()
         self.script = {}  # (verb, label) -> list of rc to return before default behaviour
         self.linger = {}  # label -> bootout answers EINPROGRESS
-        self.sudo_calls = []
+        self.system_calls = []  # file ops, and launchctl changes in the system domain
         self.fail_tools = set()
         self.disabled_rc = 119  # what bootstrap of a launchd-disabled job returns
         self.print_disabled_rc = 0
@@ -38,11 +39,12 @@ class FakeSystem:
 
     def run(self, cmd):
         self.calls.append(list(cmd))
-        if cmd[0] == launchd.SUDO:
-            assert cmd[1] == "-n", f"sudo must be non-interactive: {cmd}"
-            cmd = cmd[2:]
-            self.sudo_calls.append(list(cmd))
+        assert not any("sudo" in c for c in cmd), f"tools must never call sudo: {cmd}"
         tool = cmd[0]
+        if tool != launchd.LAUNCHCTL or (
+            cmd[1] not in ("print", "print-disabled") and any(c.startswith("system") for c in cmd)
+        ):
+            self.system_calls.append(list(cmd))
         if tool != launchd.LAUNCHCTL:
             # File ops get flags then absolute paths only; anything else would touch the cwd.
             paths = [c for c in cmd[1:] if not c.startswith("-") and "/" in c]
@@ -171,14 +173,47 @@ class LaunchdTestBase(unittest.TestCase):
             is_darwin=True,
             volumes_root=os.path.join(self.tmp, "Volumes"),
             ismount=lambda _p: True,
+            lstat=self.owner_view(os.lstat),
+            stat=self.owner_view(os.stat),
         )
         self.state = {}
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def cfg(self, services, **section):
-        return {"labelPrefix": "org.example", "services": services, **section}
+    def owner_view(self, real):
+        """Stat as root sees it on a real host: everything root-only except paths in
+        `user_owned` (owned by UID) and `writable` (group/world-writable)."""
+        self.user_owned, self.writable = set(), set()
+
+        def view(path):
+            st = real(path)
+            mode = st.st_mode | 0o022 if path in self.writable else st.st_mode & ~0o022
+            return SimpleNamespace(st_uid=UID if path in self.user_owned else 0, st_mode=mode)
+
+        return view
+
+    def cfg(self, agents=None, daemons=None, root=None, **section):
+        """A launchd section; configuring daemons switches to root mode unless root=False."""
+        raw = {"labelPrefix": "org.example", **section}
+        if agents is not None:
+            raw["agents"] = agents
+        if daemons is not None:
+            raw["daemons"] = daemons
+        if root or (root is None and daemons is not None):
+            self.as_root()
+        elif root is False:
+            self.as_user()
+        return raw
+
+    def as_root(self):
+        """`sudo tools deploy`: euid 0 acting for UID, whose home holds no daemon paths."""
+        self.env.euid = 0
+        self.env.home = os.path.join(self.tmp, "home")
+
+    def as_user(self):
+        self.env.euid = UID
+        self.env.home = self.tmp
 
     def deploy(self, raw):
         return launchd.install_launchd(raw, self.state, self.env)
@@ -198,10 +233,10 @@ class LaunchdTestBase(unittest.TestCase):
 
 
 class ParseTest(unittest.TestCase):
-    def parse(self, services, **section):
-        return launchd.parse_launchd(
-            {"labelPrefix": "org.example", "services": services, **section}
-        )
+    def parse(self, agents=None, daemons=None, **section):
+        raw = {"labelPrefix": "org.example", **section}
+        raw.update({k: v for k, v in (("agents", agents), ("daemons", daemons)) if v is not None})
+        return launchd.parse_launchd(raw)
 
     def test_defaults_and_label_prefix(self):
         _s, svcs, errors = self.parse({"web": {"command": "srv"}})
@@ -209,12 +244,42 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(svcs[0].label, "org.example.web")
         self.assertEqual(svcs[0].domain, "user")
 
+    def test_agents_and_daemons_set_the_domain(self):
+        _s, svcs, errors = self.parse({"a": {"command": "x"}}, {"d": {"command": "y"}})
+        self.assertEqual(errors, [])
+        self.assertEqual([(s.name, s.domain) for s in svcs], [("a", "user"), ("d", "system")])
+
+    def test_old_keys_name_their_replacement(self):
+        cases = {
+            "services": ({"services": {"x": {"command": "y"}}}, "launchd.agents"),
+            "sudo": ({"sudo": True}, "sudo tools deploy --scope launchd"),
+        }
+        for key, (section, hint) in cases.items():
+            with self.subTest(key):
+                settings, svcs, errors = self.parse(**section)
+                self.assertEqual(svcs, [])
+                self.assertIn(f"`launchd.{key}`", errors[0])
+                self.assertIn(hint, errors[0])
+                self.assertEqual(settings.errors, errors)
+        _s, svcs, errors = self.parse({"x": {"command": "y", "domain": "system"}})
+        self.assertEqual(svcs, [])
+        self.assertIn("agents.x: `domain` removed", errors[0])
+        self.assertIn("launchd.daemons", errors[0])
+
+    def test_same_label_in_agents_and_daemons_is_an_error(self):
+        _s, svcs, errors = self.parse({"web": {"command": "x"}}, {"web": {"command": "y"}})
+        self.assertEqual([s.domain for s in svcs], ["user"])
+        self.assertEqual(errors, ["daemons.web: label org.example.web already used by agents.web"])
+
+    def test_non_mapping_group_is_a_section_error(self):
+        settings, svcs, errors = self.parse(daemons=["x"])
+        self.assertEqual(settings.errors, ["daemons must be a mapping of name -> job"])
+
     def test_validation_errors(self):
         cases = {
             "neither": {},
             "both": {"command": "x", "programArguments": ["x"]},
             "unknown": {"command": "x", "bogus": 1},
-            "domain": {"command": "x", "domain": "gui"},
             "user-on-agent": {"command": "x", "user": "nobody"},
             "rel-wait": {"command": "x", "waitForPaths": ["relative/path"]},
             "keepalive": {"command": "x", "keepAlive": {"Whenever": True}},
@@ -228,10 +293,10 @@ class ParseTest(unittest.TestCase):
             with self.subTest(name):
                 _s, svcs, errors = self.parse({name: raw})
                 self.assertEqual(svcs, [])
-                self.assertTrue(errors and errors[0].startswith(f"{name}:"), errors)
+                self.assertTrue(errors and errors[0].startswith(f"agents.{name}:"), errors)
 
     def test_label_required_without_prefix(self):
-        _s, svcs, errors = launchd.parse_launchd({"services": {"x": {"command": "y"}}})
+        _s, svcs, errors = launchd.parse_launchd({"agents": {"x": {"command": "y"}}})
         self.assertEqual(svcs, [])
         self.assertIn("labelPrefix", errors[0])
 
@@ -249,8 +314,9 @@ class ParseTest(unittest.TestCase):
 
 
 class PlistTest(LaunchdTestBase):
-    def plist(self, raw, secrets_dir=None, **section):
-        _s, svcs, errors = launchd.parse_launchd(self.cfg({"svc": raw}, **section))
+    def plist(self, raw, secrets_dir=None, daemon=False, **section):
+        jobs = {"daemons" if daemon else "agents": {"svc": raw}}
+        _s, svcs, errors = launchd.parse_launchd(self.cfg(**jobs, **section))
         self.assertEqual(errors, [])
         settings = launchd.parse_launchd(self.cfg({}, **section), secrets_dir=secrets_dir)[0]
         return launchd.desired_plist(svcs[0], settings, self.env)
@@ -278,7 +344,6 @@ class PlistTest(LaunchdTestBase):
         script = self.plist(
             {
                 "command": "srv",
-                "domain": "system",
                 "waitForPaths": ["/Volumes/Ext Disk", "/run/secrets/token"],
                 "dataDir": "/Volumes/Ext Disk/.svc",
                 "extraDirs": [
@@ -286,7 +351,8 @@ class PlistTest(LaunchdTestBase):
                     {"path": "/tmp/b", "mode": "0750", "owner": "me", "group": "staff"},
                 ],
                 "preStart": "render-config",
-            }
+            },
+            daemon=True,
         )["ProgramArguments"][2]
         order = [
             "Waiting for /Volumes/Ext Disk...",
@@ -394,9 +460,9 @@ class PlistTest(LaunchdTestBase):
 
     def test_daemon_waits_for_the_same_secrets_dir(self):
         script = self.plist(
-            {"command": "srv", "domain": "system", "waitForSecrets": True},
+            {"command": "srv", "waitForSecrets": True},
             secrets_dir="/state/secrets",
-            sudo=True,
+            daemon=True,
         )["ProgramArguments"][2]
         self.assertIn("while [ ! -e /state/secrets ]; do sleep 1; done", script)
 
@@ -417,25 +483,26 @@ class PlistTest(LaunchdTestBase):
             self.assertIn("while [ ! -e /state/secrets ]", plistlib.load(f)["ProgramArguments"][2])
 
     def test_extra_service_config_user_owns_daemon_logs_like_nix(self):
-        svc = {"command": "x", "domain": "system", "extraServiceConfig": {"UserName": "_dns"}}
-        raw = {**self.cfg({"dns": svc}), "sudo": True}
+        svc = {"command": "x", "extraServiceConfig": {"UserName": "_dns"}}
+        raw = self.cfg(daemons={"dns": svc})
         self.assertTrue(launchd.install_launchd(raw, self.state, self.env))
         logs = self.env.system_log_dir
         self.assertIn(
             ["/usr/sbin/chown", "-h", "_dns:staff", os.path.join(logs, "dns.log"),
              os.path.join(logs, "dns.error.log")],
-            self.fake.sudo_calls,
+            self.fake.system_calls,
         )  # fmt: skip
 
     def test_daemon_user_group_and_log_dirs(self):
-        pl = self.plist({"command": "x", "domain": "system", "user": "svc", "group": "staff"})
+        pl = self.plist({"command": "x", "user": "svc", "group": "staff"}, daemon=True)
         self.assertEqual((pl["UserName"], pl["GroupName"]), ("svc", "staff"))
         syslogs = os.path.join(self.tmp, "syslogs")
         self.assertEqual(pl["StandardOutPath"], os.path.join(syslogs, "svc.log"))
         self.assertEqual(pl["StandardErrorPath"], os.path.join(syslogs, "svc.error.log"))
         env = launchd.Env(uid=UID, home=self.tmp)
         self.assertEqual(
-            (env.system_log_dir, env.user_log_dir), ("/tmp/log/launchd", "/tmp/agents/log/launchd")
+            (env.system_log_dir, env.user_log_dir),
+            ("/var/log/tools/launchd", "/tmp/agents/log/launchd"),
         )
         script = pl["ProgramArguments"][2].splitlines()
         self.assertEqual(
@@ -545,7 +612,7 @@ class AgentLifecycleTest(LaunchdTestBase):
         self.deploy(self.cfg({"web": {"command": "srv"}}))
         raw = self.cfg({"broken": {"command": "x", "bogus": True}})
         changes = self.diff(raw)
-        self.assertTrue(changes[0].startswith("  ! broken:"))
+        self.assertTrue(changes[0].startswith("  ! agents.broken:"))
         self.assertNotIn("  - remove user/org.example.web", changes)
         self.assertFalse(self.deploy(raw))
         self.assertTrue(os.path.exists(self.agent_path("web")))
@@ -707,7 +774,7 @@ class RestartOnTest(LaunchdTestBase):
         raw = self.cfg({"svc": {"command": "x", "restartOn": [watched, other]}})
         self.assertEqual(self.diff(raw), [])
 
-    def test_root_only_restart_on_file_hashed_via_sudo(self):
+    def test_unreadable_restart_on_file_is_logged_not_escalated(self):
         watched = os.path.join(self.tmp, "root-only")
         with open(watched, "w") as f:
             f.write("v1")
@@ -718,88 +785,186 @@ class RestartOnTest(LaunchdTestBase):
                 raise PermissionError(13, "Permission denied")
             return real_open(path, *a, **kw)
 
-        raw = {**self.cfg({"d": {"command": "x", "domain": "system", "restartOn": [watched]}}),
-               "sudo": True}  # fmt: skip
-        with mock.patch("builtins.open", side_effect=fake_open):
-            self.deploy(raw)
-            with real_open(watched, "w") as f:
-                f.write("v2")
-            self.assertIn("restart", self.diff(raw)[0])
-        self.assertIn(["/usr/bin/shasum", "-a", "256", watched], self.fake.sudo_calls)
-
-        self.state = {}
+        raw = self.cfg(daemons={"d": {"command": "x", "restartOn": [watched]}})
         with (
             mock.patch("builtins.open", side_effect=fake_open),
             mock.patch.object(launchd, "log") as log,
         ):
-            launchd.diff_launchd({**raw, "sudo": False}, self.state, self.env)
+            self.assertTrue(self.deploy(raw))
         self.assertTrue(any("unreadable" in c.args[0] for c in log.call_args_list))
+        self.assertEqual(self.state["launchd"]["services"]["org.example.d"]["restartOn"],
+                         {watched: None})  # fmt: skip
 
 
 class SystemDomainTest(LaunchdTestBase):
-    def daemon(self, **extra):
-        return self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system", **extra}})
+    def daemon(self, root=None, **extra):
+        return self.cfg(daemons={"dns": {"command": "dnsmasq -k", **extra}}, root=root)
 
-    def test_refuses_without_root_or_sudo(self):
-        changes = self.diff(self.daemon())
-        self.assertIn("needs root", changes[0])
-        self.assertFalse(self.deploy(self.daemon()))
+    def test_user_mode_leaves_daemons_alone_with_a_note(self):
+        raw = self.daemon(root=False)
+        with mock.patch.object(launchd, "log") as log:
+            self.assertEqual(self.diff(raw), [])
+            self.assertTrue(self.deploy(raw))
+        notes = [c.args[0] for c in log.call_args_list]
+        self.assertIn(
+            "launchd: 1 daemon(s) not managed as user; run sudo tools deploy --scope launchd",
+            notes,
+        )
         self.assertFalse(os.path.exists(self.daemon_path("dns")))
-        self.assertFalse(any(c[0] == launchd.SUDO for c in self.fake.calls))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertEqual(self.state["launchd"]["services"], {})
 
-    def test_sudo_opt_in_escalates_writes_and_launchctl(self):
-        raw = {**self.daemon(user="svc"), "sudo": True}
+    def test_root_mode_skips_agents(self):
+        raw = self.cfg({"web": {"command": "srv"}}, {"dns": {"command": "dnsmasq -k"}})
+        self.assertEqual(
+            self.diff(raw), [f"  + create system/org.example.dns -> {self.daemon_path('dns')}"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertFalse(os.path.exists(self.agent_path("web")))
+        self.assertEqual(list(self.state["launchd"]["services"]), ["org.example.dns"])
+        self.assertFalse(any(f"gui/{UID}" in " ".join(c) for c in self.fake.calls))
+
+    def test_root_mode_without_sudo_user_refuses(self):
+        raw = self.daemon()
+        self.env.uid = 0
+        self.assertEqual(self.diff(raw), [f"  ! {launchd.runmode.SUDO_USER_ERROR}"])
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.fake.calls, [])
+        with self.assertRaises(PermissionError):
+            launchd.status_rows(raw, self.state, self.env)
+
+    def test_root_writes_and_launchctl_run_directly(self):
+        raw = self.daemon(user="svc")
         self.assertEqual(
             self.diff(raw),
-            [f"  + create system/org.example.dns (sudo) -> {self.daemon_path('dns')}"],
+            [f"  + create system/org.example.dns -> {self.daemon_path('dns')}"],
         )
         self.assertTrue(self.deploy(raw))
 
         self.assertTrue(os.path.exists(self.daemon_path("dns")))
         self.assertIn(
-            [launchd.SUDO, "-n", "/bin/launchctl", "bootstrap", "system", self.daemon_path("dns")],
+            ["/bin/launchctl", "bootstrap", "system", self.daemon_path("dns")],
             self.fake.calls,
         )
         install = [c for c in self.fake.calls if "/usr/bin/install" in c and "-S" in c][0]
         self.assertEqual(
-            install[:10],
-            [
-                launchd.SUDO,
-                "-n",
-                "/usr/bin/install",
-                "-S",
-                "-m",
-                "0644",
-                "-o",
-                "root",
-                "-g",
-                "wheel",
-            ],
+            install[:8],
+            ["/usr/bin/install", "-S", "-m", "0644", "-o", "root", "-g", "wheel"],
         )
-        self.assertIn([launchd.SUDO, "-n", "/usr/sbin/chown", "-h", "svc:staff",
+        self.assertIn(["/usr/sbin/chown", "-h", "svc:staff",
                        os.path.join(self.env.system_log_dir, "dns.log"),
                        os.path.join(self.env.system_log_dir, "dns.error.log")],
                       self.fake.calls)  # fmt: skip
-        self.assertTrue(self.deploy(self.cfg({}, sudo=True)))
+        self.assertTrue(self.deploy(self.cfg({}, root=True)))
         self.assertFalse(os.path.exists(self.daemon_path("dns")))
-        self.assertIn(
-            [launchd.SUDO, "-n", "/bin/rm", "-f", self.daemon_path("dns")], self.fake.calls
-        )
-        # Status reads are never escalated.
-        prints = self.fake.verbs("print")
-        self.assertTrue(prints and all(c[0] != launchd.SUDO for c in prints))
+        self.assertIn(["/bin/rm", "-f", self.daemon_path("dns")], self.fake.calls)
 
-    def test_domain_change_retires_old_job(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        raw = {**self.daemon(), "sudo": True}
-        changes = self.diff(raw)
-        self.assertEqual(changes[0], "  - remove user/org.example.dns")
-        self.assertTrue(changes[1].startswith("  + create system/org.example.dns"))
-
-        self.assertTrue(self.deploy(raw))
+    def test_moving_an_agent_to_daemons_is_two_runs_with_two_states(self):
+        user_state = {}
+        launchd.install_launchd(self.cfg({"dns": {"command": "dnsmasq -k"}}), user_state, self.env)
+        moved = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}}, root=False)
+        self.assertEqual(launchd.diff_launchd(moved, user_state, self.env),
+                         ["  - remove user/org.example.dns"])  # fmt: skip
+        self.assertTrue(launchd.install_launchd(moved, user_state, self.env))
         self.assertFalse(os.path.exists(self.agent_path("dns")))
+        self.assertEqual(user_state["launchd"]["services"], {})
+
+        self.as_root()
+        root_state = {}
+        self.assertTrue(launchd.install_launchd(moved, root_state, self.env))
         self.assertTrue(os.path.exists(self.daemon_path("dns")))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"]["domain"], "system")
+        self.assertEqual(root_state["launchd"]["services"]["org.example.dns"]["domain"], "system")
+
+    def test_other_domain_state_entries_are_left_alone(self):
+        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
+        self.as_root()
+        self.fake.calls.clear()
+        self.assertEqual(self.diff(self.cfg({})),
+                         ["  ? org.example.dns: user job in this state; left alone"])  # fmt: skip
+        self.assertTrue(self.deploy(self.cfg({})))
+        self.assertTrue(os.path.exists(self.agent_path("dns")))
+        self.assertIn("org.example.dns", self.state["launchd"]["services"])
+        self.assertEqual(self.fake.system_calls, [])
+
+    def test_daemon_temp_file_is_private_and_beside_the_plist(self):
+        modes = []
+        real = self.fake.run
+
+        def run(cmd):
+            if cmd[0] == "/usr/bin/install":
+                modes.append((os.path.dirname(cmd[-2]), os.stat(cmd[-2]).st_mode & 0o777))
+            return real(cmd)
+
+        self.env.run = run
+        with mock.patch.dict(os.environ, {"TMPDIR": os.path.join(self.tmp, "usertmp")}):
+            self.assertTrue(self.deploy(self.daemon()))
+        self.assertEqual(modes, [(self.env.daemons_dir, 0o600)])
+        self.assertEqual(os.listdir(self.env.daemons_dir), ["org.example.dns.plist"])
+
+    def test_symlinked_daemons_dir_is_refused(self):
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        os.symlink(target, self.env.daemons_dir)
+        self.assertFalse(self.deploy(self.daemon()))
+        self.assertEqual(os.listdir(target), [])
+
+    def test_root_never_writes_under_the_users_home(self):
+        home = self.env.home = os.path.join(self.tmp, "home")
+        self.env.daemons_dir = os.path.join(home, "LaunchDaemons")
+        wd = os.path.join(home, "work")
+        raw = self.cfg(
+            daemons={"a": {"command": "x"}, "b": {"command": "y", "workingDirectory": wd}}
+        )
+        changes = self.diff(raw)
+        plist_a = os.path.join(home, "LaunchDaemons", "org.example.a.plist")
+        self.assertIn(
+            f"  ! a: plist {plist_a} is under {home}; root never writes in user space", changes
+        )
+        self.assertIn(
+            f"  ! b: workingDirectory {wd} is under {home}; root never writes in user space",
+            changes,
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertFalse(os.path.exists(home))
+        self.assertEqual(self.fake.system_calls, [])
+
+    def test_root_writes_other_daemons_when_one_targets_the_home(self):
+        self.as_root()
+        home = self.env.home
+        raw = self.cfg(
+            daemons={
+                "bad": {"command": "x", "workingDirectory": os.path.join(home, "w")},
+                "good": {"command": "y"},
+            }
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertTrue(os.path.exists(self.daemon_path("good")))
+        self.assertFalse(os.path.exists(self.daemon_path("bad")))
+
+    def test_existing_working_directory_under_the_home_is_allowed(self):
+        self.as_root()
+        wd = os.path.join(self.env.home, "w")
+        os.makedirs(wd)
+        raw = self.cfg(daemons={"d": {"command": "x", "user": "me", "workingDirectory": wd}})
+        self.assertEqual(
+            self.diff(raw), [f"  + create system/org.example.d -> {self.daemon_path('d')}"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(self.daemon_path("d"))["WorkingDirectory"], wd)
+        self.assertFalse(any(wd in c for c in self.fake.system_calls if c[0] == "/bin/mkdir"))
+
+    def test_missing_working_directory_under_the_home_is_never_created(self):
+        self.as_root()
+        wd = os.path.join(self.env.home, "w")
+        raw = self.cfg(daemons={"d": {"command": "x", "workingDirectory": wd}})
+        self.assertIn(
+            f"  ! d: workingDirectory {wd} is under {self.env.home}; "
+            "root never writes in user space",
+            self.diff(raw),
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertFalse(os.path.exists(wd))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
 
 
 class StatusAndPlatformTest(LaunchdTestBase):
@@ -823,54 +988,6 @@ class StatusAndPlatformTest(LaunchdTestBase):
 
 
 class ReviewRegressionTest(LaunchdTestBase):
-    # 1: a domain move must not orphan the old job.
-    def test_domain_move_waits_for_old_job_to_be_retired(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        old = dict(self.state["launchd"]["services"]["org.example.dns"])
-        self.fake.script[("bootout", "org.example.dns")] = [1]
-        self.fake.script[("print", "org.example.dns")] = [0]
-
-        raw = {**self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system"}}), "sudo": True}
-        self.assertFalse(self.deploy(raw))
-
-        self.assertFalse(os.path.exists(self.daemon_path("dns")))
-        self.assertTrue(os.path.exists(self.agent_path("dns")))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"], old)
-
-    def test_domain_move_proceeds_despite_unrelated_config_error(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        raw = {
-            **self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system"}, "bad": {"bogus": 1}}),
-            "sudo": True,
-        }
-        self.assertFalse(self.deploy(raw))
-        self.assertFalse(os.path.exists(self.agent_path("dns")))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"]["domain"], "system")
-
-    def test_domain_move_onto_identical_plist_is_not_adopted_until_retired(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        old = dict(self.state["launchd"]["services"]["org.example.dns"])
-        raw = {**self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system"}}), "sudo": True}
-        _s, svcs, _e = launchd.parse_launchd(raw)
-        os.makedirs(self.env.daemons_dir)
-        with open(self.daemon_path("dns"), "wb") as f:
-            plistlib.dump(launchd.desired_plist(svcs[0], _s, self.env), f)
-        self.fake.script[("bootout", "org.example.dns")] = [1]
-        self.fake.script[("print", "org.example.dns")] = [0]
-
-        self.assertFalse(self.deploy(raw))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"], old)
-
-    def test_domain_move_blocked_when_old_plist_was_edited(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        with open(self.agent_path("dns"), "wb") as f:
-            plistlib.dump({"Label": "org.example.dns", "Program": "/x"}, f)
-        raw = {**self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system"}}), "sudo": True}
-        self.assertIn("modified since tools wrote it", self.diff(raw)[0])
-        self.deploy(raw)
-        self.assertFalse(os.path.exists(self.daemon_path("dns")))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"]["domain"], "user")
-
     # 2/13: the command is always exec'd, exactly like nix-config's `exec ${command}`.
     def test_command_is_execed_like_nix(self):
         for command in ("/opt/bin/srv --port 1", "FOO=1 srv", "myfunc"):
@@ -896,13 +1013,10 @@ class ReviewRegressionTest(LaunchdTestBase):
         self.assertEqual(self.diff(secret), [])
 
     def test_secret_daemon_installed_0600(self):
-        raw = {
-            **self.cfg({"d": {"command": "x", "domain": "system", "secrets": True}}),
-            "sudo": True,
-        }
+        raw = self.cfg(daemons={"d": {"command": "x", "secrets": True}})
         self.assertTrue(self.deploy(raw))
         install = [c for c in self.fake.calls if "/usr/bin/install" in c and "-S" in c][0]
-        self.assertEqual(install[4:6], ["-m", "0600"])
+        self.assertEqual(install[2:4], ["-m", "0600"])
 
     # 5: nothing is created under an unmounted volume.
     def test_logs_not_created_on_unmounted_volume(self):
@@ -963,16 +1077,15 @@ class ReviewRegressionTest(LaunchdTestBase):
         self.assertNotIn("org.example.web", self.state["launchd"]["services"])
         self.assertEqual(self.diff(raw), ["  ~ disable user/org.example.web"])
 
-    def test_adopted_daemon_not_recorded_without_privilege(self):
-        raw = {
-            **self.cfg({"d": {"command": "x", "domain": "system", "disabled": True}}),
-            "sudo": True,
-        }
+    def test_daemon_not_adopted_as_user(self):
+        raw = self.cfg(daemons={"d": {"command": "x", "disabled": True}})
         self.deploy(raw)
         self.fake.disabled.discard("org.example.d")
         self.state = {}
-        self.assertFalse(self.deploy({**raw, "sudo": False}))
+        self.as_user()
+        self.assertTrue(self.deploy(raw))
         self.assertEqual(self.state["launchd"]["services"], {})
+        self.assertNotIn("org.example.d", self.fake.disabled)
 
     # 9: restartOn still fires when restartOnChange is false and the plist changed too.
     def test_restart_on_honoured_with_restart_on_change_false(self):
@@ -1022,9 +1135,9 @@ class ReviewRegressionTest(LaunchdTestBase):
 
 
 class RoundThreeTest(LaunchdTestBase):
-    def daemon_cfg(self, sudo=True, **extra):
-        svc = {"command": "dnsmasq -k", "domain": "system", **extra}
-        return {**self.cfg({"dns": svc}), "sudo": sudo}
+    def daemon_cfg(self, root=True, **extra):
+        svc = {"command": "dnsmasq -k", **extra}
+        return self.cfg(daemons={"dns": svc}, root=root)
 
     def lock(self, path):
         """Make path unreadable to tools (a root-owned 0600 plist) without changing its mode."""
@@ -1036,73 +1149,42 @@ class RoundThreeTest(LaunchdTestBase):
         patcher = mock.patch.object(launchd, "read_plist", side_effect=read)
         patcher.start()
         self.addCleanup(patcher.stop)
-        real_run = self.fake.run
 
-        def run(cmd):
-            if "/usr/bin/plutil" in cmd and cmd[0] != launchd.SUDO:
-                return 1, "", "Permission denied"
-            return real_run(cmd)
-
-        self.env.run = run
-
-    # 11: a root-only plist is read through gated `sudo -n plutil`, never rewritten blindly.
-    def test_unreadable_daemon_plist_read_via_sudo(self):
-        raw = self.daemon_cfg(secrets=True)
-        self.deploy(raw)
-        self.lock(self.daemon_path("dns"))
-        self.fake.calls.clear()
-
-        self.assertEqual(self.diff(raw), [])
-        self.assertTrue(self.deploy(raw))
-        self.assertEqual(self.fake.verbs("bootout") + self.fake.verbs("bootstrap"), [])
-        self.assertTrue(
-            any(c[:3] == [launchd.SUDO, "-n", "/usr/bin/plutil"] for c in self.fake.calls)
-        )
-
-    def test_unreadable_plist_without_sudo_is_unknown_and_untouched(self):
+    # 11: an unreadable plist is unknown, never rewritten blindly or read with escalation.
+    def test_unreadable_plist_is_unknown_and_untouched(self):
         raw = self.daemon_cfg(secrets=True)
         self.deploy(raw)
         before = dict(self.state["launchd"]["services"])
         self.lock(self.daemon_path("dns"))
         self.fake.calls.clear()
-        self.fake.sudo_calls.clear()
+        self.fake.system_calls.clear()
 
-        changes = self.diff(self.daemon_cfg(sudo=False, secrets=True))
+        changes = self.diff(raw)
         self.assertEqual(
             changes,
             [
                 f"  ? org.example.dns: unknown, {self.daemon_path('dns')} unreadable; "
-                "set `launchd.sudo: true` and run `sudo -v` so tools can read it"
+                "check its owner and permissions"
             ],
         )
-        self.deploy(self.daemon_cfg(sudo=False, secrets=True))
+        self.assertFalse(self.deploy(raw))
         self.assertEqual(self.state["launchd"]["services"], before)
-        self.assertEqual(self.fake.sudo_calls, [])
+        self.assertEqual(self.fake.system_calls, [])
 
-    # 12: unreadable is never "modified": removal and domain moves hold, state stays.
+    # 12: unreadable is never "modified": removal holds, state stays.
     def test_unreadable_plist_removal_is_held(self):
         self.deploy(self.daemon_cfg(secrets=True))
         before = dict(self.state["launchd"]["services"])
         self.lock(self.daemon_path("dns"))
-        raw = self.cfg({}, sudo=False)
+        raw = self.cfg({}, root=True)
         self.assertIn("unknown", self.diff(raw)[0])
         self.deploy(raw)
         self.assertEqual(self.state["launchd"]["services"], before)
         self.assertIn("org.example.dns", self.fake.loaded)
 
-    def test_unreadable_plist_domain_move_is_held(self):
-        self.deploy(self.daemon_cfg(secrets=True))
-        before = dict(self.state["launchd"]["services"])
-        self.lock(self.daemon_path("dns"))
-        raw = self.cfg({"dns": {"command": "dnsmasq -k"}}, sudo=False)
-        self.assertIn("unknown", self.diff(raw)[0])
-        self.deploy(raw)
-        self.assertFalse(os.path.exists(self.agent_path("dns")))
-        self.assertEqual(self.state["launchd"]["services"], before)
-
     # 14: `~` in user-domain paths is the login user's home, not root's.
     def test_tilde_uses_login_user_home(self):
-        services = {
+        agents = {
             "u": {
                 "command": "x",
                 "logDir": "~/logs",
@@ -1112,14 +1194,18 @@ class RoundThreeTest(LaunchdTestBase):
                 "keepAlive": {"pathState": {"~/flag": True}},
                 "extraDirs": ["~/d"],
             },
-            "s": {"command": "x", "domain": "system", "workingDirectory": "~/w"},
-            "m": {"command": "x", "domain": "system", "user": "me", "workingDirectory": "~/w"},
+        }
+        daemons = {
+            "s": {"command": "x", "workingDirectory": "~/w"},
+            "m": {"command": "x", "user": "me", "workingDirectory": "~/w"},
         }
         _s, svcs, errors = launchd.parse_launchd(
-            self.cfg(services), home="/Users/someone", login="me"
+            self.cfg(agents, daemons), home="/Users/someone", login="me"
         )
         self.assertEqual(len(errors), 1)
-        self.assertTrue(errors[0].startswith("s: workingDirectory: '~/w' would be expanded"))
+        self.assertTrue(
+            errors[0].startswith("daemons.s: workingDirectory: '~/w' would be expanded")
+        )
         u, sys_svc = {v.name: v for v in svcs}["u"], {v.name: v for v in svcs}["m"]
         self.assertEqual(u.log_dir, "/Users/someone/logs")
         self.assertEqual(u.working_directory, "/Users/someone/w")
@@ -1134,41 +1220,23 @@ class RoundThreeTest(LaunchdTestBase):
         self.deploy(self.cfg({"web": {"command": "srv", "stdoutPath": "~/o.log"}}))
         self.assertEqual(self.read(self.agent_path("web"))["StandardOutPath"], f"{self.tmp}/o.log")
 
-    # 16: a domain move re-enables a label tools had disabled, like removal does.
-    def test_domain_move_reenables_disabled_label(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k", "disabled": True}}))
-        self.assertIn("org.example.dns", self.fake.disabled)
-        self.deploy(self.daemon_cfg())
-        self.assertIn(["/bin/launchctl", "enable", f"gui/{UID}/org.example.dns"], self.fake.calls)
-        self.assertNotIn("org.example.dns", self.fake.disabled)
-
-    # 17: state drops the old job as soon as it is retired, even if the new write fails.
-    def test_state_updated_after_retire_when_new_write_fails(self):
-        self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        self.fake.fail_tools.add("/usr/bin/install")
-        self.assertFalse(self.deploy(self.daemon_cfg()))
-        self.assertFalse(os.path.exists(self.agent_path("dns")))
-        self.assertNotIn("org.example.dns", self.state["launchd"]["services"])
-
-        self.fake.fail_tools.clear()
-        self.assertTrue(self.deploy(self.daemon_cfg()))
-        self.assertEqual(self.state["launchd"]["services"]["org.example.dns"]["domain"], "system")
-
-    # 18: no escalation without `sudo: true`, from any call site.
-    def test_no_sudo_from_log_upkeep_when_not_allowed(self):
+    # 18: as the user nothing touches daemons, from any call site.
+    def test_no_daemon_commands_from_log_upkeep_as_user(self):
         self.deploy(self.daemon_cfg())
         self.fake.calls.clear()
-        self.fake.sudo_calls.clear()
-        self.deploy(self.daemon_cfg(sudo=False))
-        self.assertEqual(self.fake.sudo_calls, [])
+        self.fake.system_calls.clear()
+        self.deploy(self.daemon_cfg(root=False))
+        self.assertEqual(self.fake.system_calls, [])
 
-    def test_gate_refuses_escalation_when_not_allowed(self):
-        rc, _out, err = launchd._run_priv(["/bin/rm", "-f", "/x"], "system", self.env)
-        self.assertEqual(rc, 1)
-        self.assertIn("needs root", err)
-        self.assertEqual(self.fake.calls, [])
-        self.env.allow_sudo = True
-        self.assertEqual(launchd._priv(["/bin/true"], "system", self.env)[:2], [launchd.SUDO, "-n"])
+    def test_gate_refuses_the_other_runs_domain(self):
+        for root, domain, hint in ((False, "system", "sudo tools deploy"),
+                                   (True, "user", "run without sudo")):  # fmt: skip
+            with self.subTest(domain=domain):
+                self.as_root() if root else self.as_user()
+                rc, _out, err = launchd._run_changing(["/bin/rm", "-f", "/x"], domain, self.env)
+                self.assertEqual(rc, 1)
+                self.assertIn(hint, err)
+                self.assertEqual(self.fake.calls, [])
 
     # 19: bootstrap EIO on a launchd-disabled job enables it (only when config wants it on).
     def test_bootstrap_eio_on_disabled_job_enables_and_retries(self):
@@ -1205,24 +1273,21 @@ class StepRecordingTest(LaunchdTestBase):
         self.assertIn("org.example.web", self.state["launchd"]["services"])
 
     def test_adopted_daemon_owner_and_mode_enforced(self):
-        raw = {
-            **self.cfg({"d": {"command": "x", "domain": "system", "secrets": True}}),
-            "sudo": True,
-        }
+        raw = self.cfg(daemons={"d": {"command": "x", "secrets": True}})
         self.deploy(raw)
         os.chmod(self.daemon_path("d"), 0o644)
         self.state = {}
         self.fake.calls.clear()
-        self.fake.sudo_calls.clear()
+        self.fake.system_calls.clear()
         self.assertTrue(self.deploy(raw))
-        reinstall = [c for c in self.fake.sudo_calls if c[:2] == ["/usr/bin/install", "-S"]]
+        reinstall = [c for c in self.fake.system_calls if c[:2] == ["/usr/bin/install", "-S"]]
         self.assertEqual(len(reinstall), 1)
         self.assertEqual(reinstall[0][2:8], ["-m", "0600", "-o", "root", "-g", "wheel"])
         self.assertEqual(reinstall[0][-1], self.daemon_path("d"))
         self.assertEqual(os.stat(self.daemon_path("d")).st_mode & 0o777, 0o600)
         self.assertFalse(
             any(c[0] in ("/bin/chmod", "/usr/sbin/chown") and self.daemon_path("d") in c
-                for c in self.fake.sudo_calls)
+                for c in self.fake.system_calls)
         )  # fmt: skip
 
     # 21: a failed restartOn kickstart is retried as a kickstart, never a reload.
@@ -1285,8 +1350,8 @@ class StepRecordingTest(LaunchdTestBase):
 
 class PrivilegedPathTest(LaunchdTestBase):
     def daemon_cfg(self, **extra):
-        svc = {"command": "x", "domain": "system", **extra}
-        return {**self.cfg({"d": svc}), "sudo": True}
+        svc = {"command": "x", **extra}
+        return self.cfg(daemons={"d": svc}, root=True)
 
     def test_shared_log_path_is_a_config_error(self):
         shared = os.path.join(self.tmp, "shared.log")
@@ -1325,7 +1390,7 @@ class PrivilegedPathTest(LaunchdTestBase):
         self.assertEqual(os.stat(real).st_mode & 0o777, 0o644)
         self.assertNotIn("org.example.web", self.state["launchd"]["services"])
 
-    def test_fix_perms_via_sudo_refuses_symlink(self):
+    def test_fix_perms_as_root_refuses_symlink(self):
         item = launchd.Item(
             svc=launchd.Service(name="d", label="org.example.d", domain="system", command="x"),
             path=os.path.join(self.tmp, "link.plist"),
@@ -1335,7 +1400,7 @@ class PrivilegedPathTest(LaunchdTestBase):
             restart_hashes={},
         )
         os.symlink(os.path.join(self.tmp, "x"), item.path)
-        self.env.allow_sudo = True
+        self.as_root()
         self.assertFalse(launchd._fix_perms(item, self.env))
         self.assertEqual(self.fake.calls, [])
 
@@ -1371,25 +1436,25 @@ class PrivilegedPathTest(LaunchdTestBase):
 
 
 class NoRootTest(LaunchdTestBase):
-    def daemon_cfg(self, sudo=True, **extra):
-        svc = {"command": "dnsmasq -k", "domain": "system", **extra}
-        return {**self.cfg({"dns": svc}), "sudo": sudo}
+    def daemon_cfg(self, root=True, **extra):
+        svc = {"command": "dnsmasq -k", **extra}
+        return self.cfg(daemons={"dns": svc}, root=root)
 
-    def test_refuses_to_run_as_root(self):
+    def test_refuses_root_without_a_user_to_act_for(self):
         raw = self.cfg({"web": {"command": "srv"}})
-        for euid, uid in ((0, UID), (UID, 0)):
-            with self.subTest(euid=euid, uid=uid):
-                self.env.euid, self.env.uid = euid, uid
+        for euid in (0, UID):
+            with self.subTest(euid=euid):
+                self.env.euid, self.env.uid = euid, 0
                 self.assertFalse(self.deploy(raw))
-                self.assertEqual(self.diff(raw), [f"  ! {launchd.ROOT_ERROR}"])
+                self.assertEqual(self.diff(raw), [f"  ! {launchd.runmode.SUDO_USER_ERROR}"])
                 with self.assertRaises(PermissionError):
                     launchd.status_rows(raw, self.state, self.env)
                 self.assertEqual(self.fake.calls, [])
                 self.assertEqual(self.state, {})
                 self.assertFalse(os.path.exists(self.env.agents_dir))
-        self.assertIn("normal user", launchd.ROOT_ERROR)
+        self.assertIn("must not run as root directly", launchd.runmode.SUDO_USER_ERROR)
 
-    def test_sudo_gate_is_always_non_interactive(self):
+    def test_root_runs_only_fixed_tools_directly(self):
         watched = os.path.join(self.tmp, "conf")
         with open(watched, "w") as f:
             f.write("v1")
@@ -1400,33 +1465,31 @@ class NoRootTest(LaunchdTestBase):
         self.deploy(self.daemon_cfg(command="dnsmasq -d"))
         self.deploy(self.daemon_cfg(disabled=True))
         self.deploy(self.daemon_cfg())
-        self.deploy(self.cfg({}, sudo=True))
-        sudo = [c for c in self.fake.calls if c[0] == launchd.SUDO]
-        self.assertTrue(sudo)
-        allowed = {"/usr/bin/install", launchd.LAUNCHCTL, "/bin/rm", "/usr/bin/plutil",
-                   "/usr/sbin/chown", "/bin/mkdir", "/usr/bin/touch",
-                   "/usr/bin/shasum"}  # fmt: skip
-        for c in sudo:
-            self.assertEqual(c[1], "-n", c)
-            self.assertIn(c[2], allowed, c)
-        verbs = {c[3] for c in sudo if c[2] == launchd.LAUNCHCTL}
+        self.deploy(self.cfg({}, root=True))
+        calls = self.fake.system_calls
+        self.assertTrue(calls)
+        allowed = {"/usr/bin/install", launchd.LAUNCHCTL, "/bin/rm", "/usr/sbin/chown",
+                   "/bin/mkdir", "/usr/bin/touch"}  # fmt: skip
+        for c in self.fake.calls:
+            self.assertIn(c[0], allowed, c)
+            self.assertFalse(any("sudo" in arg for arg in c), c)
+        verbs = {c[1] for c in calls if c[0] == launchd.LAUNCHCTL}
         self.assertEqual(verbs, {"bootout", "bootstrap", "kickstart", "disable", "enable"})
-        self.env.allow_sudo = True
-        self.assertEqual(launchd._priv(["/x"], "system", self.env), [launchd.SUDO, "-n", "/x"])
-        self.assertEqual(launchd._priv(["/x"], "user", self.env), ["/x"])
 
-    def test_exact_sudo_argv_for_system_create_and_removal(self):
+    def test_exact_argv_for_system_create_and_removal(self):
         path = self.daemon_path("dns")
         self.assertTrue(self.deploy(self.daemon_cfg()))
-        calls = [list(c) for c in self.fake.sudo_calls]
+        calls = [list(c) for c in self.fake.system_calls]
         tmp = calls[1][8]
-        self.assertFalse(tmp.startswith(self.env.daemons_dir))
+        self.assertEqual(os.path.dirname(tmp), self.env.daemons_dir)
+        self.assertTrue(os.path.basename(tmp).startswith(".tools-"))
+        self.assertFalse(tmp.endswith(".plist"))
         self.assertFalse(os.path.exists(tmp))
         calls[1][8] = "<tmp>"
         self.assertEqual(
             calls,
             [
-                ["/bin/mkdir", "-p", self.env.system_log_dir],
+                ["/bin/mkdir", "-m", "755", self.env.system_log_dir],
                 ["/usr/bin/install", "-S", "-m", "0644", "-o", "root", "-g", "wheel", "<tmp>",
                  path],
                 [launchd.LAUNCHCTL, "bootout", "system/org.example.dns"],
@@ -1434,10 +1497,10 @@ class NoRootTest(LaunchdTestBase):
             ],
         )  # fmt: skip
 
-        self.fake.sudo_calls.clear()
-        self.assertTrue(self.deploy(self.cfg({}, sudo=True)))
+        self.fake.system_calls.clear()
+        self.assertTrue(self.deploy(self.cfg({}, root=True)))
         self.assertEqual(
-            self.fake.sudo_calls,
+            self.fake.system_calls,
             [[launchd.LAUNCHCTL, "bootout", "system/org.example.dns"], ["/bin/rm", "-f", path]],
         )
         self.assertFalse(os.path.exists(path))
@@ -1448,20 +1511,20 @@ class NoRootTest(LaunchdTestBase):
         entry["path"] = "/etc/passwd"
         self.assertEqual(self.diff(self.daemon_cfg()), [])
         self.fake.calls.clear()
-        self.fake.sudo_calls.clear()
+        self.fake.system_calls.clear()
 
-        self.assertTrue(self.deploy(self.cfg({}, sudo=True)))
-        self.assertIn(["/bin/rm", "-f", self.daemon_path("dns")], self.fake.sudo_calls)
+        self.assertTrue(self.deploy(self.cfg({}, root=True)))
+        self.assertIn(["/bin/rm", "-f", self.daemon_path("dns")], self.fake.system_calls)
         self.assertFalse(any("/etc/passwd" in arg for c in self.fake.calls for arg in c))
 
-    def test_tampered_state_domain_never_reaches_sudo_paths(self):
+    def test_tampered_state_domain_never_reaches_daemon_paths(self):
         self.deploy(self.cfg({"web": {"command": "srv"}}))
         entry = self.state["launchd"]["services"]["org.example.web"]
         entry.update(domain="system", path="/etc/passwd")
         self.fake.calls.clear()
-        self.deploy(self.cfg({}, sudo=True))
+        self.deploy(self.cfg({}, root=True))
         self.assertFalse(any("/etc/passwd" in arg for c in self.fake.calls for arg in c))
-        self.assertFalse(any(c[0] == "/bin/rm" for c in self.fake.sudo_calls))
+        self.assertFalse(any(c[0] == "/bin/rm" for c in self.fake.system_calls))
         self.assertTrue(os.path.exists(self.agent_path("web")))
 
         for label, bad in (
@@ -1473,8 +1536,8 @@ class NoRootTest(LaunchdTestBase):
             with self.subTest(label=label):
                 self.state = {"launchd": {"services": {label: bad}}}
                 self.fake.calls.clear()
-                self.assertIn("malformed state entry", self.diff(self.cfg({}, sudo=True))[0])
-                self.assertTrue(self.deploy(self.cfg({}, sudo=True)))
+                self.assertIn("malformed state entry", self.diff(self.cfg({}, root=True))[0])
+                self.assertTrue(self.deploy(self.cfg({}, root=True)))
                 self.assertEqual(self.state["launchd"]["services"], {label: bad})
                 self.assertEqual(self.fake.calls, [])
 
@@ -1502,35 +1565,37 @@ class NoRootTest(LaunchdTestBase):
     def test_daemon_log_dir_created_for_every_daemon(self):
         logs = self.env.system_log_dir
         self.assertTrue(self.deploy(self.daemon_cfg()))
-        self.assertIn(["/bin/mkdir", "-p", logs], self.fake.sudo_calls)
+        self.assertIn(["/bin/mkdir", "-m", "755", logs], self.fake.system_calls)
         self.assertTrue(os.path.isdir(logs))
         self.assertFalse(any(c[0] in ("/usr/bin/touch", "/usr/sbin/chown")
-                             for c in self.fake.sudo_calls))  # fmt: skip
-        self.fake.sudo_calls.clear()
+                             for c in self.fake.system_calls))  # fmt: skip
+        self.fake.system_calls.clear()
         self.deploy(self.daemon_cfg(command="y"))
-        self.assertNotIn(["/bin/mkdir", "-p", logs], self.fake.sudo_calls)
+        self.assertNotIn(["/bin/mkdir", "-m", "755", logs], self.fake.system_calls)
 
     def test_daemon_user_logs_prepared_like_nix(self):
         logs = self.env.system_log_dir
         files = [os.path.join(logs, "dns.log"), os.path.join(logs, "dns.error.log")]
         self.assertTrue(self.deploy(self.daemon_cfg(user="_svc")))
-        log_cmds = [c for c in self.fake.sudo_calls if c[0] != launchd.LAUNCHCTL and "-S" not in c]
+        log_cmds = [
+            c for c in self.fake.system_calls if c[0] != launchd.LAUNCHCTL and "-S" not in c
+        ]
         self.assertEqual(
             log_cmds,
-            [["/bin/mkdir", "-p", logs], ["/usr/bin/touch", "-h", *files],
+            [["/bin/mkdir", "-m", "755", logs], ["/usr/bin/touch", "-h", *files],
              ["/usr/sbin/chown", "-h", "_svc:staff", *files]],
         )  # fmt: skip
-        self.fake.sudo_calls.clear()
+        self.fake.system_calls.clear()
         self.deploy(self.daemon_cfg(user="_svc", group="wheel"))
-        self.assertIn(["/usr/sbin/chown", "-h", "_svc:wheel", *files], self.fake.sudo_calls)
+        self.assertIn(["/usr/sbin/chown", "-h", "_svc:wheel", *files], self.fake.system_calls)
 
         self.tearDown()
         self.setUp()
         self.assertTrue(self.deploy(self.daemon_cfg()))
         self.assertFalse(any(c[0] in ("/usr/bin/touch", "/usr/sbin/chown")
-                             for c in self.fake.sudo_calls))  # fmt: skip
+                             for c in self.fake.system_calls))  # fmt: skip
         _s, svcs, _e = launchd.parse_launchd(self.daemon_cfg(user="-rf"))
-        p = launchd.plan(_s, svcs, {}, launchd._with_sudo(self.env, _s))
+        p = launchd.plan(_s, svcs, {}, self.env)
         self.assertTrue(any("user '-rf'" in e for e in p.errors), p.errors)
 
     def test_daemon_log_paths_must_be_normalized_and_inside_roots(self):
@@ -1558,12 +1623,11 @@ class NoRootTest(LaunchdTestBase):
                     name="dns", label="org.example.dns", domain="system", command="x", **kwargs
                 )
                 self.fake.calls.clear()
-                env = launchd._with_sudo(self.env, launchd.Settings(sudo=True))
-                p = launchd.plan(launchd.Settings(sudo=True), [svc], {}, env)
+                p = launchd.plan(launchd.Settings(), [svc], {}, self.env)
                 self.assertTrue(any("dns:" in e for e in p.errors), p.errors)
                 self.assertEqual(p.create, [])
-                self.assertFalse(launchd.apply(launchd.Settings(sudo=True), p, {}, env))
-                self.assertEqual([c for c in self.fake.calls if c[0] == launchd.SUDO], [])
+                self.assertFalse(launchd.apply(launchd.Settings(), p, {}, self.env))
+                self.assertEqual(self.fake.system_calls, [])
 
     def test_retire_keeps_entry_when_reenable_fails(self):
         self.deploy(self.cfg({"web": {"command": "srv", "disabled": True}}))
@@ -1614,20 +1678,21 @@ class NoRootTest(LaunchdTestBase):
         self.assertEqual(entry["hash"], before_hash)
         self.assertEqual(len(entry["logs"]), 2)
 
-    def test_system_job_without_sudo_is_held_and_never_escalates(self):
+    def test_daemon_changes_as_user_are_left_for_root(self):
         self.deploy(self.daemon_cfg())
         before = dict(self.state["launchd"]["services"])
         with open(self.daemon_path("dns"), "rb") as f:
             plist = f.read()
         self.fake.calls.clear()
-        self.fake.sudo_calls.clear()
+        self.fake.system_calls.clear()
 
-        raw = self.daemon_cfg(sudo=False, command="dnsmasq -d")
-        self.assertIn("needs root", self.diff(raw)[0])
-        self.assertFalse(self.deploy(raw))
-        self.assertFalse(self.deploy(self.cfg({}, sudo=False)))
-        self.assertEqual(self.fake.sudo_calls, [])
-        self.assertFalse(any(c[0] == launchd.SUDO for c in self.fake.calls))
+        raw = self.daemon_cfg(root=False, command="dnsmasq -d")
+        self.assertEqual(
+            self.diff(raw), ["  ? org.example.dns: system job in this state; left alone"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertTrue(self.deploy(self.cfg({}, root=False)))
+        self.assertEqual(self.fake.system_calls, [])
         self.assertEqual(self.state["launchd"]["services"], before)
         with open(self.daemon_path("dns"), "rb") as f:
             self.assertEqual(f.read(), plist)
@@ -1639,7 +1704,7 @@ class NoRootTest(LaunchdTestBase):
                 raw = self.daemon_cfg(**{key: outside})
                 self.assertTrue(any("must be inside" in c for c in self.diff(raw)))
                 self.assertFalse(self.deploy(raw))
-                self.assertEqual(self.fake.sudo_calls, [])
+                self.assertEqual(self.fake.system_calls, [])
                 self.assertFalse(os.path.exists(os.path.join(self.tmp, "users")))
                 self.assertFalse(os.path.exists(self.daemon_path("dns")))
         self.env.system_log_roots = (os.path.join(self.tmp, "users"),)
@@ -1678,9 +1743,9 @@ class NoRootTest(LaunchdTestBase):
 
 
 class StateRobustnessTest(LaunchdTestBase):
-    def daemon_cfg(self, sudo=True, **extra):
-        svc = {"command": "dnsmasq -k", "domain": "system", **extra}
-        return {**self.cfg({"dns": svc}), "sudo": sudo}
+    def daemon_cfg(self, root=True, **extra):
+        svc = {"command": "dnsmasq -k", **extra}
+        return self.cfg(daemons={"dns": svc}, root=root)
 
     def test_non_mapping_launchd_state_is_left_alone(self):
         raw = self.cfg({"web": {"command": "srv"}})
@@ -1707,8 +1772,8 @@ class StateRobustnessTest(LaunchdTestBase):
             ),
             mock.patch.object(launchd, "log") as log,
         ):  # fmt: skip
-            self.assertFalse(self.deploy(self.daemon_cfg(sudo=False, secrets=True)))
-        self.assertTrue(any("sudo -v" in c.args[0] for c in log.call_args_list))
+            self.assertFalse(self.deploy(self.daemon_cfg(secrets=True)))
+        self.assertTrue(any("check its owner" in c.args[0] for c in log.call_args_list))
 
     def test_never_written_entry_adopts_identical_plist(self):
         raw = self.cfg({"web": {"command": "srv"}})
@@ -1747,7 +1812,7 @@ class StateRobustnessTest(LaunchdTestBase):
 
         self.state = {"launchd": {"services": {"org.example.web": dict(entry)}}}
         self.fake.calls.clear()
-        raw = {**self.cfg({"web": {"command": "srv", "domain": "system"}}), "sudo": True}
+        raw = self.cfg(daemons={"web": {"command": "srv"}}, root=True)
         self.assertTrue(self.deploy(raw))
         self.assertNotIn([launchd.LAUNCHCTL, "bootout", f"gui/{UID}/org.example.web"],
                          self.fake.calls)  # fmt: skip
@@ -1765,7 +1830,7 @@ class StateRobustnessTest(LaunchdTestBase):
 
         self.deploy(self.cfg({"web": {"command": "srv", "disabled": True}}))
         os.remove(self.agent_path("web"))
-        raw = {**self.cfg({"web": {"command": "srv", "domain": "system"}}), "sudo": True}
+        raw = self.cfg(daemons={"web": {"command": "srv"}}, root=True)
         self.assertTrue(self.deploy(raw))
         self.assertIn([launchd.LAUNCHCTL, "enable", f"gui/{UID}/org.example.web"], self.fake.calls)
         self.assertNotIn("org.example.web", self.fake.disabled)
@@ -1793,13 +1858,13 @@ class ParityReviewTest(LaunchdTestBase):
         ):
             with self.subTest(svc):
                 _s, svcs, errors = launchd.parse_launchd(
-                    self.cfg({"d": {"command": "x", "domain": "system", **svc}})
+                    self.cfg(daemons={"d": {"command": "x", **svc}})
                 )
                 self.assertEqual(svcs, [])
                 self.assertIn("not both", errors[0])
         direct = launchd.Service(name="d", label="org.example.d", domain="system", command="x",
                                  user="_a", extra_service_config={"UserName": "_b"})  # fmt: skip
-        p = launchd.plan(launchd.Settings(sudo=True), [direct], {}, self.env)
+        p = launchd.plan(launchd.Settings(), [direct], {}, self.env)
         self.assertTrue(any("both set" in e for e in p.errors), p.errors)
 
     def test_section_error_holds_every_change(self):
@@ -1807,11 +1872,11 @@ class ParityReviewTest(LaunchdTestBase):
         self.deploy(self.cfg({"web": {"command": "srv"}, "old": {"command": "x"}}, logDir=logdir))
         before = self.read(self.agent_path("web"))
         self.fake.calls.clear()
-        raw = self.cfg({"web": {"command": "srv2"}}, logDir=logdir, sudo="yes")
+        raw = self.cfg({"web": {"command": "srv2"}}, logDir=logdir, bash="relative/bash")
         _s, _svcs, errors = launchd.parse_launchd(raw)
         self.assertEqual(len(errors), 1)
         self.assertEqual(_s.log_dir, logdir)
-        self.assertTrue(self.diff(raw)[0].startswith("  ! sudo must be true or false"))
+        self.assertTrue(self.diff(raw)[0].startswith("  ! bash: 'relative/bash' must be absolute"))
         self.assertEqual(len(self.diff(raw)), 1)
         self.assertFalse(self.deploy(raw))
         self.assertEqual(self.read(self.agent_path("web")), before)
@@ -1831,18 +1896,18 @@ class ParityReviewTest(LaunchdTestBase):
 
         user_bash = os.path.join(self.tmp, "bash")
         open(user_bash, "w").close()
-        raw = {**self.cfg({"d": {"command": "x", "domain": "system"}}), "sudo": True,
+        self.user_owned.add(user_bash)
+        raw = {**self.cfg(daemons={"d": {"command": "x"}}, root=True),
                "bash": user_bash}  # fmt: skip
         self.assertTrue(any("must be root-owned" in c for c in self.diff(raw)))
         self.assertFalse(self.deploy(raw))
-        self.assertEqual(self.fake.sudo_calls, [])
+        self.assertEqual(self.fake.system_calls, [])
         agent = self.cfg({"a": {"command": "x"}}, bash=user_bash)
         self.assertTrue(self.deploy(agent))
 
-        root = SimpleNamespace(st_uid=0, st_mode=0o100755)
-        self.env.stat = self.env.lstat = lambda _p: root
+        self.user_owned.discard(user_bash)
         self.assertTrue(self.deploy(raw))
-        self.env.stat = self.env.lstat = lambda _p: SimpleNamespace(st_uid=0, st_mode=0o100775)
+        self.writable.add(user_bash)
         self.assertTrue(any("must be root-owned" in c for c in self.diff(raw)))
 
     def test_daemon_bash_symlink_must_be_root_owned_and_plist_gets_target(self):
@@ -1857,7 +1922,7 @@ class ParityReviewTest(LaunchdTestBase):
 
         self.env.stat = lambda _p: root
         self.env.lstat = lstat
-        raw = {**self.cfg({"d": {"command": "x", "domain": "system"}}), "sudo": True,
+        raw = {**self.cfg(daemons={"d": {"command": "x"}}, root=True),
                "bash": link}  # fmt: skip
         self.assertTrue(any("must be root-owned" in c for c in self.diff(raw)))
         self.assertFalse(self.deploy(raw))
@@ -1907,17 +1972,16 @@ class ParityReviewTest(LaunchdTestBase):
         self.assertIn(f"/bin/mkdir -p {logs}\n", script)
 
     def test_extra_service_config_log_paths_are_checked(self):
-        raw = {**self.cfg({"d": {"domain": "system", "command": "srv",
-                                 "extraServiceConfig": {"StandardOutPath": "/etc/evil"}}}),
-               "sudo": True}  # fmt: skip
+        svc = {"command": "srv", "extraServiceConfig": {"StandardOutPath": "/etc/evil"}}
+        raw = self.cfg(daemons={"d": svc})
         self.assertTrue(any("/etc/evil" in c for c in self.diff(raw)))
         self.assertFalse(self.deploy(raw))
         self.assertFalse(os.path.exists(self.daemon_path("d")))
-        self.assertEqual(self.fake.sudo_calls, [])
+        self.assertEqual(self.fake.system_calls, [])
 
         ok = os.path.join(self.env.system_log_dir, "d.out")
         _s, svcs, _e = launchd.parse_launchd(
-            self.cfg({"d": {"domain": "system", "command": "srv",
+            self.cfg(daemons={"d": {"command": "srv",
                             "extraServiceConfig": {"StandardOutPath": ok}}})
         )  # fmt: skip
         self.assertEqual((svcs[0].stdout_path, svcs[0].extra_service_config), (ok, {}))
@@ -1930,7 +1994,7 @@ class ParityReviewTest(LaunchdTestBase):
             command="x",
             extra_service_config=extra,
         )
-        p = launchd.plan(launchd.Settings(sudo=True), [direct], {}, self.env)
+        p = launchd.plan(launchd.Settings(), [direct], {}, self.env)
         self.assertTrue(any("/etc/evil" in e for e in p.errors), p.errors)
 
     def test_extra_dirs_mode_range(self):
@@ -1941,11 +2005,13 @@ class ParityReviewTest(LaunchdTestBase):
                 )
                 self.assertEqual(svcs, [])
                 self.assertIn("between 0000 and 7777", errors[0])
-        root_daemon = {"command": "srv", "domain": "system"}
         _s, svcs, errors = launchd.parse_launchd(
-            self.cfg({"x": {**root_daemon, "extraDirs": [{"path": "/d", "mode": "7777"}]}})
+            self.cfg(
+                daemons={"x": {"command": "srv", "extraDirs": [{"path": "/d", "mode": "7777"}]}}
+            )
         )
         self.assertEqual(errors, [])
+        self.as_user()
         direct = launchd.Service(name="x", label="org.example.x", command="srv",
                                  extra_dirs=[launchd.ExtraDir("/d", 0o77777)])  # fmt: skip
         p = launchd.plan(launchd.Settings(), [direct], {}, self.env)
@@ -1954,8 +2020,8 @@ class ParityReviewTest(LaunchdTestBase):
 
 class SignOffTest(LaunchdTestBase):
     def daemon_cfg(self, **extra):
-        svc = {"command": "x", "domain": "system", **extra}
-        return {**self.cfg({"d": svc}), "sudo": True}
+        svc = {"command": "x", **extra}
+        return self.cfg(daemons={"d": svc}, root=True)
 
     def test_working_directory_created_before_bootstrap(self):
         wd = os.path.join(self.tmp, "work")
@@ -1974,12 +2040,12 @@ class SignOffTest(LaunchdTestBase):
         dwd = os.path.join(self.tmp, "dwork")
         self.env.system_dir_roots = (self.tmp,)
         self.assertTrue(self.deploy(self.daemon_cfg(extraServiceConfig={"WorkingDirectory": dwd})))
-        self.assertIn(["/bin/mkdir", "-p", dwd], self.fake.sudo_calls)
+        self.assertIn(["/bin/mkdir", "-m", "755", dwd], self.fake.system_calls)
         self.assertEqual(self.read(self.daemon_path("d"))["WorkingDirectory"], dwd)
 
         direct = launchd.Service(name="d", label="org.example.d", domain="system", command="x",
                                  working_directory="/a/../b")  # fmt: skip
-        p = launchd.plan(launchd.Settings(sudo=True), [direct], {}, self.env)
+        p = launchd.plan(launchd.Settings(), [direct], {}, self.env)
         self.assertTrue(any("workingDirectory" in e for e in p.errors), p.errors)
 
     def test_bad_state_field_types_are_malformed_entries(self):
@@ -2053,42 +2119,103 @@ class SignOffTest(LaunchdTestBase):
         os.symlink(target, os.path.join(logs, "d.log"))
         self.assertTrue(self.deploy(self.daemon_cfg(user="_svc")))
         err = os.path.join(logs, "d.error.log")
-        self.assertIn(["/usr/bin/touch", "-h", err], self.fake.sudo_calls)
-        self.assertIn(["/usr/sbin/chown", "-h", "_svc:staff", err], self.fake.sudo_calls)
-        self.assertFalse(any(os.path.join(logs, "d.log") in c for c in self.fake.sudo_calls))
+        self.assertIn(["/usr/bin/touch", "-h", err], self.fake.system_calls)
+        self.assertIn(["/usr/sbin/chown", "-h", "_svc:staff", err], self.fake.system_calls)
+        self.assertFalse(any(os.path.join(logs, "d.log") in c for c in self.fake.system_calls))
 
         self.tearDown()
         self.setUp()
         os.makedirs(os.path.join(self.tmp, "real"))
         os.symlink(os.path.join(self.tmp, "real"), self.env.system_log_dir)
-        self.assertTrue(self.deploy(self.daemon_cfg(user="_svc")))
-        self.assertFalse(any(c[0] in ("/usr/bin/touch", "/usr/sbin/chown", "/bin/mkdir")
-                             for c in self.fake.sudo_calls))  # fmt: skip
+        self.user_owned.add(self.env.system_log_dir)
+        self.assertIn("not root-only", " ".join(self.diff(self.daemon_cfg(user="_svc"))))
+        self.assertFalse(self.deploy(self.daemon_cfg(user="_svc")))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_user_owned_log_parent_is_refused(self):
+        parent = os.path.join(self.tmp, "tmplog")
+        os.makedirs(parent)
+        self.user_owned.add(parent)
+        logs = os.path.join(parent, "launchd")
+        raw = self.daemon_cfg(logDir=logs)
+        self.env.system_log_roots = (parent,)
+        self.assertIn(
+            f"  ! d: log dir {logs}: {parent} is not root-only "
+            "(root-owned, not group/world-writable)",
+            self.diff(raw),
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertFalse(os.path.exists(logs))
+
+    def test_world_writable_ancestor_is_refused(self):
+        sticky = os.path.join(self.tmp, "tmp")
+        os.makedirs(sticky)
+        self.writable.add(sticky)
+        self.env.system_log_dir = os.path.join(sticky, "log", "launchd")
+        self.assertFalse(self.deploy(self.daemon_cfg()))
+        self.assertFalse(os.path.exists(os.path.join(sticky, "log")))
+
+    def test_log_dir_swapped_after_planning_is_refused_at_apply(self):
+        raw = self.daemon_cfg()
+        _s, svcs, _e = launchd.parse_launchd(raw, self.env.home)
+        p = launchd.plan(_s, svcs, {}, self.env)
+        self.assertEqual(len(p.create), 1)
+        os.makedirs(os.path.join(self.tmp, "victim"))
+        os.symlink(os.path.join(self.tmp, "victim"), self.env.system_log_dir)
+        self.user_owned.add(self.env.system_log_dir)
+        self.assertFalse(launchd.apply(_s, p, self.state, self.env))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_mkdir_result_must_be_a_root_only_dir(self):
+        logs = self.env.system_log_dir
+        real = self.fake.run
+
+        def run(cmd):
+            out = real(cmd)
+            if cmd[0] == "/bin/mkdir" and cmd[-1] == logs:
+                self.user_owned.add(logs)
+            return out
+
+        self.env.run = run
+        self.assertFalse(self.deploy(self.daemon_cfg()))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_default_daemon_log_dir_is_root_only(self):
+        env = launchd.Env(uid=UID, home=self.tmp)
+        self.assertEqual(env.system_log_dir, "/var/log/tools/launchd")
+        self.assertFalse(any(r.startswith(("/tmp", "/private/tmp")) for r in env.system_log_roots))
+        if sys.platform == "darwin":
+            self.assertIsNone(launchd.root_dir_error(env.system_log_dir, env))
+        self.assertIsNotNone(launchd.root_dir_error("/tmp/log/launchd", env))
 
 
 class OpenBugsTest(LaunchdTestBase):
-    def daemon_cfg(self, sudo=True, **extra):
-        svc = {"command": "x", "domain": "system", **extra}
-        return {**self.cfg({"d": svc}), "sudo": sudo}
+    def daemon_cfg(self, root=True, **extra):
+        svc = {"command": "x", **extra}
+        return self.cfg(daemons={"d": svc}, root=root)
 
     def script(self, raw):
         settings, svcs, errors = launchd.parse_launchd(raw, self.env.home)
         self.assertEqual(errors, [])
         return launchd.desired_plist(svcs[0], settings, self.env)["ProgramArguments"][2]
 
-    def test_non_mapping_services_hold_every_removal(self):
+    def test_non_mapping_jobs_hold_every_removal(self):
         self.deploy(self.cfg({"web": {"command": "srv"}}))
         self.fake.calls.clear()
-        for bad in ([], False, "", 0, ["web"]):
-            with self.subTest(bad=bad):
-                raw = self.cfg(bad)
-                self.assertTrue(launchd.has_work(raw, {}))
-                changes = self.diff(raw)
-                self.assertIn("  ! services must be a mapping of name -> service", changes)
-                self.assertFalse(any(c.startswith("  - remove") for c in changes), changes)
-                self.assertFalse(self.deploy(raw))
-                self.assertTrue(os.path.exists(self.agent_path("web")))
-                self.assertIn("org.example.web", self.state["launchd"]["services"])
+        for group in ("agents", "daemons"):
+            for bad in ([], False, "", 0, ["web"]):
+                with self.subTest(group=group, bad=bad):
+                    raw = {**self.cfg(), group: bad}
+                    self.assertTrue(launchd.has_work(raw, {}))
+                    changes = self.diff(raw)
+                    self.assertIn(f"  ! {group} must be a mapping of name -> job", changes)
+                    self.assertFalse(any(c.startswith("  - remove") for c in changes), changes)
+                    self.assertFalse(self.deploy(raw))
+                    self.assertTrue(os.path.exists(self.agent_path("web")))
+                    self.assertIn("org.example.web", self.state["launchd"]["services"])
         self.assertEqual(self.fake.verbs("bootout"), [])
         self.assertTrue(self.deploy(self.cfg(None)))
         self.assertFalse(os.path.exists(self.agent_path("web")))
@@ -2121,28 +2248,29 @@ class OpenBugsTest(LaunchdTestBase):
         rejected = {
             "agent": {"command": "x", "extraDirs": [entry]},
             "agent-mode": {"command": "x", "extraDirs": [{"path": "/srv/d", "mode": "0700"}]},
-            "user": {"command": "x", "domain": "system", "user": "_www", "extraDirs": [entry]},
+            "user": {"command": "x", "user": "_www", "extraDirs": [entry]},
             "extra-user": {
                 "command": "x",
-                "domain": "system",
                 "extraServiceConfig": {"UserName": "_www"},
                 "extraDirs": [{"path": "/srv/d", "owner": "svc"}],
             },
         }
         for name, svc in rejected.items():
             with self.subTest(name):
-                _s, svcs, errors = launchd.parse_launchd(self.cfg({name: svc}))
+                group = "agents" if name.startswith("agent") else "daemons"
+                _s, svcs, errors = launchd.parse_launchd(self.cfg(**{group: {name: svc}}))
                 self.assertEqual(svcs, [])
                 self.assertIn("root daemon", errors[0])
         for user in ({}, {"user": "root"}):
             _s, svcs, errors = launchd.parse_launchd(
-                self.cfg({"r": {"command": "x", "domain": "system", "extraDirs": [entry], **user}})
+                self.cfg(daemons={"r": {"command": "x", "extraDirs": [entry], **user}})
             )
             self.assertEqual(errors, [])
         _s, svcs, errors = launchd.parse_launchd(
             self.cfg({"a": {"command": "x", "extraDirs": ["/srv/plain"]}})
         )
         self.assertEqual(errors, [])
+        self.as_user()
         direct = launchd.Service(name="x", label="org.example.x", command="srv",
                                  extra_dirs=[launchd.ExtraDir("/d", owner="me")])  # fmt: skip
         p = launchd.plan(launchd.Settings(), [direct], {}, self.env)
@@ -2199,7 +2327,7 @@ class OpenBugsTest(LaunchdTestBase):
         for account in ({"user": "_www"}, {}, {"extraServiceConfig": {"UserName": "_www"}}):
             for key, value in fields.items():
                 with self.subTest(account=account, key=key):
-                    svc = {"command": "x", "domain": "system", key: value}
+                    svc = {"command": "x", key: value}
                     if "extraServiceConfig" in account:
                         svc["extraServiceConfig"] = {
                             **svc.get("extraServiceConfig", {}),
@@ -2207,22 +2335,23 @@ class OpenBugsTest(LaunchdTestBase):
                         }
                     else:
                         svc.update(account)
-                    _s, svcs, errors = launchd.parse_launchd(self.cfg({"d": svc}), "/Users/me")
+                    _s, svcs, errors = launchd.parse_launchd(
+                        self.cfg(daemons={"d": svc}), "/Users/me"
+                    )
                     self.assertEqual(svcs, [])
                     self.assertIn("expanded at deploy", errors[0])
         _s, svcs, errors = launchd.parse_launchd(
             self.cfg(
-                {"d": {"command": "x", "domain": "system", "user": "_www"}}, logDir="$HOME/logs"
+                daemons={"d": {"command": "x", "user": "_www"}}, logDir="$HOME/logs"
             ),  # fmt: skip
             "/Users/me",
         )
         self.assertTrue(errors and "expanded at deploy" in errors[0], errors)
         _s, svcs, errors = launchd.parse_launchd(
             self.cfg(
-                {
+                daemons={
                     "d": {
                         "command": "x",
-                        "domain": "system",
                         "user": login,
                         "workingDirectory": "~/w",
                     }
@@ -2233,6 +2362,44 @@ class OpenBugsTest(LaunchdTestBase):
         self.assertEqual(errors, [])
         self.assertEqual(svcs[0].working_directory, "/Users/me/w")
 
+    def test_failed_workdir_mkdir_fails_the_job_before_its_plist(self):
+        allowed = os.path.join(self.tmp, "varlib")
+        os.makedirs(allowed)
+        os.makedirs(self.env.system_log_dir)
+        self.env.system_dir_roots = (allowed,)
+        wd = os.path.join(allowed, "svc", "w")
+        raw = self.daemon_cfg(workingDirectory=wd)
+        self.assertEqual(
+            self.diff(raw), [f"  + create system/org.example.d -> {self.daemon_path('d')}"]
+        )
+        self.fake.fail_tools.add("/bin/mkdir")
+        self.assertFalse(self.deploy(raw))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+        self.assertEqual(self.fake.verbs("bootout") + self.fake.verbs("bootstrap"), [])
+        self.assertNotIn("hash", self.state["launchd"]["services"].get("org.example.d", {}) or {})
+
+        self.fake.fail_tools.clear()
+        self.assertTrue(self.deploy(self.daemon_cfg(workingDirectory=wd, disabled=True)))
+
+    def test_workdir_under_a_user_owned_root_is_blocked_in_plan(self):
+        allowed = os.path.join(self.tmp, "homebrew-var")
+        os.makedirs(allowed)
+        self.user_owned.add(allowed)
+        self.env.system_dir_roots = (allowed,)
+        wd = os.path.join(allowed, "svc")
+        changes = self.diff(self.daemon_cfg(workingDirectory=wd))
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(changes[0].startswith("  ! skip org.example.d: workingDirectory"), changes)
+        self.assertIn(f"{allowed} is not root-only", changes[0])
+        self.deploy(self.daemon_cfg(workingDirectory=wd))
+        self.assertFalse(os.path.exists(wd))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_homebrew_var_is_not_a_default_workdir_root(self):
+        roots = launchd.Env(uid=UID, home=self.tmp).system_dir_roots
+        self.assertNotIn("/opt/homebrew/var", roots)
+        self.assertNotIn("/usr/local/var", roots)
+
     def test_daemon_working_directory_created_only_under_allowed_roots(self):
         allowed = os.path.join(self.tmp, "varlib")
         os.makedirs(allowed)
@@ -2241,7 +2408,7 @@ class OpenBugsTest(LaunchdTestBase):
         changes = self.diff(self.daemon_cfg(workingDirectory=outside))
         self.assertTrue(any("workingDirectory" in c and c.startswith("  ! skip") for c in changes))
         self.deploy(self.daemon_cfg(workingDirectory=outside))
-        self.assertFalse(any(c[0] == "/bin/mkdir" and outside in c for c in self.fake.sudo_calls))
+        self.assertFalse(any(c[0] == "/bin/mkdir" and outside in c for c in self.fake.system_calls))
         self.assertFalse(os.path.exists(outside))
         self.assertFalse(os.path.exists(self.daemon_path("d")))
 
@@ -2253,7 +2420,7 @@ class OpenBugsTest(LaunchdTestBase):
 
         inside = os.path.join(allowed, "svc", "w")
         self.assertTrue(self.deploy(self.daemon_cfg(workingDirectory=inside)))
-        self.assertIn(["/bin/mkdir", "-p", inside], self.fake.sudo_calls)
+        self.assertIn(["/bin/mkdir", "-m", "755", inside], self.fake.system_calls)
 
         existing = os.path.join(self.tmp, "exists")
         os.makedirs(existing)
@@ -2274,35 +2441,15 @@ class OpenBugsTest(LaunchdTestBase):
         self.assertIn("org.example.d", self.fake.loaded)
         os.rmdir(wd)
         raw = self.daemon_cfg(workingDirectory=wd, disabled=True)
-        self.assertEqual(self.diff(raw), ["  ~ disable system/org.example.d (sudo)"])
+        self.assertEqual(self.diff(raw), ["  ~ disable system/org.example.d"])
         self.assertTrue(self.deploy(raw))
         self.assertNotIn("org.example.d", self.fake.loaded)
         self.assertIn("org.example.d", self.fake.disabled)
-        self.assertFalse(any(c[0] == "/bin/mkdir" and wd in c for c in self.fake.sudo_calls))
-
-    def test_workdir_root_can_reach_is_not_missing(self):
-        self.env.system_dir_roots = (os.path.join(self.tmp, "varlib"),)
-        locked = os.path.join(self.tmp, "locked")
-        wd = os.path.join(locked, "w")
-        os.makedirs(wd)
-        os.chmod(locked, 0)
-        try:
-            self.fake.root_dirs.add(wd)
-            raw = self.daemon_cfg(workingDirectory=wd)
-            self.assertEqual(
-                self.diff(raw),
-                [f"  + create system/org.example.d (sudo) -> {self.daemon_path('d')}"],
-            )
-            self.assertTrue(self.deploy(raw))
-        finally:
-            os.chmod(locked, 0o755)
-        self.assertIn(["/bin/test", "-d", wd], self.fake.sudo_calls)
-        self.assertFalse(any(c[0] == "/bin/mkdir" and wd in c for c in self.fake.sudo_calls))
-        self.assertIn("org.example.d", self.fake.loaded)
+        self.assertFalse(any(c[0] == "/bin/mkdir" and wd in c for c in self.fake.system_calls))
 
     def test_status_rows_keep_both_domains_during_a_move(self):
         self.deploy(self.cfg({"dns": {"command": "dnsmasq -k"}}))
-        raw = self.cfg({"dns": {"command": "dnsmasq -k", "domain": "system"}})
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}})
         rows = launchd.status_rows(raw, self.state, self.env)
         self.assertEqual(
             [(label, domain, st.loaded) for label, domain, st in rows],
@@ -2343,7 +2490,7 @@ class CliGatingTest(unittest.TestCase):
         self._deploy({}, state).assert_called_once()
 
     def test_runs_when_configured(self):
-        self._deploy({"launchd": {"services": {"x": {"command": "y"}}}}, {}).assert_called_once()
+        self._deploy({"launchd": {"agents": {"x": {"command": "y"}}}}, {}).assert_called_once()
 
 
 class CliStatusTest(unittest.TestCase):
@@ -2365,15 +2512,17 @@ class CliStatusTest(unittest.TestCase):
         self.assertIn("system/org.example.b: not loaded", result.output)
         save.assert_not_called()
 
-    def test_status_as_root_exits_nonzero(self):
+    def test_status_as_root_reads_only_the_root_state(self):
         with (
-            mock.patch.object(cli, "_load_merged_config", return_value={}),
-            mock.patch.object(cli, "load_json", return_value={}),
-            mock.patch.object(cli, "status_rows", side_effect=PermissionError(launchd.ROOT_ERROR)),
+            mock.patch.object(cli, "_invoker", return_value=SimpleNamespace(root=True)),
+            mock.patch.object(cli, "_load_merged_config", return_value={"stateFile": "/u/s.json"}),
+            mock.patch.object(cli.runmode, "ROOT_STATE_FILE", "/root/state.json"),
+            mock.patch.object(cli, "load_json", return_value={}) as load,
+            mock.patch.object(cli, "status_rows", return_value=[]),
         ):
             result = CliRunner().invoke(cli.main, ["status"])
-        self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("normal user", result.output)
+        self.assertEqual(result.exit_code, 0, result.output)
+        load.assert_called_once_with("/root/state.json")
 
 
 if __name__ == "__main__":

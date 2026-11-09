@@ -4,6 +4,7 @@ import time
 
 import click
 
+from tools import runmode
 from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
@@ -87,18 +88,63 @@ def _load_merged_config(config_paths: list[str]) -> dict:
         sys.exit(1)
 
 
+def _invoker() -> runmode.Invoker:
+    """Who this run acts for; as root, also points `~` and $HOME at SUDO_USER's home."""
+    try:
+        inv = runmode.invoker()
+    except runmode.RootModeError as exc:
+        log(str(exc), Color.RED)
+        sys.exit(1)
+    runmode.act_as(inv)
+    return inv
+
+
+def _root_scope(scope: tuple[str, ...]) -> tuple[str, ...]:
+    """As root only system work runs: the root-capable sections in scope, or all of them."""
+    user_only = [s for s in scope if s not in runmode.ROOT_SECTIONS]
+    if user_only:
+        for section in user_only:
+            log(f"{section} is user-only; run without sudo", Color.RED)
+        sys.exit(1)
+    if scope:
+        return scope
+    log(
+        f"Running as root: only {', '.join(runmode.ROOT_SECTIONS)} (system scope); "
+        "run without sudo for the rest",
+        Color.BLUE,
+    )
+    return runmode.ROOT_SECTIONS
+
+
+def _refuse_root(command: str) -> None:
+    if os.geteuid() == 0:
+        log(f"{command} does not run as root; run it as your normal user", Color.RED)
+        sys.exit(1)
+
+
 def _deploy(
-    config: dict, config_dir: str, scope: tuple[str, ...] = (), update: bool = False
+    config: dict,
+    config_dir: str,
+    scope: tuple[str, ...] = (),
+    update: bool = False,
+    root: bool = False,
 ) -> bool:
     """Apply config to bring system to desired state. Returns True on success.
 
     Already-installed items are only upgraded (pulled, refetched) with ``update``.
+    As root (``root``) only system sections run, against the root-owned state file.
     """
-    # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
-    # crash expanduser — and it must resolve identically to show_diff.
-    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
-    migrate_state_file(state_file)
-    state = migrate_state_schema(load_json(state_file))
+    if root:
+        state_file = runmode.ROOT_STATE_FILE
+        state = migrate_state_schema(load_json(state_file))
+    else:
+        # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
+        # crash expanduser — and it must resolve identically to show_diff.
+        state_file = os.path.expanduser(
+            config.get("stateFile") or "~/.local/state/tools/state.json"
+        )
+        migrate_state_file(state_file)
+        state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
 
@@ -110,18 +156,42 @@ def _deploy(
     # section crashes. Without it, packages installed earlier in the same run
     # become permanently unowned.
     try:
-        success = _run_sections(
-            config,
-            config_dir,
-            state,
-            paths,
-            active,
-            lambda: save_json(state_file, state),
-            state_file,
-            update,
-        )
+        persist = lambda: save_json(state_file, state)  # noqa: E731
+        if root:
+            success = _run_root_sections(config, state, active, persist)
+        else:
+            success = _run_sections(
+                config,
+                config_dir,
+                state,
+                paths,
+                active,
+                persist,
+                state_file,
+                update,
+            )
     finally:
         save_json(state_file, state)
+    return success
+
+
+def _run_root_sections(config: dict, state: dict, active: set, persist=lambda: None) -> bool:
+    """Root mode: launchd daemons and system-scope defaults; nothing in user space."""
+    success = True
+    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+        success &= install_launchd(
+            config.get("launchd"),
+            state,
+            **sops_section.secrets_dir_kwargs(config.get("sops")),
+        )
+    restarts: list = []
+    try:
+        if "defaults" in active and defaults_has_work(config.get("defaults"), state):
+            success &= install_defaults(
+                config.get("defaults"), state, restarts=restarts, persist=persist
+            )
+    finally:
+        run_restarts(restarts)
     return success
 
 
@@ -342,6 +412,7 @@ def _run_sections(
 def main(verbose):
     """Declarative configuration manager."""
     set_verbose(verbose)
+    _invoker()
 
 
 @main.command()
@@ -359,13 +430,19 @@ def main(verbose):
     ),
 )
 def deploy(config, scope, approve, update):
-    """Apply config to bring system to desired state."""
+    """Apply config to bring system to desired state.
+
+    Under `sudo`, only system work runs (launchd daemons, system defaults).
+    """
+    inv = _invoker()
+    if inv.root:
+        scope = _root_scope(tuple(scope))
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
 
     if not approve:
-        has_changes = not show_diff(merged, config_dir, scope)
+        has_changes = not show_diff(merged, config_dir, scope, root=inv.root)
         if has_changes:
             answer = click.prompt("\nType 'yes' to deploy", default="no")
             if answer != "yes":
@@ -374,7 +451,7 @@ def deploy(config, scope, approve, update):
 
     # Deploy runs even when the preview was clean: --update upgrades and
     # state housekeeping have no diff line of their own.
-    if not _deploy(merged, config_dir, scope, update):
+    if not _deploy(merged, config_dir, scope, update, root=inv.root):
         sys.exit(1)
 
 
@@ -395,10 +472,13 @@ def apply(config, scope, approve, update):
 )
 def diff(config, scope):
     """Show what would change (dry-run)."""
+    inv = _invoker()
+    if inv.root:
+        scope = _root_scope(tuple(scope))
     config_paths = list(config)
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
-    if not show_diff(merged, config_dir, scope):
+    if not show_diff(merged, config_dir, scope, root=inv.root):
         sys.exit(1)
 
 
@@ -416,9 +496,16 @@ def status(config):
     """Show live status of managed launchd jobs (read-only)."""
     from tools.state import find_state_file
 
+    inv = _invoker()
     merged = _load_merged_config(list(config))
-    state_file = os.path.expanduser(merged.get("stateFile") or "~/.local/state/tools/state.json")
-    state = migrate_state_schema(load_json(find_state_file(state_file)))
+    if inv.root:
+        state_file = runmode.ROOT_STATE_FILE
+    else:
+        state_file = os.path.expanduser(
+            merged.get("stateFile") or "~/.local/state/tools/state.json"
+        )
+        state_file = find_state_file(state_file)
+    state = migrate_state_schema(load_json(state_file))
     try:
         rows = status_rows(merged.get("launchd"), state)
     except PermissionError as e:
@@ -520,6 +607,7 @@ def _watch_run(
 @click.option("--tmux", is_flag=True, help="Run in tmux: session <hostname>, window tools-watch.")
 def watch(config, scope, approve, debounce, poll, tmux):
     """Watch the config paths and redeploy when they change."""
+    _refuse_root("watch")
     config_paths = list(config)
     missing = [p for p in config_paths if not os.path.exists(p)]
     if missing:
@@ -553,6 +641,7 @@ def watch(config, scope, approve, debounce, poll, tmux):
 @main.command()
 def reconcile():
     """Continuously watch and apply config changes."""
+    _refuse_root("reconcile")
     log("reconcile is not implemented yet", Color.YELLOW)
     sys.exit(1)
 

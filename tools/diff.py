@@ -5,6 +5,7 @@ import os
 import stat
 from typing import Dict, List
 
+from tools import runmode
 from tools.config import SECTIONS
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
@@ -366,9 +367,17 @@ def _empty_after(directory: str, removed) -> bool:
     return all(os.path.join(directory, n) in removed for n in names)
 
 
-def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> bool:
-    """Show what deploy would change. Returns True if no changes needed."""
+def show_diff(
+    config: dict, config_dir: str, scope: tuple[str, ...] = (), root: bool = False
+) -> bool:
+    """Show what deploy would change. Returns True if no changes needed.
+
+    As root (``root``) only system sections are diffed, against the root-owned state file.
+    """
     from tools.state import find_state_file, load_json, migrate_state_schema
+
+    if root:
+        return _print_sections(_root_sections(config, scope, load_json, migrate_state_schema))
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
@@ -382,7 +391,6 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
-    has_changes = False
     paths = config.get("paths", {})
 
     sections = []
@@ -595,6 +603,34 @@ def show_diff(config: dict, config_dir: str, scope: tuple[str, ...] = ()) -> boo
         if subsections:
             sections.append(("mgmt", subsections))
 
+    return _print_sections(sections)
+
+
+def _root_sections(config: dict, scope, load_json, migrate_state_schema) -> list:
+    """Root mode: launchd daemons and system-scope defaults; nothing in user space."""
+    state = migrate_state_schema(load_json(runmode.ROOT_STATE_FILE))
+    active = set(scope) if scope else set(runmode.ROOT_SECTIONS)
+    sections = []
+    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+        changes = diff_launchd(
+            config.get("launchd"),
+            state,
+            **sops_section.secrets_dir_kwargs(config.get("sops")),
+        )
+        if changes:
+            sections.append(("launchd", changes))
+    restarts: List[str] = []
+    if "defaults" in active and defaults_has_work(config.get("defaults"), state):
+        changes = diff_defaults(config.get("defaults"), state, restarts=restarts)
+        if changes:
+            sections.append(("defaults", changes))
+    if restarts:
+        sections.append(("restart", [f"  ~ restart {proc}" for proc in restarts]))
+    return sections
+
+
+def _print_sections(sections: list) -> bool:
+    has_changes = False
     if sections:
         has_changes = True
         for i, (title, items) in enumerate(sections):

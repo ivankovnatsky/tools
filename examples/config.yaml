@@ -133,10 +133,10 @@ flatpak:
   packages: []
 
 # macOS launchd jobs, like nix-config's local.launchd. See README "launchd".
+# `tools deploy` manages agents; daemons need `sudo "$(command -v tools)" deploy`.
 launchd:
   labelPrefix: com.example
-  sudo: false # true for domain: system jobs; run tools as yourself, never via sudo
-  services:
+  agents:
     web:
       waitForPaths: [/Volumes/Storage]
       dataDir: /Volumes/Storage/Data/.web
@@ -148,6 +148,7 @@ launchd:
       command: /usr/bin/find /tmp/web -mtime +7 -delete
       startCalendarInterval: { hour: 4, minute: 30 }
       keepAlive: false # default true, as in nix-config
+  daemons: {}
 
 # macOS preferences. See README "Defaults".
 defaults:
@@ -165,7 +166,7 @@ defaults:
           KeyboardLayout Name: ABC
     ~/Library/Preferences/ByHost/com.apple.controlcenter:
       Weather: 2
-  system: {}
+  system: {} # applied only by `sudo tools deploy --scope defaults`
 
 # Dock layout. See README "Dock". Undeclared sections are left alone.
 dock:

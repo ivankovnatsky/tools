@@ -22,8 +22,8 @@ class SharedRestartTest(DockTestBase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _cli(self, allow_sudo):
-        return self.fake.cli(allow_sudo)
+    def _cli(self):
+        return self.fake.cli()
 
     def run_deploy(self, config):
         return cli_mod._run_sections(config, self.tmp, self.state, {}, set(config))

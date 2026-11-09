@@ -1,12 +1,12 @@
-"""In-memory stand-in for /usr/bin/defaults, killall and sudo."""
+"""In-memory stand-in for /usr/bin/defaults and killall."""
 
+import os
 import plistlib
 
 from tools.user.defaults import DefaultsCLI
 
 DEFAULTS = "/usr/bin/defaults"
 KILLALL = "/usr/bin/killall"
-SUDO = "/usr/bin/sudo"
 
 
 class FakeDefaults:
@@ -14,7 +14,7 @@ class FakeDefaults:
         self.store = {}  # (scope, domain) -> {key: value}
         self.calls = []
         self.fail = {}  # verb -> stderr, makes that verb exit 1
-        self.sudo_ok = True
+        self.root = False  # set by cli(root=...): the euid the provider runs as
         self.running = {"Dock", "Finder"}
 
     def domain(self, domain, scope="user"):
@@ -23,15 +23,11 @@ class FakeDefaults:
     def run(self, cmd, env=None, cwd=None):
         self.calls.append(list(cmd))
         args = list(cmd)
-        privileged = False
-        if args[0] == SUDO:
-            if args[1] != "-n":
-                raise AssertionError(f"sudo without -n: {cmd}")
-            if not self.sudo_ok:
-                return 1, "", "sudo: a password is required"
-            privileged = True
-            args = args[2:]
+        assert not any("sudo" in a for a in args), f"tools must never call sudo: {cmd}"
         if args[0] == KILLALL:
+            if args[1] == "-u":
+                assert self.root, f"-u only as root: {cmd}"
+                args = [args[0], *args[3:]]
             if args[1] in self.running:
                 return 0, "", ""
             return 1, "", "No matching processes belonging to you were found"
@@ -45,7 +41,7 @@ class FakeDefaults:
         verb = args[0]
         if verb in self.fail:
             return 1, "", self.fail[verb]
-        if scope == "system" and verb in ("write", "delete") and not privileged:
+        if scope == "system" and verb in ("write", "delete") and not self.root:
             return 1, "", "Could not write domain; exiting"
         values = self.domain(args[1], scope)
         if verb == "export":
@@ -75,22 +71,18 @@ class FakeDefaults:
         self.run = run
         return lambda: setattr(self, "run", orig)
 
-    def cli(self, allow_sudo=True, **kwargs):
-        return DefaultsCLI(
-            defaults=DEFAULTS,
-            killall=KILLALL,
-            sudo=SUDO,
-            run=self.run,
-            allow_sudo=allow_sudo,
-            **kwargs,
-        )
+    def cli(self, root=False, **kwargs):
+        self.root = root
+        kwargs.setdefault("home", os.path.expanduser("~"))
+        kwargs.setdefault("login", "me")
+        return DefaultsCLI(defaults=DEFAULTS, killall=KILLALL, run=self.run, is_root=root, **kwargs)
 
     def verbs(self):
         out = []
         for cmd in self.calls:
-            args = cmd[2:] if cmd[0] == SUDO else cmd
+            args = cmd
             if args[0] == KILLALL:
-                out.append(("killall", args[1]))
+                out.append(("killall", args[-1]))
             else:
                 args = [a for a in args[1:] if a != "-currentHost"]
                 out.append((args[0], *args[1:3]))
