@@ -1,14 +1,22 @@
+import fcntl
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
+from tools import cli
+from tools import state as state_mod
 from tools.state import (
     STATE_VERSION,
     find_state_file,
     load_json,
+    lock_path,
     migrate_state_schema,
     save_json,
+    state_lock,
 )
 
 
@@ -71,7 +79,7 @@ class StateWriteTest(unittest.TestCase):
             save_json(path, {"version": STATE_VERSION, "flatpak": {"packages": ["a"]}})
 
             self.assertEqual(load_json(path)["flatpak"]["packages"], ["a"])
-            self.assertFalse(os.path.exists(f"{path}.tmp"))
+            self.assertEqual(os.listdir(os.path.dirname(path)), ["state.json"])
 
     def test_failed_write_leaves_previous_state_intact(self):
         # The state file is the only record of what we installed; a crash
@@ -88,6 +96,7 @@ class StateWriteTest(unittest.TestCase):
 
             with open(path) as f:
                 self.assertEqual(json.load(f)["flatpak"]["packages"], ["a"])
+            self.assertEqual(os.listdir(d), ["state.json"])
 
     def test_save_json_accepts_bare_relative_path(self):
         # `stateFile: state.json` has an empty dirname; makedirs("") raised
@@ -130,6 +139,107 @@ class StateWriteTest(unittest.TestCase):
             self.assertEqual(find_state_file(current), legacy)
             # Read-only: nothing was migrated.
             self.assertFalse(os.path.exists(current))
+
+
+class StateLockTest(unittest.TestCase):
+    def test_concurrent_deploys_keep_each_others_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "state.json")
+            save_json(state_file, {"version": STATE_VERSION})
+            first_inside = threading.Event()
+
+            def section(config, _dir, state, _paths, _active, persist, *_a):
+                state.setdefault("records", []).append(config["name"])
+                if config["name"] == "a":
+                    first_inside.set()
+                    # Without the lock, b reads the state now and drops "a".
+                    time.sleep(0.3)
+                persist()
+                return True
+
+            def run(name):
+                cli._deploy({"stateFile": state_file, "name": name}, d)
+
+            with (
+                mock.patch.object(cli, "_run_sections", side_effect=section),
+                mock.patch.object(cli, "migrate_state_file"),
+                mock.patch.object(state_mod, "log"),
+            ):
+                a = threading.Thread(target=run, args=("a",))
+                a.start()
+                self.assertTrue(first_inside.wait(5))
+                b = threading.Thread(target=run, args=("b",))
+                b.start()
+                a.join(5)
+                b.join(5)
+
+            self.assertEqual(sorted(load_json(state_file)["records"]), ["a", "b"])
+
+    def test_waits_with_message_instead_of_failing(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "state.json")
+            holder = os.open(lock_path(state_file), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            threading.Timer(0.2, os.close, args=(holder,)).start()
+            with mock.patch.object(state_mod, "log") as log:
+                with state_lock(state_file):
+                    pass
+            self.assertIn("Waiting for another tools run", log.call_args[0][0])
+
+    def test_lock_file_is_private(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "sub", "state.json")
+            with state_lock(state_file):
+                pass
+            self.assertEqual(os.stat(lock_path(state_file)).st_mode & 0o777, 0o600)
+
+    def test_lock_released_on_exception(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "state.json")
+            with self.assertRaises(RuntimeError):
+                with state_lock(state_file):
+                    raise RuntimeError("boom")
+            fd = os.open(lock_path(state_file), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+    def test_deploy_releases_lock_when_a_section_crashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_file = os.path.join(d, "state.json")
+            with (
+                mock.patch.object(cli, "_run_sections", side_effect=RuntimeError("boom")),
+                mock.patch.object(cli, "migrate_state_file"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    cli._deploy({"stateFile": state_file}, d)
+            fd = os.open(lock_path(state_file), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+    def test_save_json_temp_files_are_unique(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            seen = []
+            real_replace = os.replace
+
+            def replace(src, dst):
+                seen.append(src)
+                self.assertEqual(os.stat(src).st_mode & 0o777, 0o600)
+                real_replace(src, dst)
+
+            with mock.patch.object(state_mod.os, "replace", side_effect=replace):
+                save_json(path, {"a": 1})
+                save_json(path, {"a": 2})
+
+            self.assertEqual(len(set(seen)), 2)
+            for tmp in seen:
+                self.assertEqual(os.path.dirname(tmp), d)
+                self.assertTrue(os.path.basename(tmp).startswith("state.json."))
+            self.assertEqual(os.listdir(d), ["state.json"])
 
 
 if __name__ == "__main__":

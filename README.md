@@ -112,8 +112,8 @@ tools watch --config PATH... [--scope SECTION]... [--approve]
   `.DS_Store`) are skipped, as the config loader skips them; a hidden `files:`
   source there does not trigger a run. Only the `--config` paths are watched:
   `include:` files and `files:` sources outside them are not.
-- The state file and `mgmt.key` next to it (and their `.tmp` siblings) are
-  never watched. Other deploy targets inside a watched directory make each
+- The state file and `mgmt.key` next to it (and their `.lock` and `.tmp`
+  siblings) are never watched. Other deploy targets inside a watched directory make each
   deploy trigger the next; keep them outside.
 - Log lines are prefixed `[tools watch]`. `--tmux` runs it in tmux window
   `tools-watch` of session `<hostname>` (reused if already running) and switches
@@ -886,6 +886,14 @@ exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
 config removes it from the system on the next deploy (where an uninstall exists;
 `go` and `curlShell` only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
+
+Every deploy (including each `watch` run) holds an exclusive lock on
+`<stateFile>.lock` (0600) from reading the state to its last save, so
+overlapping runs (`watch`, scheduled and manual deploys) never drop each
+other's records; a second run logs `Waiting for another tools run to finish`
+and waits. Under sudo, root locks `/var/db/tools/state.json.lock` and the user
+child locks its own. `diff` and `status` only read and never wait. Saves go to
+a unique temp file beside the state and are renamed into place.
 
 ## Security notes
 

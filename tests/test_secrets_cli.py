@@ -18,6 +18,7 @@ class SecretsGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(
                 secrets_flow,
                 "deploy_sops",
@@ -49,6 +50,7 @@ class SecretsGatingTest(unittest.TestCase):
                 mock.patch.object(cli, "load_json", return_value={}),
                 mock.patch.object(cli, "migrate_state_file"),
                 mock.patch.object(cli, "save_json"),
+                mock.patch.object(cli, "state_lock"),
             ):
                 self.assertFalse(cli._deploy(config, "/tmp"), config)
             with mock.patch("tools.state.find_state_file", return_value="/nonexistent"):
@@ -62,6 +64,7 @@ class SecretsGatingTest(unittest.TestCase):
                 mock.patch.object(cli, "load_json", return_value={}),
                 mock.patch.object(cli, "migrate_state_file"),
                 mock.patch.object(cli, "save_json"),
+                mock.patch.object(cli, "state_lock"),
                 mock.patch.object(
                     secrets_flow,
                     "deploy_sops",
@@ -87,6 +90,7 @@ class SecretsGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(
                 secrets_flow,
                 "deploy_sops",
@@ -119,6 +123,7 @@ class SecretsGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(secrets_flow, "deploy_sops", side_effect=rec("sops")),
             mock.patch.object(secrets_flow, "deploy_templates", side_effect=rec("templates")),
             mock.patch.object(cli, "install_mcp_servers", side_effect=rec("mcp")),

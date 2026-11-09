@@ -1473,6 +1473,7 @@ class CliGatingTest(unittest.TestCase):
             mock.patch.object(cli_mod, "load_json", return_value=state),
             mock.patch.object(cli_mod, "migrate_state_file"),
             mock.patch.object(cli_mod, "save_json"),
+            mock.patch.object(cli_mod, "state_lock"),
             mock.patch.object(cli_mod, "install_defaults", return_value=True) as d,
             mock.patch.object(cli_mod, "install_dock", return_value=True) as k,
         ):

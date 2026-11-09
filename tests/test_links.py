@@ -229,6 +229,7 @@ class GatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_links", return_value=True) as install,
         ):
             cli._deploy(config, "/tmp", ("links",))

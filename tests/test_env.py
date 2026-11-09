@@ -420,6 +420,7 @@ class CliTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_env", return_value=True) as install,
             mock.patch.object(cli, "env_export_process") as export,
         ):

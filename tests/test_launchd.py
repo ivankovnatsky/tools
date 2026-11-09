@@ -2237,6 +2237,7 @@ class OpenBugsTest(LaunchdTestBase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_launchd", return_value=False) as install,
         ):
             cli._deploy({"launchd": []}, "/tmp")
@@ -2618,6 +2619,7 @@ class CliGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_launchd", return_value=True) as install,
         ):
             cli._deploy(config, "/tmp")
@@ -2644,6 +2646,7 @@ class CliStatusTest(unittest.TestCase):
             mock.patch.object(cli, "_load_merged_config", return_value={}),
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "save_json") as save,
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "status_rows", return_value=rows),
         ):
             result = CliRunner().invoke(cli.main, ["status"])

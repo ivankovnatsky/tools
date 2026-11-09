@@ -19,6 +19,7 @@ class DeployGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
         ):
             return cli._deploy(config, "/tmp", scope)
 
@@ -30,6 +31,7 @@ class DeployGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_git_repos", return_value=True) as git,
             mock.patch.object(cli, "install_brew_packages", return_value=True) as brew,
         ):
@@ -51,6 +53,7 @@ class DeployGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_files", return_value=True) as inst,
         ):
             for args, update in (
@@ -188,6 +191,7 @@ class SkillsGatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_skills", return_value=True) as install,
         ):
             cli._deploy(config, "/tmp")
@@ -355,6 +359,7 @@ class UserDeploySystemKeysTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch("tools.state.load_json", return_value={}),
             mock.patch.object(cli.click, "prompt") as prompt,
         ):

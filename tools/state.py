@@ -1,7 +1,10 @@
+import contextlib
+import fcntl
 import json
 import os
 import shutil
-from typing import Dict, List
+import tempfile
+from typing import Dict, Iterator, List
 
 from tools.log import Color, log
 
@@ -58,15 +61,48 @@ def save_json(path: str, data: Dict):
     if dirname:
         # A bare relative filename has no parent to create.
         os.makedirs(dirname, exist_ok=True)
-    tmp_path = f"{path}.tmp"
-    # 0600: the state holds fingerprints of service secrets.
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    # Unique per writer so concurrent saves never share a temp file; mkstemp
+    # creates it 0600, and the state holds fingerprints of service secrets.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=dirname or ".", prefix=f"{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)
+        raise
+
+
+def lock_path(state_file: str) -> str:
+    return f"{state_file}.lock"
+
+
+@contextlib.contextmanager
+def state_lock(state_file: str) -> Iterator[None]:
+    """Hold an exclusive lock on state_file for a whole read-modify-write.
+
+    Waits for another holder rather than failing; the kernel drops the lock
+    when the process dies, so a crashed run never leaves it stuck.
+    """
+    path = lock_path(state_file)
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log(f"Waiting for another tools run to finish (lock {path})", Color.YELLOW)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def migrate_state_schema(state: Dict) -> Dict:

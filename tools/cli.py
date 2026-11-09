@@ -11,7 +11,13 @@ from tools.log import Color, log, set_verbose
 from tools.mgmt import has_work as mgmt_has_work
 from tools.mgmt import install_mgmt, release_mgmt
 from tools.mgmt.keys import key_path as mgmt_key_path
-from tools.state import load_json, migrate_state_file, migrate_state_schema, save_json
+from tools.state import (
+    load_json,
+    migrate_state_file,
+    migrate_state_schema,
+    save_json,
+    state_lock,
+)
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
@@ -181,15 +187,29 @@ def _deploy(
     """
     if root:
         state_file = privilege.ROOT_STATE_FILE
-        state = migrate_state_schema(load_json(state_file))
     else:
         # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
         # crash expanduser — and it must resolve identically to show_diff.
         state_file = os.path.expanduser(
             config.get("stateFile") or "~/.local/state/tools/state.json"
         )
+    # Overlapping runs (watch, scheduled and manual deploys) would otherwise
+    # each save their own copy and drop the other's records.
+    with state_lock(state_file):
+        return _deploy_locked(config, config_dir, state_file, scope, update, root)
+
+
+def _deploy_locked(
+    config: dict,
+    config_dir: str,
+    state_file: str,
+    scope: tuple[str, ...],
+    update: bool,
+    root: bool,
+) -> bool:
+    if not root:
         migrate_state_file(state_file)
-        state = migrate_state_schema(load_json(state_file))
+    state = migrate_state_schema(load_json(state_file))
 
     active = set(scope) if scope else set(ALL_SECTIONS)
 

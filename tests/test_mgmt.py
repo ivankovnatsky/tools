@@ -27,6 +27,7 @@ class GatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_mgmt", return_value=True) as install,
         ):
             cli._deploy(config, "/tmp")
@@ -122,6 +123,7 @@ class GatingTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_mgmt", return_value=False),
         ):
             self.assertFalse(cli._deploy({"mgmt": jellyfin()}, "/tmp"))
@@ -386,6 +388,7 @@ class KeyFileErrorTest(unittest.TestCase):
             mock.patch.object(cli, "load_json", return_value={}),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "mgmt_key_path", return_value=self.key),
             mock.patch.object(cli, "install_flatpak_packages", return_value=True) as fp,
             contextlib.redirect_stdout(io.StringIO()),
