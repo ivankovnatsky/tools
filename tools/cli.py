@@ -254,7 +254,7 @@ def _deploy(
     # Overlapping runs (watch, scheduled and manual deploys) would otherwise
     # each save their own copy and drop the other's records.
     with state_lock(state_file):
-        return _deploy_locked(config, config_dir, state_file, scope, update, root)
+        return _deploy_locked(config, config_dir, state_file, scope, update, root, restarts)
 
 
 def _deploy_locked(
@@ -264,6 +264,7 @@ def _deploy_locked(
     scope: tuple[str, ...],
     update: bool,
     root: bool,
+    restarts: list | None = None,
 ) -> bool:
     if not root:
         migrate_state_file(state_file)
