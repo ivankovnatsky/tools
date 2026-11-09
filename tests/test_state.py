@@ -242,5 +242,17 @@ class StateLockTest(unittest.TestCase):
             self.assertEqual(os.listdir(d), ["state.json"])
 
 
+class StateLockSymlinkTest(unittest.TestCase):
+    def test_refuses_symlinked_lock_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "state.json")
+            target = os.path.join(d, "elsewhere")
+            os.symlink(target, lock_path(state))
+            with self.assertRaises(OSError):
+                with state_lock(state):
+                    pass
+            self.assertFalse(os.path.exists(target))
+
+
 if __name__ == "__main__":
     unittest.main()
