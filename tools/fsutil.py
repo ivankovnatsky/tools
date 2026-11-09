@@ -8,7 +8,7 @@ import pwd
 import stat
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 _NO_LINK_ERRNOS = {
     errno.EPERM,
@@ -76,6 +76,7 @@ class Current:
     uid: Optional[int] = None
     gid: Optional[int] = None
     error: Optional[str] = None
+    symlink: bool = False
 
 
 _NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -100,6 +101,8 @@ def _open_regular(path: str) -> int:
 def read_current(path: str) -> Current:
     if not os.path.lexists(path):
         return Current(exists=False)
+    if os.path.islink(path):
+        return Current(exists=True, error=SYMLINK_REFUSED, symlink=True)
     try:
         fd = _open_regular(path)
         with os.fdopen(fd, "rb") as f:
@@ -338,17 +341,78 @@ def _publish_exclusive(tmp: str, path: str) -> None:
     os.unlink(tmp)
 
 
+FORCE_REMOVED = "force is no longer supported: tools now always moves the old file aside"
+
+BACKUP_SUFFIX = ".tools"
+
+
+def backup_path(path: str) -> str:
+    return path + BACKUP_SUFFIX
+
+
+def earlier_backup(path: str) -> Optional[str]:
+    """``backup_path(path)`` if something is already there."""
+    backup = backup_path(path)
+    return backup if os.path.lexists(backup) else None
+
+
+def aside_refused(path: str) -> Optional[str]:
+    """Why ``path`` must not be moved aside again: an earlier backup exists."""
+    earlier = earlier_backup(path)
+    if earlier is None:
+        return None
+    return f"{path} changed again; an earlier backup {earlier} exists; remove it"
+
+
+def move_aside(path: str) -> Optional[str]:
+    """Rename whatever is at ``path`` (a symlink itself, never its target) to
+    ``backup_path(path)``; the rename keeps its mode. None if nothing is there."""
+    if not os.path.lexists(path):
+        return None
+    dest = backup_path(path)
+    # A target is moved aside at most once: link (which never replaces) rather
+    # than rename, so a backup created meanwhile is not overwritten.
+    try:
+        os.link(path, dest, follow_symlinks=False)
+    except FileExistsError:
+        raise FileExistsError(errno.EEXIST, "an earlier backup exists", dest) from None
+    except OSError as e:
+        if e.errno not in _NO_LINK_ERRNOS:
+            raise
+        raise OSError(
+            e.errno, f"cannot move {path} aside: hard links unsupported here ({e.strerror})"
+        ) from None
+    os.unlink(path)
+    return dest
+
+
+def aside_note(path: str, reason: str) -> str:
+    """Diff wording for a write that first moves the existing file aside."""
+    return f"{reason}; old file moved aside to {backup_path(path)}"
+
+
 def atomic_write(
-    path: str, data: bytes, mode: int, uid: int = -1, gid: int = -1, *, exclusive: bool = False
-) -> None:
+    path: str,
+    data: bytes,
+    mode: int,
+    uid: int = -1,
+    gid: int = -1,
+    *,
+    exclusive: bool = False,
+    backup: bool = False,
+) -> Optional[str]:
     """Write via a temp file in the same dir. Mode/owner land before content.
 
     ``exclusive`` refuses to replace an existing path (hard-link publish;
     check-then-rename where hard links are unsupported), so a value that
     must only ever be created once cannot be clobbered.
+
+    ``backup`` moves the existing path aside (``move_aside``) once the new
+    content is on disk, just before publishing; returns the backup path.
     """
     dirname = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".tools-")
+    moved = None
     try:
         with os.fdopen(fd, "wb") as f:
             os.fchmod(f.fileno(), mode)
@@ -357,14 +421,44 @@ def atomic_write(
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        moved = move_aside(path) if backup else None
         if exclusive:
             _publish_exclusive(tmp, path)
         else:
             os.replace(tmp, path)
-    except BaseException:
+    except BaseException as e:
         if os.path.lexists(tmp):
             os.unlink(tmp)
+        if moved and isinstance(e, OSError):
+            raise OSError(e.errno, f"{e.strerror or e}; old file moved aside to {moved}") from e
         raise
+    return moved
+
+
+def create_or_replace(
+    path: str, data: bytes, mode: int, uid: int = -1, gid: int = -1
+) -> Tuple[Optional[str], Optional[str]]:
+    """Create ``path`` only while it is missing. One that appeared since
+    planning is judged like an untracked file: the same bytes are rewritten,
+    anything else is moved aside once (``aside_refused``).
+
+    Returns (backup path, why it was moved aside), both None for a plain create.
+    """
+    try:
+        atomic_write(path, data, mode, uid, gid, exclusive=True)
+        return None, None
+    except FileExistsError:
+        pass
+    current = read_current(path)
+    if current.error and not current.symlink:
+        raise OSError(errno.EEXIST, f"{path} appeared during this run ({current.error})")
+    same = not current.symlink and current.content == data
+    reason = None if same else ("a symlink" if current.symlink else "not tracked by tools")
+    if reason:
+        refused = aside_refused(path)
+        if refused:
+            raise OSError(errno.EEXIST, refused)
+    return atomic_write(path, data, mode, uid, gid, backup=reason is not None), reason
 
 
 def describe_removals(errors, remove, forget) -> list:

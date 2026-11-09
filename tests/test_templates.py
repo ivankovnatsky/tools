@@ -14,6 +14,15 @@ from tools.user.sops import Decryptor, parse_sops
 SECRET = "s3cr3t-password-value"
 
 
+def backups(path):
+    d, base = os.path.split(path)
+    return sorted(os.path.join(d, n) for n in os.listdir(d) if n == base + ".tools")
+
+
+def replace_row(path, reason):
+    return f"  ~ replace {path} ({reason}; old file moved aside to {path}.tools; content not shown)"
+
+
 class FakeSops:
     def __init__(self, doc):
         self.doc = doc
@@ -236,61 +245,12 @@ class RenderTest(TemplatesTestBase):
         self.assertTrue(ok)
         self.assertEqual(self.diff(self.tpl({"a": 1})), [])
 
-    def test_early_phase_hooks_recorded_in_state_at_once(self):
-        raw = self.tpl({"a": 1}, onChange="true")
-        repo = os.path.join(self.tmp, "repo")
-        inside = secrets_flow.paths_in_repos({repo: {}}, self.sops_raw, raw)
-        with contextlib.redirect_stdout(io.StringIO()):
-            secrets_flow.deploy_templates(
-                raw,
-                self.sops_raw,
-                self.state,
-                self.report,
-                decryptor=self.decryptor(),
-                phase=secrets_flow.EARLY,
-                inside=inside,
-            )
-        self.assertEqual(self.state["onChange"]["templates"], {"true": [self.target]})
-
     def test_pending_hook_kept_while_template_fails_to_parse(self):
         self.deploy(self.tpl({"a": 1}, onChange="exit 4"))
         broken = self.tpl({"a": 1}, onChange="exit 4", format="nope")
         with contextlib.redirect_stdout(io.StringIO()):
             secrets_flow.run_template_hooks(broken, self.state)
         self.assertIn("exit 4", self.state["onChange"]["templates"])
-
-    def test_shared_on_change_runs_once_across_phases(self):
-        repo = os.path.join(self.tmp, "repo")
-        os.makedirs(os.path.join(repo, ".git"))
-        marker = os.path.join(self.tmp, "ran")
-        hook = f"ls {repo}/late.json >> {marker}"
-        raw = {
-            "early": {"path": self.target, "format": "json", "content": {}, "onChange": hook},
-            "late": {
-                "path": os.path.join(repo, "late.json"),
-                "format": "json",
-                "content": {},
-                "onChange": hook,
-            },
-        }
-        inside = secrets_flow.paths_in_repos({repo: {}}, self.sops_raw, raw)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            ok = True
-            for phase in (secrets_flow.EARLY, secrets_flow.LATE):
-                ok &= secrets_flow.deploy_templates(
-                    raw,
-                    self.sops_raw,
-                    self.state,
-                    self.report,
-                    decryptor=self.decryptor(),
-                    phase=phase,
-                    inside=inside,
-                )
-            ok &= secrets_flow.run_template_hooks(raw, self.state)
-        self.assertTrue(ok, out.getvalue())
-        with open(marker) as f:
-            self.assertEqual(f.read().splitlines(), [os.path.join(repo, "late.json")])
 
     def test_on_change_must_be_a_string(self):
         _tmpls, errors = templates.parse_templates(self.tpl({}, onChange=["x"]))
@@ -474,7 +434,7 @@ class RenderTest(TemplatesTestBase):
         self.assertIn("age must be a mapping", rows[0])
         self.assertNotIn("no sops secret named", rows[0])
 
-    def test_unmanaged_symlink_target_refused_not_followed(self):
+    def test_unmanaged_symlink_target_moved_aside_not_followed(self):
         pointee = os.path.join(self.tmp, "elsewhere.json")
         raw = self.tpl({"a": 1})
         rendered, _ = templates.render(templates.parse_templates(raw)[0][0], None)
@@ -484,12 +444,16 @@ class RenderTest(TemplatesTestBase):
         os.makedirs(os.path.dirname(self.target))
         os.symlink(pointee, self.target)
         rows = self.diff(raw)
-        self.assertIn("is a symlink", rows[0])
+        self.assertEqual(rows, [replace_row(self.target, "a symlink")])
         ok, out = self.deploy(raw)
-        self.assertFalse(ok)
-        self.assertTrue(os.path.islink(self.target))
+        self.assertTrue(ok)
+        self.assertFalse(os.path.islink(self.target))
         self.assertEqual(stat.S_IMODE(os.stat(pointee).st_mode), 0o640)
-        self.assertNotIn(self.target, self.state["templates"]["installed"])
+        [backup] = backups(self.target)
+        self.assertEqual(os.readlink(backup), pointee)
+        self.assertIn(f"-> {backup}", out)
+        self.assertIn(self.target, self.state["templates"]["installed"])
+        self.assertEqual(self.diff(raw), [])
 
     def test_exact_claim_matched_through_unmanaged_alias(self):
         real_dir = os.path.join(self.tmp, "config")
@@ -560,27 +524,97 @@ class RenderTest(TemplatesTestBase):
         with open(self.target, "w") as f:
             f.write("INTERNAL_TOKEN = handwrittenvalue\n")
         raw = self.tpl({"a": 1})
+        os.chmod(self.target, 0o640)
         rows = self.diff(raw)
-        self.assertIn("not tracked by tools and differs; set force: true", rows[0])
-        self.assertNotIn("handwrittenvalue", "\n".join(rows))
-        ok, out = self.deploy(raw)
-        self.assertTrue(ok)
-        self.assertIn("skipping", out)
-        self.assertNotIn("handwrittenvalue", out)
-        self.assertIn("handwrittenvalue", self.read())
-
-        raw = self.tpl({"a": 1}, force=True)
-        rows = self.diff(raw)
-        self.assertEqual(
-            rows, [f"  ~ replace {self.target} (not tracked by tools; content not shown)"]
-        )
+        self.assertEqual(rows, [replace_row(self.target, "not tracked by tools")])
         ok, out = self.deploy(raw)
         self.assertTrue(ok)
         self.assertNotIn("handwrittenvalue", out)
-        self.assertIn("Replaced untracked", out)
+        [backup] = backups(self.target)
+        self.assertIn(f"Moved aside (not tracked by tools): {self.target} -> {backup}", out)
+        self.assertIn(f"Replaced: {self.target}", out)
+        self.assertEqual(stat.S_IMODE(os.lstat(backup).st_mode), 0o640)
+        with open(backup) as f:
+            self.assertIn("handwrittenvalue", f.read())
+        self.assertEqual(json.loads(self.read()), {"a": 1})
         with mock.patch("tools.util._try_delta", return_value=None):
-            rows = self.diff(self.tpl({"a": 2}, force=True))
+            rows = self.diff(self.tpl({"a": 2}))
         self.assertEqual(rows[0], f"  ~ update {self.target}")
+
+    def test_tracked_unchanged_target_updated_without_backup(self):
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        ok, out = self.deploy(self.tpl({"a": 2}))
+        self.assertTrue(ok)
+        self.assertIn(f"Updated: {self.target}", out)
+        self.assertEqual(json.loads(self.read()), {"a": 2})
+        self.assertEqual(backups(self.target), [])
+
+    def test_tracked_hand_edited_target_moved_aside(self):
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        os.chmod(self.target, 0o600)
+        with open(self.target, "w") as f:
+            f.write('{"a": "hand"}')
+        os.chmod(self.target, 0o400)
+        rows = self.diff(self.tpl({"a": 1}))
+        self.assertEqual(rows, [replace_row(self.target, "modified since tools wrote it")])
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        [backup] = backups(self.target)
+        with open(backup) as f:
+            self.assertEqual(f.read(), '{"a": "hand"}')
+        self.assertEqual(self.diff(self.tpl({"a": 1})), [])
+
+    def test_second_drift_refused_until_backup_removed(self):
+        os.makedirs(os.path.dirname(self.target))
+        with open(self.target, "w") as f:
+            f.write("one")
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        [backup] = backups(self.target)
+        os.chmod(self.target, 0o600)
+        with open(self.target, "w") as f:
+            f.write("two")
+        rows = self.diff(self.tpl({"a": 1}))
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("  ! app: "), rows)
+        self.assertIn(f"an earlier backup {backup} exists", rows[0])
+        ok, _ = self.deploy(self.tpl({"a": 1}))
+        self.assertFalse(ok)
+        self.assertEqual(self.read(), "two")
+        self.assertEqual(backups(self.target), [backup])
+        os.remove(backup)
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        [again] = backups(self.target)
+        with open(again) as f:
+            self.assertEqual(f.read(), "two")
+
+    def test_once_key_is_unknown(self):
+        _, errors = templates.parse_templates(self.tpl({"a": 1}, once=True))
+        self.assertIn("unknown keys ['once']", errors[0])
+
+    def test_force_key_is_an_error(self):
+        _, errors = templates.parse_templates(self.tpl({"a": 1}, force=True))
+        self.assertIn("tools now always moves the old file aside", errors[0])
+
+    def _appearing(self, content):
+        real = fsutil.atomic_write
+
+        def write(path, *args, **kwargs):
+            if kwargs.get("exclusive") and not os.path.lexists(path):
+                with open(path, "w") as f:
+                    f.write(content)
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(fsutil, "atomic_write", side_effect=write)
+
+    def test_target_appearing_after_plan_is_moved_aside(self):
+        with self._appearing("raced"):
+            ok, _ = self.deploy(self.tpl({"a": 1}))
+        self.assertTrue(ok)
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        [backup] = backups(self.target)
+        with open(backup) as f:
+            self.assertEqual(f.read(), "raced")
+        self.assertIn(self.target, self.state["templates"]["installed"])
 
     def respellings(self):
         """(declared, respelled) pairs naming the same file."""
@@ -839,19 +873,14 @@ class FixesTest(TemplatesTestBase):
         with open(os.path.join(b, "app.json"), "w") as f:
             f.write("handwritten-content-here\n")
         rows = self.diff(self.tpl({"a": 2}))
-        self.assertEqual(len(rows), 1, rows)
-        self.assertIn("not tracked by tools and differs; set force: true", rows[0])
-        self.assertNotIn("handwritten-content-here", "\n".join(rows))
+        self.assertEqual(rows, [replace_row(self.target, "not tracked by tools")])
         ok, out = self.deploy(self.tpl({"a": 2}))
         self.assertTrue(ok)
-        self.assertIn("skipping", out)
         self.assertNotIn("handwritten-content-here", out)
-        with open(os.path.join(b, "app.json")) as f:
+        [backup] = backups(os.path.join(b, "app.json"))
+        with open(backup) as f:
             self.assertEqual(f.read(), "handwritten-content-here\n")
-        rows = self.diff(self.tpl({"a": 2}, force=True))
-        self.assertEqual(
-            rows, [f"  ~ replace {self.target} (not tracked by tools; content not shown)"]
-        )
+        self.assertEqual(json.loads(self.read()), {"a": 2})
 
     def test_generated_secret_behind_repointed_symlink_not_rendered(self):
         a = os.path.join(self.tmp, "a")

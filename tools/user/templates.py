@@ -44,7 +44,6 @@ _KEYS = {
     "secrets",
     "restartUnits",
     "quote",
-    "force",
     "onChange",
 }
 DEFAULT_MODE = 0o400
@@ -64,7 +63,6 @@ class Template:
     secrets: bool = False
     notify: Tuple[str, ...] = ()
     quote: bool = True
-    force: bool = False  # replace an existing file tools does not track
     on_change: Optional[str] = None
 
 
@@ -85,6 +83,8 @@ def parse_templates(
         try:
             if not isinstance(spec, Mapping):
                 raise ValueError(f"{name}: spec must be a mapping")
+            if "force" in spec:
+                raise ValueError(f"{name}: {fsutil.FORCE_REMOVED}")
             unknown = set(spec) - _KEYS
             if unknown:
                 raise ValueError(f"{name}: unknown keys {sorted(unknown)}")
@@ -124,9 +124,6 @@ def parse_templates(
             notify = [] if notify is None else notify
             if not isinstance(notify, list) or not all(isinstance(n, str) for n in notify):
                 raise ValueError(f"{name}: restartUnits must be a list of strings")
-            force = spec.get("force", False)
-            if not isinstance(force, bool):
-                raise ValueError(f"{name}: force must be a bool")
             quote = spec.get("quote", True)
             if not isinstance(quote, bool) or ("quote" in spec and fmt != "env"):
                 raise ValueError(f"{name}: quote must be a bool and only applies to format env")
@@ -150,7 +147,6 @@ def parse_templates(
                 secrets=secret_flag,
                 notify=tuple(notify),
                 quote=quote,
-                force=force,
                 on_change=on_change,
             )
         )
@@ -189,13 +185,13 @@ def secret_refs(t: Template) -> set:
 @dataclass
 class Change:
     template: Template
-    # create | update | chmod | adopt | skip | unchanged | pending | error
+    # create | update | replace | chmod | adopt | unchanged | pending | error
     action: str
     desired: Optional[bytes] = None
     secret: bool = False
     mode: int = 0o644
     masked: bool = False
-    untracked: bool = False  # replaces a file tools never wrote: content never shown
+    aside: Optional[str] = None  # replace: why the existing file is moved aside first
     diff: Optional[str] = None
     error: Optional[str] = None
 
@@ -268,21 +264,21 @@ def plan(
             continue
         current = fsutil.read_current(t.target)
         ch = Change(t, "unchanged", desired, secret=secret, mode=mode)
-        if current.error:
+        if current.symlink:
+            ch.action, ch.aside = "replace", "a symlink"
+        elif current.error:
             ch.action, ch.error = "error", f"{t.name}: cannot read {t.target} ({current.error})"
         elif not current.exists:
             ch.action = "create"
-        elif current.content != desired and not tracked and not t.force:
-            # Left as is and reported, not an error: force: true replaces it.
-            ch.action = "skip"
-            ch.error = "not tracked by tools and differs; set force: true to replace it"
+        elif current.content != desired and not tracked:
+            ch.action, ch.aside = "replace", "not tracked by tools"
+        elif current.content != desired and not fsutil.matches_fingerprint(t.target, record):
+            ch.action, ch.aside = "replace", "modified since tools wrote it"
         elif current.content != desired:
             ch.action = "update"
-            ch.untracked = not tracked
             # The old content may hold a secret the new one no longer does.
             ch.masked = bool(
-                ch.untracked
-                or secret
+                secret
                 or record.get("secret")
                 or looks_like_secret(desired)
                 or looks_like_secret(current.content)
@@ -295,6 +291,10 @@ def plan(
             ch.secret = secret or bool(record.get("secret"))
         elif not tracked:
             ch.action = "adopt"
+        if ch.action == "replace":
+            refused = fsutil.aside_refused(t.target)
+            if refused:
+                ch.action, ch.error = "error", f"{t.name}: {refused}"
         changes.append(ch)
 
     desired_targets = {t.target for t in templates}
@@ -370,9 +370,6 @@ def apply(
             log(f"templates: {ch.error}", Color.RED)
             res.success = False
             continue
-        if ch.action == "skip":
-            log(f"templates: skipping {t.target}: {ch.error}", Color.YELLOW)
-            continue
         if ch.action == "unchanged":
             fsutil.refresh_dev(t.target, installed[t.target])
             if ch.secret and not installed[t.target].get("secret"):
@@ -387,16 +384,24 @@ def apply(
                 fsutil.apply_attrs(t.target, ch.mode, uid, gid)
             else:
                 fsutil.makedirs_secret(os.path.dirname(t.target), private_root, created_dirs)
-                fsutil.atomic_write(t.target, ch.desired, ch.mode, uid, gid)
+                if ch.action != "create":
+                    moved = fsutil.atomic_write(
+                        t.target, ch.desired, ch.mode, uid, gid, backup=ch.action == "replace"
+                    )
+                else:
+                    moved, ch.aside = fsutil.create_or_replace(
+                        t.target, ch.desired, ch.mode, uid, gid
+                    )
+                if moved:
+                    log(f"Moved aside ({ch.aside}): {t.target} -> {moved}", Color.YELLOW)
         except (OSError, KeyError, ValueError) as e:
             log(f"templates: failed to write {t.target}: {e}", Color.RED)
             res.success = False
             continue
         installed[t.target] = _record(ch)
         res.changed.append(t)
-        verb = {"create": "Rendered", "update": "Updated", "chmod": "Chmod"}[ch.action]
-        if ch.untracked:
-            verb = "Replaced untracked"
+        verb = {"create": "Rendered", "update": "Updated", "replace": "Replaced", "chmod": "Chmod"}
+        verb = verb[ch.action]
         log(f"{verb}: {t.target}{' (secret)' if ch.secret else ''}", Color.GREEN)
         if ch.diff:
             print(ch.diff)
@@ -434,10 +439,11 @@ def describe(p: Plan) -> List[str]:
             rows.append(f"  ~ render {t.target} (pending: {ch.error})")
         elif ch.action == "create":
             rows.append(f"  + render {t.target}{' (secret)' if ch.secret else ''}")
+        elif ch.action == "replace":
+            note = fsutil.aside_note(t.target, ch.aside)
+            rows.append(f"  ~ replace {t.target} ({note}; content not shown)")
         elif ch.action == "update":
-            if ch.untracked:
-                rows.append(f"  ~ replace {t.target} (not tracked by tools; content not shown)")
-            elif ch.masked:
+            if ch.masked:
                 rows.append(f"  ~ update {t.target} (secret, diff suppressed)")
             else:
                 rows.append(f"  ~ update {t.target}")
@@ -445,9 +451,6 @@ def describe(p: Plan) -> List[str]:
                     rows.append(ch.diff)
         elif ch.action == "chmod":
             rows.append(f"  ~ chmod {t.target} -> {oct(ch.mode)}")
-        elif ch.action == "skip":
-            rows.append(f"  ! skip {t.target}: {ch.error}")
-            continue
         else:
             continue
         rows += [f"    notify: {n}" for n in t.notify]

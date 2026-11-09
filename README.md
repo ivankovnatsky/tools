@@ -148,6 +148,8 @@ Notable keys:
   suppresses inline content diffs for that entry. Removals wait while any entry
   is malformed; a target refused by another owner stays tracked and does not
   hold others.
+- An existing target that differs is replaced; one tools did not write, or
+  that changed since, is moved aside first (see Ownership).
 - `directory: true` ensures the directory (and its parents) exists and applies
   `mode`. Only a directory tools created is tracked, and it is removed only
   while empty; parents and pre-existing directories are never removed. Other
@@ -247,9 +249,9 @@ sops:
 - Writes are atomic, mode/owner set before content; unchanged files are not rewritten.
 - New dirs inside `secretsDir` are `0751` (as sops-nix); parents outside it use the normal umask.
 - One failing secret doesn't stop the rest; its templates are blocked; the run exits non-zero.
-- `generate` creates a value once and never overwrites; an existing untracked file needs `force: true` to be adopted.
+- `generate` creates a value once and never overwrites; an existing untracked file is adopted as the value.
 - Values must be strings (as sops-nix); quote numbers in the sops file. Numeric key segments index lists (`nextDNS/IPs/0`), as nix-config uses.
-- An existing untracked file with different content is refused unless the entry sets `force: true`.
+- An existing file with different content is replaced; one tools did not write, or that changed since, is moved aside first (see Ownership).
 - One secret's path may not contain another's (`a` vs `a/b`).
 - A whole-file secret (`key: ""`) is decrypted with input and output type set to its `format`, as sops-nix does.
 - An `sshKeyPaths` key that can't be read or converted is skipped with a warning, as in sops-nix; a missing `ssh-to-age` only skips conversion. The converted key is never written to disk.
@@ -280,7 +282,7 @@ templates:
 - `env` values are shell single-quoted; `quote: false` writes `KEY=value`.
 - `${sops:}` renders from the same decryption as `sops`, so diff and deploy agree.
 - Default mode `0400`; `owner`/`group` and new dirs as in sops.
-- An existing untracked file with different content is skipped with a warning, not an error; `force: true` replaces it.
+- An existing file with different content is replaced; one tools did not write, or that changed since, is moved aside first (see Ownership).
 - With an invalid `sops:` section, templates without `path` are errors; there's no fallback to the default directory.
 - Content is masked in diff/deploy output when it uses `${sops:}`, has `secrets: true`, was secret before, or looks like a key.
 
@@ -290,11 +292,16 @@ templates:
 - Refused as well: symlinks managed by `links`/`skills`, paths through them or inside their targets, skill copy dirs and the skills cache.
 - Symlinked parents and case (on case-insensitive volumes) are normalized before comparing, so aliases match.
 - A managed path may not be inside another one (for example, a secret named `rendered`).
-- An unmanaged symlink at a target is never followed.
+- An unmanaged symlink at a target is never followed; it is moved aside like a file.
 - Only tracked, unmodified files are removed; any invalid entry holds removals.
 - Nothing is removed through a managed link.
 - sops/templates state keeps device, inode and mtime, never values or hashes.
-- An untracked existing file's content is never shown; sops/templates replace it only with `force: true` (sops refuses, templates skip), `files:` as before.
+- A target whose content differs is replaced. If tools did not write it (untracked) or it changed since tools wrote it, it is first renamed to `<target>.tools`, keeping its mode, and the backup path is logged; a file tools wrote and nobody changed is replaced without a backup. This applies to `files`, `sops`, `templates`, `fetch` and `env`. A symlink at the target is never followed: the link itself is renamed. Backups are never removed by tools.
+- A target is moved aside at most once: if it needs replacing again while `<target>.tools` already exists, that entry fails (`!` in diff) and the file is left as is; other entries proceed. Remove the backup to let tools move it aside again.
+- The replacement is written to a temp file first, so a failed write or download leaves the old file in place.
+- `tools diff` shows such a write as `~ replace <target> (<reason>; old file moved aside to <target>.tools ...)`.
+- Content tools did not write, or that changed since, is never shown.
+- `force:` was removed; setting it is a config error.
 - State entries match declared paths by file identity, so a respelled path (alias, case) is the same entry.
 - A tracked entry also records the file's device and inode; another file at that path (for example behind a repointed parent symlink) counts as untracked. A changed device number alone (APFS renumbers at mount) is accepted when the inode and mtime (or the `files:` hash) still match, and is re-recorded.
 - `sops`/`templates` paths outside every `gitRepos` destination are written before `gitRepos` (so clones can use them); paths inside one, secrets whose `sopsFile` is inside one, templates using such a secret, then removals, after it. `tools diff` lists them in that order (`sops (after gitRepos)`).
@@ -318,7 +325,7 @@ templates:
 | Diff | n/a | path + action, content masked | no secrets in logs |
 | `generate` | n/a | create-once random secrets | first-run app secrets |
 | `owner` default | `root` (system module) | the user running tools | user-level tool |
-| Untracked file at `path`/template path | overwritten | sops: refused, templates: skipped, unless `force: true` | never clobber hand-written files |
+| Untracked or changed file at `path`/template path | overwritten | moved aside to `<path>.tools`, then written | never lose hand-written files |
 
 ## Skills
 
@@ -397,24 +404,27 @@ fetch:
     url: https://example.com/tool-v1.2
     sha256: 3b0c...   # optional
     mode: "0755"      # quoted octal, default 0644
-    force: true       # replace an existing file tools did not write
 ```
 
 - A missing target is downloaded to a temp file beside it and renamed into
-  place; parent directories are created. A file tools wrote is not downloaded
-  again on a plain deploy. Without `sha256`, a changed `url` or
+  place; parent directories are created. A file tools wrote and nobody changed
+  is not downloaded again on a plain deploy; an edited one is moved aside and
+  downloaded again. Without `sha256`, a changed `url` or
   `deploy --update` re-downloads it; with `sha256`, only a changed `sha256`
   does (a matching file is kept even if its `url` changes).
 - With `sha256`, a download that does not match is not installed, and an
   untracked file that already matches is adopted without downloading.
 - https only, redirects included; 60s network timeout. A failed download fails
   the deploy but not the other entries.
-- Ownership follows `files:`: an untracked existing file is replaced only with
-  `force: true`, a file modified since tools wrote it is neither updated nor
-  removed, a dropped entry's file is removed, and removals wait while any entry
-  is malformed.
+- Ownership follows `files:`: an untracked existing file, or one modified
+  since tools wrote it, is moved aside and downloaded again (with `sha256`, an
+  untracked file that already matches is adopted instead); a modified file is
+  not removed, a dropped entry's file is removed, and removals wait while any
+  entry is malformed.
 - `tools diff` never touches the network: it shows `+ fetch <target> <- <url>`
-  for missing files, `~ fetch` for url/sha256 changes, and removals.
+  for missing files, `~ fetch` for url/sha256 changes,
+  `~ replace <target> <- <url> (<reason>; old file moved aside to <target>.tools)`
+  for untracked, edited or symlinked targets, and removals.
 
 ## Env
 
@@ -473,7 +483,9 @@ source ~/.local/state/tools/env/env.nu
   removes the files tools wrote, unless they were edited since (then they are
   released and left in place). Shells already running keep their environment
   until restarted. Any config error holds the whole section. A path another
-  section (`files`, `templates`, `sops`) also claims is refused by both.
+  section (`files`, `templates`, `sops`) also claims is refused by both. A
+  differing snippet tools did not write, or that was edited since, is moved
+  aside first, as in Ownership.
 - `launchd: true` (macOS) runs `launchctl setenv` for each var so GUI apps
   launched afterwards see it; `PATH` is not set this way. `launchctl` values
   do not survive logout or reboot: the diff compares against

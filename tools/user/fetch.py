@@ -8,13 +8,12 @@ Config shape::
         url: https://example.com/tool
         sha256: <hex>     # optional: downloads are verified; changing it re-downloads
         mode: "0755"      # default 0644
-        force: true       # replace an existing file tools did not write
 
 A missing target is downloaded. A file tools wrote is left alone unless
 config changed it (``sha256`` for pinned entries, ``url`` for unpinned ones)
 or ``deploy --update`` runs (unpinned only); a pinned file that already
-matches is kept even when its url changes. A file edited since tools wrote it
-is never overwritten.
+matches is kept even when its url changes. A file tools did not write, or
+edited since, is moved aside and downloaded again.
 ``tools diff`` never touches the network. Records match ``files:`` (content
 hash, device, inode) plus the url.
 """
@@ -36,7 +35,7 @@ from tools.user.files import _file_hash, _record, _removable, _tracked
 
 DEFAULT_MODE = 0o644
 TIMEOUT = 60
-_KEYS = {"url", "sha256", "mode", "force"}
+_KEYS = {"url", "sha256", "mode"}
 _HEX = set("0123456789abcdef")
 
 
@@ -46,7 +45,6 @@ class Entry:
     url: str
     sha256: Optional[str] = None
     mode: int = DEFAULT_MODE
-    force: bool = False
 
 
 def _https(url) -> bool:
@@ -78,6 +76,9 @@ def parse(raw) -> Tuple[List[Entry], List[str]]:
         if not isinstance(spec, Mapping):
             errors.append(f"{where}: must be a url or a mapping with url")
             continue
+        if "force" in spec:
+            errors.append(f"{where}: {fsutil.FORCE_REMOVED}")
+            continue
         unknown = set(spec) - _KEYS
         if unknown:
             errors.append(f"{where}: unknown keys {', '.join(sorted(map(str, unknown)))}")
@@ -97,15 +98,11 @@ def parse(raw) -> Tuple[List[Entry], List[str]]:
         except (TypeError, ValueError) as e:
             errors.append(str(e))
             continue
-        force = spec.get("force", False)
-        if not isinstance(force, bool):
-            errors.append(f"{where}: force must be a bool")
-            continue
         canon = fsutil.canonical_path(target)
         if canon in entries:
             errors.append(f"{where}: {target} is declared twice")
             continue
-        entries[canon] = Entry(target, url, sha, DEFAULT_MODE if mode is None else mode, force)
+        entries[canon] = Entry(target, url, sha, DEFAULT_MODE if mode is None else mode)
     return list(entries.values()), errors
 
 
@@ -118,7 +115,7 @@ def parse(raw) -> Tuple[List[Entry], List[str]]:
 class Change:
     entry: Entry
     action: str  # fetch | update | replace | chmod | adopt | unchanged | error
-    reason: str = ""
+    reason: str = ""  # replace: why the existing file is moved aside first
 
 
 @dataclass
@@ -155,7 +152,10 @@ def plan(raw, installed: Mapping[str, Dict], conflicts=None, update: bool = Fals
         if not os.path.lexists(e.target):
             p.changes.append(Change(e, "fetch"))
             continue
-        if os.path.islink(e.target) or not os.path.isfile(e.target):
+        if os.path.islink(e.target):
+            p.changes.append(Change(e, "replace", "a symlink"))
+            continue
+        if not os.path.isfile(e.target):
             p.changes.append(Change(e, "error", f"{e.target} exists and is not a regular file"))
             continue
         current = _file_hash(e.target)
@@ -165,28 +165,15 @@ def plan(raw, installed: Mapping[str, Dict], conflicts=None, update: bool = Fals
         if not _tracked(e.target, record):
             if e.sha256 and current == e.sha256:
                 p.changes.append(Change(e, "adopt"))
-            elif e.force:
-                p.changes.append(Change(e, "replace"))
             else:
-                p.changes.append(
-                    Change(
-                        e,
-                        "error",
-                        f"{e.target} exists and is not tracked by tools; "
-                        "set force: true to replace it",
-                    )
-                )
+                p.changes.append(Change(e, "replace", "not tracked by tools"))
             continue
         modified = record.get("hash") != current
         why = _why_refetch(e, record, update)
         if e.sha256 and current == e.sha256 and record.get("hash") != e.sha256:
             p.changes.append(Change(e, "adopt"))  # already holds the new pin
-        elif why and modified:
-            p.changes.append(
-                Change(
-                    e, "error", f"{e.target} modified since tools wrote it; not updating ({why})"
-                )
-            )
+        elif modified:
+            p.changes.append(Change(e, "replace", "modified since tools wrote it"))
         elif why:
             p.changes.append(Change(e, "update", why))
         elif not modified and stat.S_IMODE(os.stat(e.target).st_mode) != e.mode:
@@ -194,6 +181,10 @@ def plan(raw, installed: Mapping[str, Dict], conflicts=None, update: bool = Fals
         else:
             p.changes.append(Change(e, "unchanged"))
 
+    for ch in p.changes:
+        refused = ch.action == "replace" and fsutil.aside_refused(ch.entry.target)
+        if refused:
+            ch.action, ch.reason = "error", refused
     declared = [e.target for e in entries]
     for target in sorted(set(installed) - set(declared)):
         record = installed[target]
@@ -236,12 +227,15 @@ def _open(url: str, timeout: float):
 _ABSENT = object()
 
 
-def download(e: Entry, opener: Callable, expect=None) -> str:
+def download(
+    e: Entry, opener: Callable, expect=None, on_aside: Optional[Callable[[str], None]] = None
+) -> str:
     """Stream ``e.url`` to a temp file beside the target, verify, rename. Returns the sha256.
 
     ``expect`` guards the rename against changes made during the download:
     ``_ABSENT`` (target must still be missing), a hash (target must still hold
-    what tools wrote), or None (``force`` replace, no check).
+    what tools wrote), or None (replace: whatever is there is moved aside
+    first, and ``on_aside`` gets the backup path).
     """
     dirname = os.path.dirname(e.target)
     os.makedirs(dirname, exist_ok=True)
@@ -270,6 +264,10 @@ def download(e: Entry, opener: Callable, expect=None) -> str:
             return got
         if isinstance(expect, str) and (os.path.islink(e.target) or _file_hash(e.target) != expect):
             raise FetchError("target changed during download; not replacing it")
+        if expect is None:
+            moved = fsutil.move_aside(e.target)
+            if moved and on_aside:
+                on_aside(moved)
         os.replace(tmp, e.target)
     except BaseException:
         if os.path.lexists(tmp):
@@ -327,14 +325,18 @@ def install_fetch(
         else:
             try:
                 expect = {"fetch": _ABSENT, "update": (installed.get(e.target) or {}).get("hash")}
-                file_hash = download(e, opener, expect.get(ch.action))
+
+                def aside(moved, e=e, why=ch.reason):
+                    log(f"Moved aside ({why}): {e.target} -> {moved}", Color.YELLOW)
+
+                file_hash = download(e, opener, expect.get(ch.action), aside)
             except (OSError, ValueError, http.client.HTTPException, FetchError) as err:
                 log(f"fetch: {e.target} <- {e.url}: {err}", Color.RED)
                 success = False
                 continue
             installed[e.target] = _fetch_record(e, file_hash)
-            verb = {"fetch": "Fetched", "update": "Updated", "replace": "Replaced untracked"}
-            suffix = f" ({ch.reason})" if ch.reason else ""
+            verb = {"fetch": "Fetched", "update": "Updated", "replace": "Replaced"}
+            suffix = f" ({ch.reason})" if ch.reason and ch.action != "replace" else ""
             log(f"{verb[ch.action]}: {e.target} <- {e.url}{suffix}", Color.GREEN)
             changed = True
 
@@ -384,7 +386,8 @@ def diff_fetch(raw, state: Dict, conflicts=None) -> List[str]:
         elif ch.action == "update":
             rows.append(f"  ~ fetch {e.target} <- {e.url} ({ch.reason})")
         elif ch.action == "replace":
-            rows.append(f"  ~ replace {e.target} <- {e.url} (not tracked by tools)")
+            note = fsutil.aside_note(e.target, ch.reason)
+            rows.append(f"  ~ replace {e.target} <- {e.url} ({note})")
         elif ch.action == "chmod":
             rows.append(f"  ~ chmod {e.target} -> {oct(e.mode)}")
         elif ch.action == "adopt":

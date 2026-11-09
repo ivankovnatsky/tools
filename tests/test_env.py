@@ -276,14 +276,68 @@ class DeployTest(EnvTestBase):
         self.assertTrue(os.path.exists(self.path("sh")))
         self.assertEqual(self.state["env"]["files"], {})
 
-    def test_hand_edited_tracked_file_is_rewritten(self):
+    def backups(self, shell):
+        d, base = os.path.split(self.path(shell))
+        return sorted(os.path.join(d, n) for n in os.listdir(d) if n == base + ".tools")
+
+    def test_hand_edited_tracked_file_is_moved_aside_and_rewritten(self):
         raw = self.raw(vars={"A": "1"}, shells=["sh"])
         self.deploy(raw)
         with open(self.path("sh"), "w") as f:
             f.write("export A=2\n")
-        self.assertEqual(self.diff(raw), [f"  ~ update {self.path('sh')}"])
+        target = self.path("sh")
+        self.assertEqual(
+            self.diff(raw),
+            [
+                f"  ~ replace {target} (changed since tools wrote it; old file moved aside "
+                f"to {target}.tools)"
+            ],
+        )
         self.assertTrue(self.deploy(raw))
         self.assertIn("export A='1'", self.read("sh"))
+        [backup] = self.backups("sh")
+        with open(backup) as f:
+            self.assertEqual(f.read(), "export A=2\n")
+
+    def test_second_drift_refused_until_backup_removed(self):
+        raw = self.raw(vars={"A": "1"}, shells=["sh", "fish"])
+        self.deploy(raw)
+        for _ in range(2):
+            with open(self.path("sh"), "w") as f:
+                f.write("export A=2\n")
+            self.deploy(raw)
+        [backup] = self.backups("sh")
+        self.assertIn("export A=2", self.read("sh"))
+        self.assertIn(f"an earlier backup {backup} exists", "\n".join(self.diff(raw)))
+        self.assertFalse(self.deploy(raw))
+        os.remove(backup)
+        self.assertTrue(self.deploy(raw))
+        self.assertIn("export A='1'", self.read("sh"))
+        self.assertEqual(len(self.backups("sh")), 1)
+
+    def test_target_appearing_after_plan_is_moved_aside(self):
+        from tools import fsutil
+
+        real = fsutil.atomic_write
+
+        def write(path, *args, **kwargs):
+            if kwargs.get("exclusive") and not os.path.lexists(path):
+                with open(path, "w") as f:
+                    f.write("raced\n")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(fsutil, "atomic_write", side_effect=write):
+            self.assertTrue(self.deploy(self.raw(vars={"A": "1"}, shells=["sh"])))
+        self.assertIn("export A='1'", self.read("sh"))
+        [backup] = self.backups("sh")
+        with open(backup) as f:
+            self.assertEqual(f.read(), "raced\n")
+
+    def test_tracked_file_updated_without_backup(self):
+        self.deploy(self.raw(vars={"A": "1"}, shells=["sh"]))
+        self.assertTrue(self.deploy(self.raw(vars={"A": "2"}, shells=["sh"])))
+        self.assertIn("export A='2'", self.read("sh"))
+        self.assertEqual(self.backups("sh"), [])
 
     def test_untracked_file_is_replaced_and_identical_one_adopted(self):
         raw = self.raw(vars={"A": "1"}, shells=["sh", "fish"])
@@ -294,10 +348,18 @@ class DeployTest(EnvTestBase):
         with open(self.path("fish"), "wb") as f:
             f.write(env.render(spec, "fish"))
         rows = self.diff(raw)
-        self.assertIn(f"  ~ replace {self.path('sh')} (not tracked by tools)", rows)
+        target = self.path("sh")
+        self.assertIn(
+            f"  ~ replace {target} (not tracked by tools; old file moved aside to {target}.tools)",
+            rows,
+        )
         self.assertNotIn(self.path("fish"), "".join(rows))
         self.assertTrue(self.deploy(raw))
         self.assertEqual(sorted(self.state["env"]["files"]), [self.path("fish"), self.path("sh")])
+        [backup] = self.backups("sh")
+        with open(backup) as f:
+            self.assertEqual(f.read(), "foreign\n")
+        self.assertEqual(self.backups("fish"), [])
 
     def test_config_error_changes_nothing(self):
         self.deploy(self.raw(vars={"A": "1"}))

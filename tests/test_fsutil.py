@@ -1,6 +1,9 @@
+import errno
 import os
+import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import fsutil
 
@@ -41,3 +44,49 @@ class RefreshDevTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoveAsideTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = os.path.realpath(self._tmp.name)
+        self.path = os.path.join(self.d, "f")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_moves_file_keeping_mode(self):
+        with open(self.path, "w") as f:
+            f.write("old")
+        os.chmod(self.path, 0o600)
+        dest = fsutil.move_aside(self.path)
+        self.assertEqual(dest, self.path + ".tools")
+        self.assertFalse(os.path.lexists(self.path))
+        self.assertEqual(stat.S_IMODE(os.lstat(dest).st_mode), 0o600)
+
+    def test_moves_symlink_itself(self):
+        os.symlink("/nonexistent/pointee", self.path)
+        dest = fsutil.move_aside(self.path)
+        self.assertEqual(os.readlink(dest), "/nonexistent/pointee")
+        self.assertFalse(os.path.lexists(self.path))
+
+    def test_existing_backup_is_never_replaced(self):
+        with open(self.path, "w") as f:
+            f.write("old")
+        with open(self.path + ".tools", "w") as f:
+            f.write("earlier")
+        with self.assertRaises(FileExistsError):
+            fsutil.move_aside(self.path)
+        with open(self.path + ".tools") as f:
+            self.assertEqual(f.read(), "earlier")
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "old")
+
+    def test_no_hard_links_is_an_error_not_a_rename(self):
+        with open(self.path, "w") as f:
+            f.write("old")
+        with mock.patch("os.link", side_effect=OSError(errno.EXDEV, "cross-device")):
+            with self.assertRaises(OSError):
+                fsutil.move_aside(self.path)
+        self.assertTrue(os.path.exists(self.path))
+        self.assertFalse(os.path.lexists(self.path + ".tools"))

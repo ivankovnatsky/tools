@@ -58,6 +58,13 @@ class FetchTest(unittest.TestCase):
         with open(self.target, "wb") as f:
             f.write(data)
 
+    def backups(self):
+        d, base = os.path.split(self.target)
+        return sorted(os.path.join(d, n) for n in os.listdir(d) if n == base + ".tools")
+
+    def aside(self, reason):
+        return f"{reason}; old file moved aside to {self.target}.tools"
+
     def test_short_form_downloads_missing_target(self):
         raw = {self.target: URL}
         self.assertEqual(self.diff(raw), [f"  + fetch {self.target} <- {URL}"])
@@ -119,13 +126,23 @@ class FetchTest(unittest.TestCase):
         self.assertTrue(self.deploy(raw, update=True))
         self.assertEqual(len(self.opener.calls), 2)
 
-    def test_modified_file_not_updated_or_removed(self):
+    def test_modified_file_moved_aside_and_fetched_again(self):
         raw = {self.target: URL}
         self.deploy(raw)
         self.write(b"edited")
-        self.assertFalse(self.deploy(raw, update=True))
-        self.assertEqual(self.read(), b"edited")
+        why = self.aside("modified since tools wrote it")
+        self.assertEqual(self.diff(raw), [f"  ~ replace {self.target} <- {URL} ({why})"])
         self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(), b"v1")
+        [backup] = self.backups()
+        with open(backup, "rb") as f:
+            self.assertEqual(f.read(), b"edited")
+        self.assertEqual(self.diff(raw), [])
+
+    def test_modified_file_not_removed(self):
+        raw = {self.target: URL}
+        self.deploy(raw)
+        self.write(b"edited")
         self.assertEqual(
             self.diff({}), [f"  ~ keep {self.target} (modified since tools wrote it; not removed)"]
         )
@@ -133,19 +150,67 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(self.read(), b"edited")
         self.assertIn(self.target, self.state["fetch"]["installed"])
 
-    def test_untracked_existing_file_refused_without_force(self):
+    def test_untracked_existing_file_moved_aside(self):
         self.write(b"mine")
+        os.chmod(self.target, 0o600)
         raw = {self.target: URL}
-        self.assertIn("not tracked by tools; set force: true", self.diff(raw)[0])
-        self.assertFalse(self.deploy(raw))
-        self.assertEqual(self.read(), b"mine")
-        self.assertEqual(self.opener.calls, [])
-        forced = {self.target: {"url": URL, "force": True}}
-        self.assertEqual(
-            self.diff(forced), [f"  ~ replace {self.target} <- {URL} (not tracked by tools)"]
-        )
-        self.assertTrue(self.deploy(forced))
+        why = self.aside("not tracked by tools")
+        self.assertEqual(self.diff(raw), [f"  ~ replace {self.target} <- {URL} ({why})"])
+        with mock.patch("tools.user.fetch.log") as log:
+            self.assertTrue(fetch.install_fetch(raw, self.state, None, False, self.opener))
         self.assertEqual(self.read(), b"v1")
+        [backup] = self.backups()
+        self.assertEqual(backup, self.target + ".tools")
+        self.assertEqual(stat.S_IMODE(os.lstat(backup).st_mode), 0o600)
+        with open(backup, "rb") as f:
+            self.assertEqual(f.read(), b"mine")
+        self.assertIn(backup, repr(log.call_args_list))
+        self.assertEqual(self.diff(raw), [])
+
+    def test_failed_download_leaves_untracked_file_in_place(self):
+        self.write(b"mine")
+        self.opener.body = urllib.error.URLError("down")
+        self.assertFalse(self.deploy({self.target: URL}))
+        self.assertEqual(self.read(), b"mine")
+        self.assertEqual(self.backups(), [])
+
+    def test_symlink_target_is_moved_aside_not_followed(self):
+        other = os.path.join(self.tmp, "other")
+        with open(other, "wb") as f:
+            f.write(b"theirs")
+        os.makedirs(os.path.dirname(self.target))
+        os.symlink(other, self.target)
+        raw = {self.target: URL}
+        self.assertIn(self.aside("a symlink"), self.diff(raw)[0])
+        self.assertTrue(self.deploy(raw))
+        self.assertFalse(os.path.islink(self.target))
+        self.assertEqual(self.read(), b"v1")
+        [backup] = self.backups()
+        self.assertEqual(os.readlink(backup), other)
+        with open(other, "rb") as f:
+            self.assertEqual(f.read(), b"theirs")
+
+    def test_second_drift_refused_until_backup_removed(self):
+        self.write(b"one")
+        raw = {self.target: URL}
+        self.assertTrue(self.deploy(raw))
+        [backup] = self.backups()
+        self.write(b"two")
+        rows = self.diff(raw)
+        self.assertEqual(
+            rows, [f"  ! {self.target} changed again; an earlier backup {backup} exists; remove it"]
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.read(), b"two")
+        self.assertEqual(self.backups(), [backup])
+        os.remove(backup)
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(), b"v1")
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_force_key_is_an_error(self):
+        rows = self.diff({self.target: {"url": URL, "force": True}})
+        self.assertIn("tools now always moves the old file aside", rows[0])
 
     def test_untracked_file_matching_sha_is_adopted(self):
         self.write(b"v1")
@@ -242,14 +307,15 @@ class FetchTest(unittest.TestCase):
         self.assertFalse(self.deploy(raw, conflicts=conflicts))
         self.assertFalse(os.path.exists(self.target))
 
-    def test_pinned_file_edited_is_left_alone(self):
+    def test_pinned_file_edited_is_moved_aside(self):
         raw = {self.target: {"url": URL, "sha256": sha(b"v1")}}
         self.deploy(raw)
         self.write(b"edited")
-        self.assertEqual(self.diff(raw), [])
+        self.assertEqual(len(self.diff(raw)), 1)
         self.assertTrue(self.deploy(raw))
-        self.assertEqual(self.read(), b"edited")
-        self.assertEqual(len(self.opener.calls), 1)
+        self.assertEqual(self.read(), b"v1")
+        self.assertEqual(len(self.opener.calls), 2)
+        self.assertEqual(len(self.backups()), 1)
 
     def test_move_from_files_to_fetch_downloads_and_keeps_no_secret_mode(self):
         src = os.path.join(self.tmp, "src")

@@ -127,7 +127,8 @@ links: []
 #   target: ~/.claude/skills/jira
 
 # Copies relative to the first --config path. onChange runs when the entry
-# changed; onUpdate only on `deploy --update`. See README.
+# changed; onUpdate only on `deploy --update`. A differing file tools did not
+# write (or that changed since) is renamed to <target>.tools first. See README.
 files: []
 # - dir: dotfiles
 # - source: dotfiles/.config/nvim/lua/config/pack.lua

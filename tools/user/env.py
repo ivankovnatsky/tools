@@ -311,7 +311,8 @@ class Plan:
     errors: List[str] = field(default_factory=list)
     spec: Optional[Spec] = None
     var_rows: List[str] = field(default_factory=list)
-    write: List[Tuple[str, bytes, str]] = field(default_factory=list)  # (path, data, action)
+    # (path, data, action, why the existing file is moved aside first or None)
+    write: List[Tuple[str, bytes, str, Optional[str]]] = field(default_factory=list)
     adopt: List[Tuple[str, str]] = field(default_factory=list)  # (path, hash)
     blocked: List[Tuple[str, str]] = field(default_factory=list)
     remove: List[str] = field(default_factory=list)
@@ -371,18 +372,31 @@ def plan(raw, state: Dict, conflicts=None, run: Optional[Callable] = None) -> Pl
             p.blocked.append((target, reason))
             continue
         data = render(spec, shell)
-        if os.path.isdir(target) or (os.path.islink(target) and target not in installed):
+        if os.path.islink(target):
+            p.write.append((target, data, "replace", "a symlink"))
+            continue
+        if os.path.lexists(target) and not os.path.isfile(target):
             p.blocked.append((target, "exists and is not a regular file"))
             continue
         current = _file_hash(target) if os.path.lexists(target) else None
+        recorded = (installed.get(target) or {}).get("hash")
         if current is None and not os.path.lexists(target):
-            p.write.append((target, data, "create"))
+            p.write.append((target, data, "create", None))
         elif current != _hash(data):
-            action = "update" if target in installed else "replace"
-            p.write.append((target, data, action))
+            if target not in installed:
+                p.write.append((target, data, "replace", "not tracked by tools"))
+            elif current != recorded:
+                p.write.append((target, data, "replace", "changed since tools wrote it"))
+            else:
+                p.write.append((target, data, "update", None))
         elif (installed.get(target) or {}).get("hash") != current:
             p.adopt.append((target, current))
 
+    for item in list(p.write):
+        refused = item[3] and fsutil.aside_refused(item[0])
+        if refused:
+            p.write.remove(item)
+            p.blocked.append((item[0], refused))
     for target in sorted(set(installed) - set(desired)):
         record = installed.get(target) or {}
         if not os.path.lexists(target):
@@ -437,15 +451,20 @@ def install_env(raw, state: Dict, conflicts=None, run: Optional[Callable] = None
 
     for target, file_hash in p.adopt:
         installed[target] = {"hash": file_hash}
-    labels = {"create": "Created", "update": "Updated", "replace": "Replaced untracked"}
-    for target, data, action in p.write:
+    labels = {"create": "Created", "update": "Updated", "replace": "Replaced"}
+    for target, data, action, aside in p.write:
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            fsutil.atomic_write(target, data, FILE_MODE)
+            if action == "create":
+                moved, aside = fsutil.create_or_replace(target, data, FILE_MODE)
+            else:
+                moved = fsutil.atomic_write(target, data, FILE_MODE, backup=aside is not None)
         except OSError as e:
             log(f"env: failed to write {target}: {e}", Color.RED)
             success = False
             continue
+        if moved:
+            log(f"Moved aside ({aside}): {target} -> {moved}", Color.YELLOW)
         installed[target] = {"hash": _hash(data)}
         log(f"{labels[action]}: {target}", Color.GREEN)
 
@@ -516,8 +535,8 @@ def diff_env(raw, state: Dict, conflicts=None, run: Optional[Callable] = None) -
     if p.write or p.remove or p.setenv or p.unsetenv:
         rows += p.var_rows
     verbs = {"create": "+ write", "update": "~ update", "replace": "~ replace"}
-    for target, _data, action in p.write:
-        suffix = " (not tracked by tools)" if action == "replace" else ""
+    for target, _data, action, aside in p.write:
+        suffix = f" ({fsutil.aside_note(target, aside)})" if aside else ""
         rows.append(f"  {verbs[action]} {target}{suffix}")
     rows += [f"  ! skip {t}: {reason}" for t, reason in p.blocked]
     rows += fsutil.describe_removals([], p.remove, [f for f in p.forget if f[1] != "already gone"])

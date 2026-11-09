@@ -1,10 +1,12 @@
 import hashlib
 import os
 import stat
-import tempfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from tools.fsutil import (
+    FORCE_REMOVED,
+    aside_refused,
+    atomic_write,
     canonical_path,
     fingerprint,
     makedirs_secret,
@@ -182,18 +184,58 @@ def _parse_mode(value) -> Optional[int]:
     )
 
 
+class FilePlan(NamedTuple):
+    # create | unchanged | chmod | update | replace | error
+    action: str
+    reason: str = ""  # replace: why the existing file is moved aside; error: what failed
+    existing: Optional[bytes] = None
+
+
+def _replace(target: str, reason: str, existing: Optional[bytes] = None) -> FilePlan:
+    refused = aside_refused(target)
+    if refused:
+        return FilePlan("error", refused)
+    return FilePlan("replace", reason, existing)
+
+
+def plan_file(target: str, desired: bytes, desired_mode: int, record) -> FilePlan:
+    """What deploying ``desired`` to ``target`` does; shared by deploy and diff."""
+    if not os.path.lexists(target):
+        return FilePlan("create")
+    if os.path.islink(target):
+        return _replace(target, "a symlink")
+    if not os.path.isfile(target):
+        return FilePlan("error", f"{target} exists and is not a regular file")
+    try:
+        with open(target, "rb") as f:
+            existing = f.read()
+    except OSError as e:
+        return FilePlan("error", f"cannot read {target}: {e}")
+    if existing == desired:
+        if stat.S_IMODE(os.lstat(target).st_mode) == desired_mode:
+            return FilePlan("unchanged", existing=existing)
+        return FilePlan("chmod", existing=existing)
+    if not _tracked(target, record):
+        return _replace(target, "not tracked by tools", existing)
+    if hashlib.sha256(existing).hexdigest() != record.get("hash"):
+        return _replace(target, "modified since tools wrote it", existing)
+    return FilePlan("update", existing=existing)
+
+
 def _copy_file(
     source: str,
     target: str,
     mode: Optional[int],
     *,
     secrets: bool = False,
-    tracked: bool = True,
+    record=None,
 ) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
 
     Returns (result, source_hash) where result is:
-    True if written, False on error, None if up to date and mode matches.
+    True if written, False on error, None if up to date.
+
+    A target tools did not write, or that changed since, is moved aside first.
 
     When ``secrets`` is true — or either side (incoming or existing)
     trips the ``looks_like_secret`` heuristic — the inline diff body is
@@ -210,47 +252,55 @@ def _copy_file(
 
     source_hash = hashlib.sha256(desired).hexdigest()
     desired_mode = mode if mode is not None else stat.S_IMODE(os.stat(source).st_mode)
-
-    if os.path.exists(target):
-        try:
-            with open(target, "rb") as f:
-                existing = f.read()
-        except OSError as e:
-            log(f"Failed to read {target}: {e}", Color.RED)
-            return False, source_hash
-
-        existing_mode = stat.S_IMODE(os.stat(target).st_mode)
-        if existing == desired and existing_mode == desired_mode:
-            return None, source_hash
-        action = "Updated" if tracked else "Replaced untracked"
-        is_secret = secrets or looks_like_secret(desired) or looks_like_secret(existing)
-        # Content tools never wrote is never shown: it may hold hand-written secrets.
-        if is_secret or not tracked:
-            diff_body = None
-        else:
-            diff_body = format_diff_bytes(desired, existing, target)
-    else:
-        action = "Created"
-        diff_body = None
-
+    fp = plan_file(target, desired, desired_mode, record)
     try:
         dirname = os.path.dirname(target)
-        if dirname:
+        if fp.action == "create" and dirname:
             os.makedirs(dirname, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dirname or ".")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(desired)
-            os.chmod(tmp_path, desired_mode)
-            os.replace(tmp_path, target)
-        except BaseException:
-            os.unlink(tmp_path)
-            raise
+        if fp.action == "create":
+            atomic_write(target, desired, desired_mode, exclusive=True)
+            log(f"Created: {target}", Color.GREEN)
+            return True, source_hash
+    except FileExistsError:
+        # Appeared since planning: judge it like any existing file.
+        fp = plan_file(target, desired, desired_mode, record)
     except OSError as e:
         log(f"Failed to write {target}: {e}", Color.RED)
         return False, source_hash
 
-    log(f"{action}: {target}", Color.GREEN)
+    if fp.action == "unchanged":
+        return None, source_hash
+    if fp.action == "error":
+        log(f"files: {fp.reason}", Color.RED)
+        return False, source_hash
+    if fp.action == "chmod":
+        try:
+            os.chmod(target, desired_mode)
+        except OSError as e:
+            log(f"Failed to chmod {target}: {e}", Color.RED)
+            return False, source_hash
+        log(f"Chmod: {target} -> {oct(desired_mode)}", Color.GREEN)
+        return True, source_hash
+    if fp.action == "create":
+        log(f"files: {target} keeps changing; not writing it", Color.RED)
+        return False, source_hash
+
+    diff_body = None
+    if fp.action == "update":
+        is_secret = secrets or looks_like_secret(desired) or looks_like_secret(fp.existing)
+        if not is_secret:
+            diff_body = format_diff_bytes(desired, fp.existing, target)
+    # Content moved aside is never shown: it may hold hand-written secrets.
+
+    try:
+        moved = atomic_write(target, desired, desired_mode, backup=fp.action == "replace")
+    except OSError as e:
+        log(f"Failed to write {target}: {e}", Color.RED)
+        return False, source_hash
+
+    if moved:
+        log(f"Moved aside ({fp.reason}): {target} -> {moved}", Color.YELLOW)
+    log(f"{'Updated' if fp.action == 'update' else 'Replaced'}: {target}", Color.GREEN)
     if diff_body:
         print(diff_body)
     return True, source_hash
@@ -325,6 +375,9 @@ def _resolve_entries(
         if not isinstance(entry, dict):
             errors.append(f"entry must be a mapping: {entry!r}")
             continue
+        if "force" in entry:
+            errors.append(f"{FORCE_REMOVED}: {entry!r}")
+            continue
         try:
             entry_mode = _parse_mode(entry.get("mode"))
         except (TypeError, ValueError) as e:
@@ -372,7 +425,13 @@ def _resolve_entries(
                     target = os.path.join(home, rel)
                     dir_pairs.append(
                         Entry(
-                            target, source, entry_mode, entry_secrets, on_change, False, on_update
+                            target,
+                            source,
+                            entry_mode,
+                            entry_secrets,
+                            on_change,
+                            False,
+                            on_update,
                         )
                     )
             continue
@@ -471,12 +530,9 @@ def install_files(
             elif result is not False:
                 released.add(target)
         else:
+            record = state_files.get(target)
             result, source_hash = _copy_file(
-                e.source,
-                target,
-                e.mode,
-                secrets=e.secrets,
-                tracked=_tracked(target, state_files.get(target)),
+                e.source, target, e.mode, secrets=e.secrets, record=record
             )
             if source_hash and result is not False:
                 managed[target] = _record(target, source_hash)

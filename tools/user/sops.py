@@ -24,6 +24,7 @@ Values never reach logs, diff output or state: changes are reported as
 path + action, and ownership records keep inode/mtime, not a content hash.
 """
 
+import errno
 import json
 import os
 import secrets as _secrets
@@ -58,7 +59,6 @@ _SECRET_KEYS = {
     "group",
     "generate",
     "restartUnits",
-    "force",
 }
 _TOP_KEYS = {
     "binary",
@@ -98,7 +98,6 @@ class Secret:
     format: str = "yaml"
     generate: Optional[Generate] = None
     notify: Tuple[str, ...] = ()
-    force: bool = False  # replace an existing file tools does not track
 
 
 @dataclass(frozen=True)
@@ -237,6 +236,8 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
                 raise ValueError(f"invalid secret name {name!r}")
             if not isinstance(spec, Mapping):
                 raise ValueError(f"{name}: spec must be a mapping")
+            if "force" in spec:
+                raise ValueError(f"{name}: {fsutil.FORCE_REMOVED}")
             bad = set(spec) - _SECRET_KEYS
             if bad:
                 raise ValueError(f"{name}: unknown keys {sorted(bad)}")
@@ -250,9 +251,6 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
             for other, other_name in seen_paths.items():
                 if fsutil.is_within(canon, other) or fsutil.is_within(other, canon):
                     raise ValueError(f"{name}: path {path} nests with secret {other_name}")
-            force = spec.get("force", False)
-            if not isinstance(force, bool):
-                raise ValueError(f"{name}: force must be a bool")
             notify = spec.get("restartUnits")
             notify = [] if notify is None else notify
             if not isinstance(notify, list) or not all(isinstance(n, str) for n in notify):
@@ -267,7 +265,6 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
                 owner=spec.get("owner"),
                 group=spec.get("group"),
                 notify=tuple(notify),
-                force=force,
             )
             if "generate" in spec:
                 if {"key", "sopsFile", "format"} & set(spec):
@@ -487,6 +484,7 @@ class Change:
     action: str
     desired: Optional[bytes] = None
     error: Optional[str] = None
+    aside: Optional[str] = None  # why the existing file is moved aside before writing
 
 
 @dataclass
@@ -532,17 +530,11 @@ def plan(
 
         if s.generate is not None:
             # The value is never rewritten; only mode/owner are reconciled.
+            # An untracked existing file is adopted as the generated value.
             if not current.exists:
                 changes.append(Change(s, "generate"))
-            elif not tracked and not s.force:
-                changes.append(
-                    Change(
-                        s,
-                        "error",
-                        error=f"{s.name}: {s.path} exists and is not tracked by tools; "
-                        "set force: true to adopt it as the generated value",
-                    )
-                )
+            elif current.symlink:
+                changes.append(Change(s, "generate", aside="a symlink"))
             elif current.error:
                 changes.append(
                     Change(s, "error", error=f"{s.name}: cannot read {s.path} ({current.error})")
@@ -563,24 +555,20 @@ def plan(
             else:
                 changes.append(Change(s, "error", error=str(e)))
             continue
-        if current.error:
+        if current.symlink:
+            changes.append(Change(s, "replace", desired, aside="a symlink"))
+        elif current.error:
             changes.append(
                 Change(s, "error", error=f"{s.name}: cannot read {s.path} ({current.error})")
             )
         elif not current.exists:
             changes.append(Change(s, "create", desired))
         elif current.content != desired and not tracked:
-            if s.force:
-                changes.append(Change(s, "replace", desired))
-            else:
-                changes.append(
-                    Change(
-                        s,
-                        "error",
-                        error=f"{s.name}: {s.path} exists and is not tracked by tools; "
-                        "set force: true to replace it",
-                    )
-                )
+            changes.append(Change(s, "replace", desired, aside="not tracked by tools"))
+        elif current.content != desired and not fsutil.matches_fingerprint(
+            s.path, installed.get(s.path) or {}
+        ):
+            changes.append(Change(s, "replace", desired, aside="modified since tools wrote it"))
         elif current.content != desired:
             changes.append(Change(s, "update", desired))
         elif not fsutil.attrs_match(current, s.mode, uid, gid):
@@ -588,6 +576,10 @@ def plan(
         else:
             changes.append(Change(s, "unchanged" if tracked else "adopt", desired))
 
+    for ch in changes:
+        refused = ch.aside and fsutil.aside_refused(ch.secret.path)
+        if refused:
+            ch.action, ch.error = "error", f"{ch.secret.name}: {refused}"
     desired_paths = {s.path for s in parsed.secrets}
     remove: List[str] = []
     forget: List[Tuple[str, str]] = []
@@ -696,12 +688,30 @@ def apply(
                 fsutil.apply_attrs(s.path, s.mode, uid, gid)
             else:
                 fsutil.makedirs_secret(os.path.dirname(s.path), settings.secrets_dir, created_dirs)
+                backup = ch.aside is not None
                 if ch.action == "generate":
                     g = s.generate
                     value = "".join(_secrets.choice(g.chars) for _ in range(g.length))
-                    fsutil.atomic_write(s.path, value.encode(), s.mode, uid, gid, exclusive=True)
+                    try:
+                        moved = fsutil.atomic_write(
+                            s.path, value.encode(), s.mode, uid, gid, exclusive=True, backup=backup
+                        )
+                    except FileExistsError:
+                        # Appeared since planning: adopted as the value, as in plan.
+                        current = fsutil.read_current(s.path)
+                        if current.error:
+                            raise OSError(
+                                errno.EEXIST, f"{s.path} appeared during this run"
+                            ) from None
+                        fsutil.apply_attrs(s.path, s.mode, uid, gid)
+                        installed[s.path] = _record(s)
+                        continue
+                elif ch.action == "create":
+                    moved, ch.aside = fsutil.create_or_replace(s.path, ch.desired, s.mode, uid, gid)
                 else:
-                    fsutil.atomic_write(s.path, ch.desired, s.mode, uid, gid)
+                    moved = fsutil.atomic_write(s.path, ch.desired, s.mode, uid, gid, backup=backup)
+                if moved:
+                    log(f"Moved aside ({ch.aside}): {s.path} -> {moved}", Color.YELLOW)
         except (OSError, KeyError, ValueError) as e:
             log(f"sops: failed to write {s.path}: {e}", Color.RED)
             res.success = False
@@ -712,7 +722,7 @@ def apply(
         verb = {
             "create": "Decrypted",
             "update": "Updated",
-            "replace": "Replaced untracked",
+            "replace": "Replaced",
             "chmod": "Chmod",
             "generate": "Generated",
         }
@@ -758,8 +768,10 @@ def describe(p: Plan) -> List[str]:
         elif ch.action == "pending":
             rows.append(f"  ~ decrypt {s.path} (pending: {ch.error})")
         elif ch.action in labels:
-            suffix = {"chmod": f" -> {oct(s.mode)}", "replace": " (secret, not tracked by tools)"}
-            suffix = suffix.get(ch.action, " (secret)")
+            if ch.aside:
+                suffix = f" (secret; {fsutil.aside_note(s.path, ch.aside)})"
+            else:
+                suffix = f" -> {oct(s.mode)}" if ch.action == "chmod" else " (secret)"
             rows.append(f"  {labels[ch.action]} {s.path}{suffix}")
             rows += [f"    notify: {n}" for n in s.notify]
     rows += [f"  ~ keep {path} (is {reason}; not removed)" for path, reason in p.keep]

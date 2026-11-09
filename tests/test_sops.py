@@ -15,6 +15,28 @@ from tools.user import secrets_flow, sops
 SECRET_VALUE = "hunter2-very-secret"
 
 
+def backups(path):
+    d, base = os.path.split(path)
+    return sorted(os.path.join(d, n) for n in os.listdir(d) if n == base + ".tools")
+
+
+def appearing(content):
+    """Patch fsutil.atomic_write so the target appears just before an exclusive create."""
+    real = fsutil.atomic_write
+
+    def write(path, *args, **kwargs):
+        if kwargs.get("exclusive") and not os.path.lexists(path):
+            with open(path, "w") as f:
+                f.write(content)
+        return real(path, *args, **kwargs)
+
+    return mock.patch.object(fsutil, "atomic_write", side_effect=write)
+
+
+def aside(path, reason):
+    return f"{reason}; old file moved aside to {path}.tools"
+
+
 class FakeSops:
     """Stands in for the sops and ssh-to-age binaries: {file: decrypted document}."""
 
@@ -351,7 +373,7 @@ class AtomicWriteTest(unittest.TestCase):
         self.assertIn("symlink", current.error)
         self.assertNotEqual(fsutil.fingerprint(self.path), fsutil.fingerprint(pointee))
 
-    def test_secret_at_unmanaged_symlink_refused(self):
+    def test_secret_at_unmanaged_symlink_moved_aside(self):
         pointee = os.path.join(self.tmp, "p")
         with open(pointee, "w") as f:
             f.write("v")
@@ -364,14 +386,17 @@ class AtomicWriteTest(unittest.TestCase):
         parsed = sops.parse_sops(raw)
         runner = lambda cmd, env: (0, b'{"k": "v"}', "")  # noqa: E731
         p = sops.plan(parsed, {}, sops.Decryptor(parsed.settings, runner=runner, env={}))
-        self.assertEqual(p.changes[0].action, "error")
-        self.assertIn("is a symlink", p.changes[0].error)
+        self.assertEqual((p.changes[0].action, p.changes[0].aside), ("replace", "a symlink"))
         installed = {}
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertFalse(sops.apply(p, parsed.settings, installed).success)
-        self.assertEqual(installed, {})
+            self.assertTrue(sops.apply(p, parsed.settings, installed).success)
+        self.assertIn(self.path, installed)
         self.assertEqual(stat.S_IMODE(os.stat(pointee).st_mode), 0o644)
-        self.assertTrue(os.path.islink(self.path))
+        with open(pointee) as f:
+            self.assertEqual(f.read(), "v")
+        self.assertFalse(os.path.islink(self.path))
+        [backup] = backups(self.path)
+        self.assertEqual(os.readlink(backup), pointee)
 
     def test_generate_works_without_hardlinks(self):
         raw = {"secretsDir": self.tmp, "secrets": {"jwt": {"generate": {"length": 16}}}}
@@ -677,28 +702,112 @@ class OwnershipTest(SopsTestBase):
         self.assertTrue(os.path.exists(os.path.join(repo, "tok")))
         self.assertIn(path, self.state["sops"]["installed"])
 
-    def test_untracked_existing_file_refused_unless_force(self):
+    def test_untracked_existing_file_moved_aside(self):
         path = os.path.join(self.tmp, "ssh", "config")
         os.makedirs(os.path.dirname(path))
         with open(path, "w") as f:
             f.write("Host handwritten\n")
+        os.chmod(path, 0o600)
         raw = self.config({"tok": {"key": "token", "path": path}})
-        rows = self.diff(raw)
-        self.assertIn("exists and is not tracked by tools; set force: true", rows[0])
-        ok, _ = self.deploy(raw)
-        self.assertFalse(ok)
-        self.assertEqual(self.read(path), "Host handwritten\n")
-        self.assertNotIn(path, self.state["sops"]["installed"])
-
-        raw = self.config({"tok": {"key": "token", "path": path, "force": True}})
-        self.assertEqual(self.diff(raw), [f"  ~ replace {path} (secret, not tracked by tools)"])
+        why = aside(path, "not tracked by tools")
+        self.assertEqual(self.diff(raw), [f"  ~ replace {path} (secret; {why})"])
         ok, out = self.deploy(raw)
         self.assertTrue(ok)
-        self.assertIn(f"Replaced untracked: {path}", out)
+        [backup] = backups(path)
+        self.assertIn(f"Moved aside (not tracked by tools): {path} -> {backup}", out)
+        self.assertIn(f"Replaced: {path}", out)
+        self.assertNotIn("handwritten", out)
         self.assertEqual(self.read(path), SECRET_VALUE)
+        self.assertEqual(self.read(backup), "Host handwritten\n")
+        self.assertEqual(self.mode(backup), 0o600)
+        self.assertEqual(self.mode(path), 0o400)
         self.assertEqual(self.diff(raw), [])
-        p = sops.parse_sops({**raw, "secrets": {"t": {"key": "k", "force": "yes"}}})
-        self.assertIn("force must be a bool", p.errors[0])
+        self.assertEqual(backups(path), [backup])
+
+    def test_tracked_unchanged_file_updated_without_backup(self):
+        path = os.path.join(self.tmp, "tok")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        self.assertTrue(self.deploy(raw)[0])
+        self.fake.docs[self.main]["token"] = "rotated"
+        self.assertEqual(self.diff(raw), [f"  ~ update {path} (secret)"])
+        self.assertTrue(self.deploy(raw)[0])
+        self.assertEqual(self.read(path), "rotated")
+        self.assertEqual(backups(path), [])
+
+    def test_tracked_hand_edited_file_moved_aside(self):
+        path = os.path.join(self.tmp, "tok")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        self.assertTrue(self.deploy(raw)[0])
+        os.chmod(path, 0o600)
+        with open(path, "w") as f:
+            f.write("hand-edited")
+        os.chmod(path, 0o400)
+        why = aside(path, "modified since tools wrote it")
+        self.assertEqual(self.diff(raw), [f"  ~ replace {path} (secret; {why})"])
+        self.assertTrue(self.deploy(raw)[0])
+        self.assertEqual(self.read(path), SECRET_VALUE)
+        [backup] = backups(path)
+        self.assertEqual(self.read(backup), "hand-edited")
+        self.assertEqual(self.mode(backup), 0o400)
+
+    def test_second_drift_refused_until_backup_removed(self):
+        path = os.path.join(self.tmp, "tok")
+        other = os.path.join(self.tmp, "other")
+        with open(path, "w") as f:
+            f.write("one")
+        raw = self.config(
+            {"tok": {"key": "token", "path": path}, "dom": {"key": "externalDomain", "path": other}}
+        )
+        self.assertTrue(self.deploy(raw)[0])
+        [backup] = backups(path)
+        os.chmod(path, 0o600)
+        with open(path, "w") as f:
+            f.write("two")
+        rows = self.diff(raw)
+        self.assertIn(f"  ! tok: {path} changed again; an earlier backup {backup} exists", rows[0])
+        ok, _ = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertEqual(self.read(path), "two")
+        self.assertEqual(backups(path), [backup])
+        self.assertEqual(self.read(other), "example.test")
+        os.remove(backup)
+        self.assertTrue(self.deploy(raw)[0])
+        self.assertEqual(self.read(path), SECRET_VALUE)
+        self.assertEqual(len(backups(path)), 1)
+
+    def test_target_appearing_after_plan_is_moved_aside(self):
+        path = os.path.join(self.tmp, "tok")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        with appearing("raced"):
+            self.assertTrue(self.deploy(raw)[0])
+        self.assertEqual(self.read(path), SECRET_VALUE)
+        [backup] = backups(path)
+        self.assertEqual(self.read(backup), "raced")
+
+    def test_target_appearing_with_earlier_backup_is_an_error(self):
+        path = os.path.join(self.tmp, "tok")
+        with open(path + ".tools", "w") as f:
+            f.write("old")
+        raw = self.config({"tok": {"key": "token", "path": path}})
+        with appearing("raced"):
+            ok, out = self.deploy(raw)
+        self.assertFalse(ok)
+        self.assertIn("changed again", out)
+        self.assertEqual(self.read(path), "raced")
+
+    def test_generated_target_appearing_after_plan_is_adopted(self):
+        path = os.path.join(self.tmp, "gen")
+        raw = self.config({"tok": {"generate": {}, "path": path}})
+        with appearing("raced"):
+            self.assertTrue(self.deploy(raw)[0])
+        self.assertEqual(self.read(path), "raced")
+        self.assertEqual(self.mode(path), 0o400)
+        self.assertTrue(self.state["sops"]["installed"][path]["generated"])
+        self.assertEqual(backups(path), [])
+
+    def test_force_key_is_an_error(self):
+        p = sops.parse_sops({"secrets": {"t": {"key": "k", "force": True}}})
+        self.assertIn("tools now always moves the old file aside", p.errors[0])
 
     def test_respelled_path_keeps_secret_and_single_entry(self):
         real = os.path.join(self.tmp, "Sec")
@@ -734,20 +843,34 @@ class GenerateTest(SopsTestBase):
         self.assertEqual(self.diff(raw), [])
         self.assertEqual(self.fake.calls, [])
 
-    def test_existing_value_adopted_only_with_force(self):
+    def test_symlink_at_generated_path_moved_aside(self):
+        pointee = os.path.join(self.tmp, "pointee")
+        with open(pointee, "w") as f:
+            f.write("theirs")
+        path = os.path.join(self.tmp, "gen", "tok")
+        os.makedirs(os.path.dirname(path))
+        os.symlink(pointee, path)
+        raw = self.config({"tok": {"generate": {}, "path": path}})
+        self.assertEqual(
+            self.diff(raw), [f"  + generate {path} (secret; {aside(path, 'a symlink')})"]
+        )
+        ok, _ = self.deploy(raw)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.islink(path))
+        self.assertEqual(len(self.read(path)), 64)
+        [backup] = backups(path)
+        self.assertEqual(os.readlink(backup), pointee)
+
+    def test_existing_untracked_value_adopted(self):
         path = os.path.join(self.tmp, "forgejo", "internal_token")
         os.makedirs(os.path.dirname(path))
         with open(path, "w") as f:
             f.write("pre-existing")
         os.chmod(path, 0o644)
-        ok, out = self.deploy(self.config({"tok": {"generate": {}, "path": path}}))
-        self.assertFalse(ok)
-        self.assertIn("set force: true to adopt it", out)
-        self.assertEqual(self.mode(path), 0o644)
-        self.assertNotIn(path, self.state["sops"]["installed"])
-        ok, _ = self.deploy(self.config({"tok": {"generate": {}, "path": path, "force": True}}))
+        ok, _ = self.deploy(self.config({"tok": {"generate": {}, "path": path}}))
         self.assertTrue(ok)
         self.assertEqual(self.read(path), "pre-existing")
+        self.assertEqual(backups(path), [])
         self.assertEqual(self.mode(path), 0o400)
         self.assertTrue(self.state["sops"]["installed"][path]["generated"])
 
@@ -970,10 +1093,13 @@ class FixesTest(SopsTestBase):
         with open(os.path.join(b, "tok"), "w") as f:
             f.write("hand-written")
         rows = self.diff(raw)
-        self.assertIn("exists and is not tracked by tools; set force: true", rows[0])
+        why = aside(path, "not tracked by tools")
+        self.assertEqual(rows, [f"  ~ replace {path} (secret; {why})"])
         ok, _ = self.deploy(raw)
-        self.assertFalse(ok)
-        self.assertEqual(self.read(os.path.join(b, "tok")), "hand-written")
+        self.assertTrue(ok)
+        self.assertEqual(self.read(os.path.join(b, "tok")), SECRET_VALUE)
+        [backup] = backups(os.path.join(b, "tok"))
+        self.assertEqual(self.read(backup), "hand-written")
 
     def test_removed_same_inode_other_file_is_not_removed(self):
         raw = self.config({"t": {"key": "token"}})

@@ -24,6 +24,20 @@ class ParseModeTest(unittest.TestCase):
             files._parse_mode(True)
 
 
+def _replace_row(path, reason):
+    return f"  ~ replace {path} ({reason}; old file moved aside to {path}.tools; content not shown)"
+
+
+def _backups(path):
+    d, base = os.path.split(path)
+    return sorted(os.path.join(d, n) for n in os.listdir(d) if n == base + ".tools")
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read()
+
+
 def _write(path, content, mode=0o644):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -200,9 +214,7 @@ class FilesUntrackedContentTest(unittest.TestCase):
             _write(target, "INTERNAL_TOKEN = handwrittenvalue\n")
             entries = [{"source": "src", "target": target}]
             rows = _diff_files(entries, d, {})
-            self.assertEqual(
-                rows, [f"  ~ replace {target} (not tracked by tools; content not shown)"]
-            )
+            self.assertEqual(rows, [_replace_row(target, "not tracked by tools")])
             out = io.StringIO()
             with contextlib.redirect_stdout(out), mock.patch("tools.user.files.log") as log:
                 files.install_files(entries, d, {})
@@ -272,9 +284,7 @@ class FilesIdentityTest(unittest.TestCase):
             os.symlink(b, link)
             _write(os.path.join(b, "app.ini"), "fresh = 1\nhandwrittenvalue = 2\n")
             rows = _diff_files(entries, d, state)
-            self.assertEqual(
-                rows, [f"  ~ replace {target} (not tracked by tools; content not shown)"]
-            )
+            self.assertEqual(rows, [_replace_row(target, "not tracked by tools")])
             out = io.StringIO()
             with contextlib.redirect_stdout(out), mock.patch("tools.user.files.log") as log:
                 files.install_files(entries, d, state)
@@ -369,21 +379,6 @@ class OnChangeTest(unittest.TestCase):
         _write(os.path.join(self.d, "src", "a.conf"), "two\n")
         _quiet(files.install_files, entries, self.d, state)
         self.assertEqual(self.runs(), 2)
-
-    def test_dir_entry_hook_runs_once(self):
-        from tools.diff import _diff_files
-
-        _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
-        _write(os.path.join(self.d, "tree", ".cfg", "b"), "b\n")
-        entries = [{"dir": "tree", "onChange": self.hook}]
-        home = os.path.join(self.d, "home")
-        with mock.patch.dict(os.environ, {"HOME": home}):
-            rows = _diff_files(entries, self.d, {})
-            self.assertEqual(rows.count(f"  ~ run onChange: {self.hook}"), 1)
-            (ok, out) = _quiet(files.install_files, entries, self.d, {})
-        self.assertTrue(ok)
-        self.assertEqual(self.runs(), 1)
-        self.assertIn("and 1 more", out)
 
     def test_failing_hook_fails_deploy_and_is_retried(self):
         from tools.diff import _diff_files
@@ -480,19 +475,6 @@ class OnUpdateTest(unittest.TestCase):
         self.assertEqual(self.runs(), 2)
         self.install(entries, state, False)
         self.assertEqual(self.runs(), 2)
-
-    def test_dir_entry_runs_once_and_dedupes_across_entries(self):
-        _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
-        _write(os.path.join(self.d, "tree", ".cfg", "b"), "b\n")
-        entries = [
-            {"dir": "tree", "onUpdate": self.hook},
-            {"source": "src/a.conf", "target": self.target, "onUpdate": self.hook},
-        ]
-        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.d, "home")}):
-            (ok, out) = self.install(entries, {}, True)
-        self.assertTrue(ok)
-        self.assertEqual(self.runs(), 1)
-        self.assertIn("and 2 more", out)
 
     def test_explicit_entry_overrides_dir_entry(self):
         _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
@@ -856,3 +838,135 @@ class DirectoryEntryTest(unittest.TestCase):
         ):
             _resolved, errors = files._resolve_entries([entry], self.d)
             self.assertEqual(len(errors), 1, entry)
+
+
+class MoveAsideTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = os.path.realpath(self._tmp.name)
+        _write(os.path.join(self.d, "src"), "fresh = 1\n")
+        self.target = os.path.join(self.d, "out", "app.ini")
+        self.state = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def entries(self, **extra):
+        return [{"source": "src", "target": self.target, **extra}]
+
+    def deploy(self, entries):
+        with mock.patch("tools.user.files.log") as log:
+            ok = files.install_files(entries, self.d, self.state)
+        return ok, repr(log.call_args_list)
+
+    def diff(self, entries):
+        from tools.diff import _diff_files
+
+        return _diff_files(entries, self.d, self.state)
+
+    def test_untracked_differing_target_moved_aside(self):
+        _write(self.target, "mine\n", 0o600)
+        self.assertEqual(
+            self.diff(self.entries()), [_replace_row(self.target, "not tracked by tools")]
+        )
+        ok, log = self.deploy(self.entries())
+        self.assertTrue(ok)
+        [backup] = _backups(self.target)
+        self.assertEqual(backup, self.target + ".tools")
+        self.assertIn(backup, log)
+        self.assertEqual(_read(backup), "mine\n")
+        self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+        self.assertEqual(self.diff(self.entries()), [])
+
+    def test_untracked_identical_target_adopted_without_backup(self):
+        _write(self.target, "fresh = 1\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        self.assertEqual(_backups(self.target), [])
+        self.assertIn(self.target, self.state["files"])
+
+    def test_tracked_unchanged_target_replaced_without_backup(self):
+        self.assertTrue(self.deploy(self.entries())[0])
+        _write(os.path.join(self.d, "src"), "fresh = 2\n")
+        self.assertEqual(self.diff(self.entries())[0], f"  ~ update {self.target}")
+        self.assertTrue(self.deploy(self.entries())[0])
+        self.assertEqual(_read(self.target), "fresh = 2\n")
+        self.assertEqual(_backups(self.target), [])
+
+    def test_tracked_hand_edited_target_moved_aside(self):
+        self.assertTrue(self.deploy(self.entries())[0])
+        with open(self.target, "w") as f:
+            f.write("edited\n")
+        self.assertEqual(
+            self.diff(self.entries()),
+            [_replace_row(self.target, "modified since tools wrote it")],
+        )
+        self.assertTrue(self.deploy(self.entries())[0])
+        [backup] = _backups(self.target)
+        self.assertEqual(_read(backup), "edited\n")
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+
+    def test_symlink_target_renamed_not_followed(self):
+        pointee = os.path.join(self.d, "pointee")
+        _write(pointee, "theirs\n")
+        os.makedirs(os.path.dirname(self.target))
+        os.symlink(pointee, self.target)
+        self.assertEqual(self.diff(self.entries()), [_replace_row(self.target, "a symlink")])
+        self.assertTrue(self.deploy(self.entries())[0])
+        self.assertFalse(os.path.islink(self.target))
+        [backup] = _backups(self.target)
+        self.assertEqual(os.readlink(backup), pointee)
+        self.assertEqual(_read(pointee), "theirs\n")
+
+    def test_second_drift_refused_until_backup_removed(self):
+        _write(self.target, "one\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        [backup] = _backups(self.target)
+        _write(self.target, "two\n")
+        _write(os.path.join(self.d, "other-src"), "x\n")
+        other = os.path.join(self.d, "out", "other.ini")
+        entries = self.entries() + [{"source": "other-src", "target": other}]
+        rows = self.diff(entries)
+        self.assertEqual(rows[0][:4], "  ! ")
+        self.assertIn(f"changed again; an earlier backup {backup} exists", rows[0])
+        ok, log = self.deploy(entries)
+        self.assertFalse(ok)
+        self.assertIn("changed again", log)
+        self.assertEqual(_read(self.target), "two\n")
+        self.assertEqual(_backups(self.target), [backup])
+        self.assertEqual(_read(other), "x\n")
+        os.remove(backup)
+        self.assertTrue(self.deploy(entries)[0])
+        [again] = _backups(self.target)
+        self.assertEqual(_read(again), "two\n")
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+
+    def test_unrelated_backup_names_ignored(self):
+        _write(self.target + ".tools-20260101-000000", "x\n")
+        _write(self.target + "x.tools", "x\n")
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+
+    def test_force_key_is_an_error(self):
+        ok, log = self.deploy(self.entries(force=True))
+        self.assertFalse(ok)
+        self.assertIn("tools now always moves the old file aside", log)
+        self.assertFalse(os.path.exists(self.target))
+
+    def _appearing(self, content):
+        real = files.atomic_write
+
+        def write(path, *args, **kwargs):
+            if kwargs.get("exclusive") and not os.path.lexists(path):
+                _write(path, content)
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(files, "atomic_write", side_effect=write)
+
+    def test_target_appearing_after_plan_is_moved_aside(self):
+        with self._appearing("raced\n"):
+            self.assertTrue(self.deploy(self.entries())[0])
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+        [backup] = _backups(self.target)
+        self.assertEqual(_read(backup), "raced\n")

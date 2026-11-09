@@ -1,6 +1,5 @@
 """Dry-run diff: show what deploy would change without modifying anything."""
 
-import hashlib
 import os
 import stat
 from typing import Dict, List
@@ -233,7 +232,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
     Resolves entries via `_resolve_entries`, compares each desired entry
     against the live filesystem, and accounts for cleanup against state.
     """
-    from tools.fsutil import removal_blocked, respell, same_file_as
+    from tools.fsutil import aside_note, removal_blocked, respell, same_file_as
     from tools.user.files import (
         _conflict,
         _dir_kept,
@@ -243,8 +242,8 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
         _removable,
         _removal_order,
         _resolve_entries,
-        _tracked,
         declared_hooks,
+        plan_file,
     )
     from tools.util import pending_hooks
 
@@ -277,8 +276,6 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
                 desired_mode
             ):
                 changes.append(f"  ~ chmod {target} -> {oct(desired_mode)}")
-        elif not os.path.exists(target):
-            changes.append(f"  + create {target}")
         else:
             try:
                 with open(source, "rb") as f:
@@ -286,34 +283,29 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
             except OSError:
                 changes.append(f"  ? cannot read source {source}")
                 continue
-            try:
-                with open(target, "rb") as f:
-                    tgt_bytes = f.read()
-            except OSError:
-                changes.append(f"  ? cannot read {target}")
-                continue
-
-            src_hash = hashlib.sha256(src_bytes).hexdigest()
-            tgt_hash = hashlib.sha256(tgt_bytes).hexdigest()
-
-            target_mode = stat.S_IMODE(os.stat(target).st_mode)
             source_mode = stat.S_IMODE(os.stat(source).st_mode)
             effective_mode = desired_mode if desired_mode is not None else source_mode
-
-            if src_hash != tgt_hash:
-                is_secret = secrets or looks_like_secret(src_bytes) or looks_like_secret(tgt_bytes)
-                if not _tracked(target, state_files.get(target)):
-                    changes.append(
-                        f"  ~ replace {target} (not tracked by tools; content not shown)"
-                    )
-                elif is_secret:
+            fp = plan_file(target, src_bytes, effective_mode, state_files.get(target))
+            if fp.action == "create":
+                changes.append(f"  + create {target}")
+            elif fp.action == "error":
+                changes.append(f"  ! {fp.reason}")
+                continue
+            elif fp.action == "replace":
+                note = aside_note(target, fp.reason)
+                changes.append(f"  ~ replace {target} ({note}; content not shown)")
+            elif fp.action == "update":
+                is_secret = (
+                    secrets or looks_like_secret(src_bytes) or looks_like_secret(fp.existing)
+                )
+                if is_secret:
                     changes.append(f"  ~ update {target} (secret, diff suppressed)")
                 else:
                     changes.append(f"  ~ update {target}")
-                    diff_text = format_diff_bytes(src_bytes, tgt_bytes, target)
+                    diff_text = format_diff_bytes(src_bytes, fp.existing, target)
                     if diff_text:
                         changes.append(diff_text)
-            elif effective_mode != target_mode:
+            elif fp.action == "chmod":
                 changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
         if e.on_change and len(changes) > before:
