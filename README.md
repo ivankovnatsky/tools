@@ -228,7 +228,8 @@ templates:
 - `content`: text for `raw`, mapping for `ini`/`env`/`toml`, mapping or list for `yaml`/`json`.
 - `env` values are shell single-quoted; `quote: false` writes `KEY=value`.
 - `${sops:}` renders from the same decryption as `sops`, so diff and deploy agree.
-- Default mode `0400`; `owner`/`group`/`force` and new dirs as in sops.
+- Default mode `0400`; `owner`/`group` and new dirs as in sops.
+- An existing untracked file with different content is skipped with a warning, not an error; `force: true` replaces it.
 - With an invalid `sops:` section, templates without `path` are errors; there's no fallback to the default directory.
 - Content is masked in diff/deploy output when it uses `${sops:}`, has `secrets: true`, was secret before, or looks like a key.
 
@@ -242,7 +243,7 @@ templates:
 - Only tracked, unmodified files are removed; any invalid entry holds removals.
 - Nothing is removed through a managed link.
 - sops/templates state keeps device, inode and mtime, never values or hashes.
-- An untracked existing file's content is never shown; sops/templates replace it only with `force: true`, `files:` as before.
+- An untracked existing file's content is never shown; sops/templates replace it only with `force: true` (sops refuses, templates skip), `files:` as before.
 - State entries match declared paths by file identity, so a respelled path (alias, case) is the same entry.
 - A tracked entry also records the file's device and inode; another file at that path (for example behind a repointed parent symlink) counts as untracked. A changed device number alone (APFS renumbers at mount) is accepted when the inode and mtime (or the `files:` hash) still match, and is re-recorded.
 - `sops`/`templates` paths outside every `gitRepos` destination are written before `gitRepos` (so clones can use them); paths inside one, secrets whose `sopsFile` is inside one, templates using such a secret, then removals, after it. `tools diff` lists them in that order (`sops (after gitRepos)`).
@@ -266,7 +267,7 @@ templates:
 | Diff | n/a | path + action, content masked | no secrets in logs |
 | `generate` | n/a | create-once random secrets | first-run app secrets |
 | `owner` default | `root` (system module) | the user running tools | user-level tool |
-| Untracked file at `path`/template path | overwritten | refused unless `force: true` | never clobber hand-written files |
+| Untracked file at `path`/template path | overwritten | sops: refused, templates: skipped, unless `force: true` | never clobber hand-written files |
 
 ## Skills
 

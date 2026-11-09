@@ -189,7 +189,7 @@ def secret_refs(t: Template) -> set:
 @dataclass
 class Change:
     template: Template
-    # create | update | chmod | adopt | unchanged | pending | error
+    # create | update | chmod | adopt | skip | unchanged | pending | error
     action: str
     desired: Optional[bytes] = None
     secret: bool = False
@@ -273,11 +273,9 @@ def plan(
         elif not current.exists:
             ch.action = "create"
         elif current.content != desired and not tracked and not t.force:
-            ch.action = "error"
-            ch.error = (
-                f"{t.name}: {t.target} exists and is not tracked by tools; "
-                "set force: true to replace it"
-            )
+            # Left as is and reported, not an error: force: true replaces it.
+            ch.action = "skip"
+            ch.error = "not tracked by tools and differs; set force: true to replace it"
         elif current.content != desired:
             ch.action = "update"
             ch.untracked = not tracked
@@ -372,6 +370,9 @@ def apply(
             log(f"templates: {ch.error}", Color.RED)
             res.success = False
             continue
+        if ch.action == "skip":
+            log(f"templates: skipping {t.target}: {ch.error}", Color.YELLOW)
+            continue
         if ch.action == "unchanged":
             fsutil.refresh_dev(t.target, installed[t.target])
             if ch.secret and not installed[t.target].get("secret"):
@@ -444,6 +445,9 @@ def describe(p: Plan) -> List[str]:
                     rows.append(ch.diff)
         elif ch.action == "chmod":
             rows.append(f"  ~ chmod {t.target} -> {oct(ch.mode)}")
+        elif ch.action == "skip":
+            rows.append(f"  ! skip {t.target}: {ch.error}")
+            continue
         else:
             continue
         rows += [f"    notify: {n}" for n in t.notify]
