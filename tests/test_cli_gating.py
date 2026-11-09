@@ -44,6 +44,28 @@ class DeployGatingTest(unittest.TestCase):
             runner.invoke(cli.main, ["deploy", "--approve", "--scope", "gitRepos"])
             self.assertEqual(git.call_args.args[2], False)
 
+    def test_update_flag_reaches_files(self):
+        config = {"files": [{"dir": "d"}]}
+        runner = CliRunner()
+        with (
+            mock.patch.object(cli, "_load_merged_config", return_value=config),
+            mock.patch.object(cli, "load_json", return_value={}),
+            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "install_files", return_value=True) as inst,
+        ):
+            for args, update in (
+                (["--scope", "files", "--update"], True),
+                (["--scope", "files"], False),
+            ):
+                inst.reset_mock()
+                result = runner.invoke(cli.main, ["deploy", "--approve", *args])
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(inst.call_args.args[5], update)
+            inst.reset_mock()
+            runner.invoke(cli.main, ["deploy", "--approve", "--scope", "brew", "--update"])
+            inst.assert_not_called()
+
     def test_empty_config_does_not_crash(self):
         # No paths at all: the pre-fix code raised KeyError: 'bun'.
         self.assertTrue(self._deploy({}, {}))

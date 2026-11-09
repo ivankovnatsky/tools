@@ -20,24 +20,29 @@ def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int,
     return result.returncode, result.stdout, result.stderr
 
 
-def run_hooks(section: str, hooks: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Run each ``onChange`` command once, in order, via ``/bin/sh -c``.
+def run_hooks(
+    section: str,
+    hooks: Dict[str, List[str]],
+    kind: str = "onChange",
+    retry: str = "retried next deploy",
+) -> Dict[str, List[str]]:
+    """Run each hook command once, in order, via ``/bin/sh -c``.
 
-    ``hooks`` maps a command to the paths whose change triggered it.
+    ``hooks`` maps a command to the paths that triggered it.
     Returns the commands that failed, in the same shape.
     """
     failed: Dict[str, List[str]] = {}
     for command, changed in hooks.items():
         more = f" and {len(changed) - 1} more" if len(changed) > 1 else ""
-        log(f"{section}: onChange ({changed[0]}{more}): {command}", Color.BLUE)
+        log(f"{section}: {kind} ({changed[0]}{more}): {command}", Color.BLUE)
         try:
             code = subprocess.run(["/bin/sh", "-c", command]).returncode
         except OSError as e:
-            log(f"{section}: onChange failed ({e}): {command}", Color.RED)
+            log(f"{section}: {kind} failed ({e}): {command}", Color.RED)
             failed[command] = changed
             continue
         if code != 0:
-            log(f"{section}: onChange failed (exit {code}); retried next deploy", Color.RED)
+            log(f"{section}: {kind} failed (exit {code}); {retry}", Color.RED)
             failed[command] = changed
     return failed
 
@@ -83,12 +88,12 @@ def settle_hooks(state: Dict, section: str, hooks: Dict[str, List[str]], declare
     return not failed
 
 
-def parse_on_change(value, label: str) -> Optional[str]:
-    """Validate an ``onChange`` value: absent, or a non-empty string."""
+def parse_on_change(value, label: str, key: str = "onChange") -> Optional[str]:
+    """Validate a hook value (``onChange``, ``onUpdate``): absent, or a non-empty string."""
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label}: onChange must be a non-empty string, got {value!r}")
+        raise ValueError(f"{label}: {key} must be a non-empty string, got {value!r}")
     return value
 
 

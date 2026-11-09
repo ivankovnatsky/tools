@@ -126,6 +126,15 @@ links: []
 # - source: $HOME/.agents/skills/jira
 #   target: ~/.claude/skills/jira
 
+# Copies relative to the first --config path. onChange runs when the entry
+# changed; onUpdate only on `deploy --update`. See README.
+files: []
+# - dir: dotfiles
+# - source: dotfiles/.config/nvim/lua/config/pack.lua
+#   target: ~/.config/nvim/lua/config/pack.lua
+#   onChange: nvim --headless +qa
+#   onUpdate: nvim --headless "+lua vim.pack.update(nil, { force = true })" +qa
+
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.
 flatpak:

@@ -14,7 +14,13 @@ from tools.fsutil import (
     same_identity,
 )
 from tools.log import Color, debug, log
-from tools.util import format_diff_bytes, looks_like_secret, parse_on_change, settle_hooks
+from tools.util import (
+    format_diff_bytes,
+    looks_like_secret,
+    parse_on_change,
+    run_hooks,
+    settle_hooks,
+)
 
 
 def _file_hash(path: str) -> Optional[str]:
@@ -257,6 +263,7 @@ class Entry(NamedTuple):
     secrets: bool
     on_change: Optional[str] = None
     directory: bool = False
+    on_update: Optional[str] = None
 
 
 def declared_hooks(entries) -> set:
@@ -292,9 +299,9 @@ def _resolve_entries(
     """Expand a `files:` config into a flat list of `Entry`.
 
     Three entry shapes are supported and may be mixed in the same list:
-      - dir entry:       {dir: <path>, mode?, secrets?, onChange?}
-      - file entry:      {source, target, mode?, secrets?, onChange?}
-      - directory entry: {target, directory: true, mode?, onChange?}
+      - dir entry:       {dir: <path>, mode?, secrets?, onChange?, onUpdate?}
+      - file entry:      {source, target, mode?, secrets?, onChange?, onUpdate?}
+      - directory entry: {target, directory: true, mode?, onChange?, onUpdate?}
 
     The ``secrets`` flag, when true, suppresses inline content diffs in
     both ``tools deploy`` and ``tools diff`` for that entry. On a dir
@@ -325,6 +332,7 @@ def _resolve_entries(
             continue
         try:
             on_change = parse_on_change(entry.get("onChange"), f"entry {entry!r}")
+            on_update = parse_on_change(entry.get("onUpdate"), f"entry {entry!r}", "onUpdate")
         except ValueError as e:
             errors.append(str(e))
             continue
@@ -346,7 +354,7 @@ def _resolve_entries(
                 errors.append(f"a directory entry takes `target` and no `source`/`dir`: {entry!r}")
                 continue
             target = os.path.normpath(os.path.expanduser(str(entry["target"])))
-            file_pairs.append(Entry(target, None, entry_mode, False, on_change, True))
+            file_pairs.append(Entry(target, None, entry_mode, False, on_change, True, on_update))
             continue
 
         if "dir" in entry:
@@ -362,7 +370,11 @@ def _resolve_entries(
                     source = os.path.join(root, name)
                     rel = os.path.relpath(source, source_dir)
                     target = os.path.join(home, rel)
-                    dir_pairs.append(Entry(target, source, entry_mode, entry_secrets, on_change))
+                    dir_pairs.append(
+                        Entry(
+                            target, source, entry_mode, entry_secrets, on_change, False, on_update
+                        )
+                    )
             continue
 
         if "source" in entry and "target" in entry:
@@ -371,7 +383,9 @@ def _resolve_entries(
             if not os.path.isfile(source):
                 errors.append(f"source not found: {entry['source']}")
                 continue
-            file_pairs.append(Entry(target, source, entry_mode, entry_secrets, on_change))
+            file_pairs.append(
+                Entry(target, source, entry_mode, entry_secrets, on_change, False, on_update)
+            )
             continue
 
         errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
@@ -401,8 +415,13 @@ def install_files(
     state: Dict,
     conflicts: Optional[Dict[str, str]] = None,
     private_root: Optional[str] = None,
+    update: bool = False,
 ) -> bool:
     """Deploy files declared in the `files:` config section.
+
+    With ``update``, each distinct ``onUpdate`` command runs once afterwards,
+    changed or not, provided all its entries converged and onChange succeeded.
+    Failures are not kept pending: the next update reruns them.
 
     ``private_root`` is the sops secretsDir: directory entries inside it are
     created with its mode and registered with the sops section's created dirs.
@@ -429,6 +448,8 @@ def install_files(
 
     held: Dict[str, Dict] = {}
     released = set()
+    updates: Dict[str, List[str]] = {}
+    unsettled = set()
     for e in _ordered(resolved):
         target = e.target
         reason = _conflict(target, conflicts)
@@ -437,6 +458,8 @@ def install_files(
             success = False
             if target in state_files:
                 held[target] = state_files[target]
+            if e.on_update:
+                unsettled.add(e.on_update)
             continue
         if e.directory:
             created = state.setdefault("sops", {}).setdefault("createdDirs", [])
@@ -457,6 +480,11 @@ def install_files(
             )
             if source_hash and result is not False:
                 managed[target] = _record(target, source_hash)
+        if e.on_update:
+            if result is False:
+                unsettled.add(e.on_update)
+            else:
+                updates.setdefault(e.on_update, []).append(target)
         if result is False:
             success = False
             if target in state_files:
@@ -527,7 +555,16 @@ def install_files(
         merged.update(managed)
         state["files"] = merged
 
-    success &= settle_hooks(state, "files", hooks, declared_hooks(entries))
+    settled = settle_hooks(state, "files", hooks, declared_hooks(entries))
+    success &= settled
+
+    if update:
+        skipped = unsettled if settled else unsettled | set(updates)
+        for command in sorted(skipped):
+            log(f"files: onUpdate skipped (files or onChange failed): {command}", Color.YELLOW)
+        runnable = {c: t for c, t in updates.items() if c not in skipped}
+        if run_hooks("files", runnable, "onUpdate", "rerun on the next deploy --update"):
+            success = False
 
     if not changed and entries:
         debug("All files up to date", Color.BLUE)

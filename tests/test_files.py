@@ -438,6 +438,150 @@ class OnChangeTest(unittest.TestCase):
             self.assertIn("onChange", errors[0])
 
 
+class OnUpdateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = os.path.realpath(self._tmp.name)
+        self.marker = os.path.join(self.d, "ran")
+        self.hook = f"echo x >> {self.marker}"
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        self.target = os.path.join(self.d, "out", "a.conf")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def runs(self):
+        if not os.path.exists(self.marker):
+            return 0
+        with open(self.marker) as f:
+            return len(f.read().splitlines())
+
+    def install(self, entries, state, update):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = files.install_files(entries, self.d, state, None, None, update)
+        return ok, out.getvalue()
+
+    def test_runs_only_with_update_changed_or_not(self):
+        from tools.diff import _diff_files
+
+        entries = [{"source": "src/a.conf", "target": self.target, "onUpdate": self.hook}]
+        state = {}
+        self.assertEqual([r for r in _diff_files(entries, self.d, state) if "onUpdate" in r], [])
+        (ok, _out) = self.install(entries, state, False)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 0)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+        (ok, out) = self.install(entries, state, True)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertIn("files: onUpdate (", out)
+        self.install(entries, state, True)
+        self.assertEqual(self.runs(), 2)
+        self.install(entries, state, False)
+        self.assertEqual(self.runs(), 2)
+
+    def test_dir_entry_runs_once_and_dedupes_across_entries(self):
+        _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
+        _write(os.path.join(self.d, "tree", ".cfg", "b"), "b\n")
+        entries = [
+            {"dir": "tree", "onUpdate": self.hook},
+            {"source": "src/a.conf", "target": self.target, "onUpdate": self.hook},
+        ]
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.d, "home")}):
+            (ok, out) = self.install(entries, {}, True)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertIn("and 2 more", out)
+
+    def test_explicit_entry_overrides_dir_entry(self):
+        _write(os.path.join(self.d, "tree", ".cfg", "a"), "a\n")
+        home = os.path.join(self.d, "home")
+        entries = [
+            {"dir": "tree", "onUpdate": "exit 9"},
+            {"source": "tree/.cfg/a", "target": "~/.cfg/a", "onUpdate": self.hook},
+        ]
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            (ok, _out) = self.install(entries, {}, True)
+        self.assertTrue(ok)
+        self.assertEqual(self.runs(), 1)
+
+    def test_failure_fails_deploy_and_is_not_pending(self):
+        from tools.diff import _diff_files
+
+        entries = [{"source": "src/a.conf", "target": self.target, "onUpdate": "exit 3"}]
+        state = {}
+        (ok, out) = self.install(entries, state, True)
+        self.assertFalse(ok)
+        self.assertIn("onUpdate failed (exit 3)", out)
+        self.assertTrue(os.path.exists(self.target))
+        self.assertNotIn("onChange", state)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+        (ok, _out) = self.install(entries, state, False)
+        self.assertTrue(ok)
+
+    def install_with(self, entries, conflicts):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = files.install_files(entries, self.d, {}, conflicts, None, True)
+        return ok, out.getvalue()
+
+    def test_skipped_when_target_refused(self):
+        entries = [{"source": "src/a.conf", "target": self.target, "onUpdate": self.hook}]
+        (ok, out) = self.install_with(entries, {self.target: "owned by templates"})
+        self.assertFalse(ok)
+        self.assertEqual(self.runs(), 0)
+        self.assertIn("onUpdate skipped", out)
+
+    def test_skipped_when_any_entry_failed_to_write(self):
+        os.makedirs(self.target)
+        good = os.path.join(self.d, "out", "b.conf")
+        entries = [
+            {"source": "src/a.conf", "target": good, "onUpdate": self.hook},
+            {"source": "src/a.conf", "target": self.target, "onUpdate": self.hook},
+        ]
+        (ok, out) = self.install(entries, {}, True)
+        self.assertFalse(ok)
+        self.assertTrue(os.path.exists(good))
+        self.assertEqual(self.runs(), 0)
+        self.assertIn("onUpdate skipped", out)
+
+    def test_skipped_when_on_change_failed(self):
+        entries = [
+            {"source": "src/a.conf", "target": self.target, "onChange": "exit 3"},
+            {
+                "source": "src/a.conf",
+                "target": os.path.join(self.d, "out", "b.conf"),
+                "onUpdate": self.hook,
+            },
+        ]
+        (ok, out) = self.install(entries, {}, True)
+        self.assertFalse(ok)
+        self.assertEqual(self.runs(), 0)
+        self.assertIn("onUpdate skipped", out)
+
+    def test_unrelated_failure_does_not_skip(self):
+        os.makedirs(self.target)
+        entries = [
+            {"source": "src/a.conf", "target": self.target},
+            {
+                "source": "src/a.conf",
+                "target": os.path.join(self.d, "out", "b.conf"),
+                "onUpdate": self.hook,
+            },
+        ]
+        (ok, _out) = self.install(entries, {}, True)
+        self.assertFalse(ok)
+        self.assertEqual(self.runs(), 1)
+
+    def test_invalid_on_update_is_config_error(self):
+        for bad in ("", 3, ["x"]):
+            entries = [{"source": "src/a.conf", "target": "~/x", "onUpdate": bad}]
+            _resolved, errors = files._resolve_entries(entries, self.d)
+            self.assertEqual(len(errors), 1, bad)
+            self.assertIn("onUpdate", errors[0])
+
+
 class DirectoryEntryTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

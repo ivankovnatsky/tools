@@ -35,6 +35,7 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
   - `ollamaModels`: tracked models are pulled again; `flatpak`: tracked apps get
     `flatpak update`.
   - `fetch`: tracked files without a `sha256` pin are downloaded again.
+  - `files`: every distinct `onUpdate` command runs once (see below).
   - `pi`, `mcp` and `curlShell` have no upgrade step.
 - `--config` accepts a file or a directory and may be repeated; configs are
   deep-merged in order (scalars replace, dicts recurse, lists replace).
@@ -128,11 +129,12 @@ Notable keys:
 - `paths` — binary/install locations the reconcilers use; documented in the
   comment block of `examples/config.yaml`.
 - `files:` entries take `{source, target, mode?, secrets?}`,
-  `{dir, mode?, secrets?}` or `{target, directory: true, mode?}`. `mode` must be
-  a **quoted octal string** (`"0644"`); bare YAML ints are rejected as
-  ambiguous. `secrets: true` suppresses inline content diffs for that entry.
-  Removals wait while any entry is malformed; a target refused by another owner
-  stays tracked and does not hold others.
+  `{dir, mode?, secrets?}` or `{target, directory: true, mode?}`, each with
+  optional `onChange` and `onUpdate`. `mode` must be a **quoted octal string**
+  (`"0644"`); bare YAML ints are rejected as ambiguous. `secrets: true`
+  suppresses inline content diffs for that entry. Removals wait while any entry
+  is malformed; a target refused by another owner stays tracked and does not
+  hold others.
 - `directory: true` ensures the directory (and its parents) exists and applies
   `mode`. Only a directory tools created is tracked, and it is removed only
   while empty; parents and pre-existing directories are never removed. Other
@@ -145,12 +147,25 @@ Notable keys:
   removals and `tools diff` never run it; diff lists it as `run onChange`. A
   failing command fails the deploy, the written file stays, and the command is
   retried on each deploy until it succeeds or is no longer declared.
+- `onUpdate: "<shell command>"` (on `files:` entries) runs only on
+  `deploy --update` with `files` in scope, after the section converges, whether
+  or not the entry changed: once per distinct command, however many entries or
+  `dir:` files declare it. It is skipped when any entry declaring it was refused
+  or failed to write, or when an `onChange` in the section failed. Plain deploy, `tools diff` and `watch` never run it,
+  and diff does not list it. A failing command fails the deploy; it is not kept
+  pending and runs again on the next `--update`. Use it to drive an app's own
+  plugin manager, with `onChange` installing what a new config declares.
 
   ```yaml
   files:
     - source: amethyst/amethyst.yml
       target: ~/.config/amethyst/amethyst.yml
       onChange: pkill -x Amethyst; open -a Amethyst
+    - source: dotfiles/.config/nvim/lua/config/pack.lua
+      target: ~/.config/nvim/lua/config/pack.lua
+      onChange: nvim --headless +qa
+      onUpdate:
+        nvim --headless "+lua vim.pack.update(nil, { force = true })" +qa
     - target: ~/Screenshots
       directory: true
       mode: "0755"

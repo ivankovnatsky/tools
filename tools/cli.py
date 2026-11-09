@@ -344,6 +344,7 @@ def _run_sections(
             state,
             conflicts,
             sops_section.parse_sops(config.get("sops")).secrets_dir()[0],
+            update,
         )
 
     if "fetch" in active and fetch_has_work(config.get("fetch"), state):
@@ -426,7 +427,8 @@ def main(verbose):
     is_flag=True,
     help=(
         "Also upgrade what is already installed "
-        "(packages, git checkouts, skill sources, fetched files)."
+        "(packages, git checkouts, skill sources, fetched files) "
+        "and run files onUpdate hooks."
     ),
 )
 def deploy(config, scope, approve, update):
