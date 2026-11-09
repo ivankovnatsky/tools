@@ -559,9 +559,13 @@ def install_files(
     success &= settled
 
     if update:
-        skipped = unsettled if settled else unsettled | set(updates)
+        # An entry that failed to resolve may declare the same command.
+        skipped = unsettled if settled and not errors else unsettled | set(updates)
         for command in sorted(skipped):
-            log(f"files: onUpdate skipped (files or onChange failed): {command}", Color.YELLOW)
+            log(
+                f"files: onUpdate skipped (files, config or onChange failed): {command}",
+                Color.YELLOW,
+            )
         runnable = {c: t for c, t in updates.items() if c not in skipped}
         if run_hooks("files", runnable, "onUpdate", "rerun on the next deploy --update"):
             success = False

@@ -560,6 +560,20 @@ class OnUpdateTest(unittest.TestCase):
         self.assertEqual(self.runs(), 0)
         self.assertIn("onUpdate skipped", out)
 
+    def test_skipped_when_an_entry_fails_to_resolve(self):
+        entries = [
+            {"source": "src/missing", "target": self.target, "onUpdate": self.hook},
+            {
+                "source": "src/a.conf",
+                "target": os.path.join(self.d, "out", "b.conf"),
+                "onUpdate": self.hook,
+            },
+        ]
+        (ok, out) = self.install(entries, {}, True)
+        self.assertFalse(ok)
+        self.assertEqual(self.runs(), 0)
+        self.assertIn("onUpdate skipped", out)
+
     def test_unrelated_failure_does_not_skip(self):
         os.makedirs(self.target)
         entries = [
