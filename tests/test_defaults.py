@@ -799,7 +799,10 @@ class SystemScopeTest(DefaultsTestBase):
 
     def test_user_previews_system_keys_but_never_writes_them(self):
         raw = {**self.RAW, "user": {"com.example.app": {"k": 1}}}
-        with mock.patch.object(defaults, "log") as log:
+        with (
+            mock.patch.object(defaults, "log") as log,
+            mock.patch.object(defaults.sys, "platform", "darwin"),
+        ):
             self.assertEqual(self.diff(raw), ["  + write com.example.app k = 1"])
             self.assertEqual(self.diff(self.RAW), [])
             self.assertTrue(defaults.install_defaults(raw, self.state, self.fake.cli()))

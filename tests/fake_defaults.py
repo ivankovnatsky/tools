@@ -2,11 +2,27 @@
 
 import os
 import plistlib
+import tempfile
+from types import SimpleNamespace
 
 from tools.user.defaults import DefaultsCLI
 
 DEFAULTS = "/usr/bin/defaults"
 KILLALL = "/usr/bin/killall"
+
+
+def host_view(real):
+    """stat as on a macOS host: paths outside the temp dir (/, /Library, ...) are
+    root-only, since build sandboxes don't own / as root."""
+    tmp = os.path.realpath(tempfile.gettempdir())
+
+    def st(path):
+        r = real(path)
+        if os.path.commonpath([tmp, os.path.realpath(path)]) == tmp:
+            return r
+        return SimpleNamespace(st_uid=0, st_mode=r.st_mode & ~0o022)
+
+    return st
 
 
 class FakeDefaults:
@@ -73,6 +89,8 @@ class FakeDefaults:
 
     def cli(self, root=False, **kwargs):
         self.root = root
+        kwargs.setdefault("stat", host_view(os.stat))
+        kwargs.setdefault("lstat", host_view(os.lstat))
         kwargs.setdefault("home", os.path.expanduser("~"))
         kwargs.setdefault("login", "me")
         return DefaultsCLI(defaults=DEFAULTS, killall=KILLALL, run=self.run, is_root=root, **kwargs)
