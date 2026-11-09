@@ -5,7 +5,7 @@ import os
 import stat
 from typing import Dict, List
 
-from tools import runmode
+from tools import privilege
 from tools.config import SECTIONS
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
@@ -607,9 +607,9 @@ def show_diff(
 
 
 def _root_sections(config: dict, scope, load_json, migrate_state_schema) -> list:
-    """Root mode: launchd daemons and system-scope defaults; nothing in user space."""
-    state = migrate_state_schema(load_json(runmode.ROOT_STATE_FILE))
-    active = set(scope) if scope else set(runmode.ROOT_SECTIONS)
+    """Under sudo: launchd daemons and system-scope defaults; nothing in user space."""
+    state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+    active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         changes = diff_launchd(

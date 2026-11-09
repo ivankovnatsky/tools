@@ -194,7 +194,7 @@ class LaunchdTestBase(unittest.TestCase):
         return view
 
     def cfg(self, agents=None, daemons=None, root=None, **section):
-        """A launchd section; configuring daemons switches to root mode unless root=False."""
+        """A launchd section; configuring daemons runs it under sudo unless root=False."""
         raw = {"labelPrefix": "org.example", **section}
         if agents is not None:
             raw["agents"] = agents
@@ -814,7 +814,7 @@ class SystemDomainTest(LaunchdTestBase):
         self.assertEqual(self.fake.system_calls, [])
         self.assertEqual(self.state["launchd"]["services"], {})
 
-    def test_root_mode_skips_agents(self):
+    def test_sudo_skips_agents(self):
         raw = self.cfg({"web": {"command": "srv"}}, {"dns": {"command": "dnsmasq -k"}})
         self.assertEqual(
             self.diff(raw), [f"  + create system/org.example.dns -> {self.daemon_path('dns')}"]
@@ -824,10 +824,10 @@ class SystemDomainTest(LaunchdTestBase):
         self.assertEqual(list(self.state["launchd"]["services"]), ["org.example.dns"])
         self.assertFalse(any(f"gui/{UID}" in " ".join(c) for c in self.fake.calls))
 
-    def test_root_mode_without_sudo_user_refuses(self):
+    def test_root_without_sudo_user_refuses(self):
         raw = self.daemon()
         self.env.uid = 0
-        self.assertEqual(self.diff(raw), [f"  ! {launchd.runmode.SUDO_USER_ERROR}"])
+        self.assertEqual(self.diff(raw), [f"  ! {launchd.privilege.SUDO_USER_ERROR}"])
         self.assertFalse(self.deploy(raw))
         self.assertEqual(self.fake.calls, [])
         with self.assertRaises(PermissionError):
@@ -1446,13 +1446,13 @@ class NoRootTest(LaunchdTestBase):
             with self.subTest(euid=euid):
                 self.env.euid, self.env.uid = euid, 0
                 self.assertFalse(self.deploy(raw))
-                self.assertEqual(self.diff(raw), [f"  ! {launchd.runmode.SUDO_USER_ERROR}"])
+                self.assertEqual(self.diff(raw), [f"  ! {launchd.privilege.SUDO_USER_ERROR}"])
                 with self.assertRaises(PermissionError):
                     launchd.status_rows(raw, self.state, self.env)
                 self.assertEqual(self.fake.calls, [])
                 self.assertEqual(self.state, {})
                 self.assertFalse(os.path.exists(self.env.agents_dir))
-        self.assertIn("must not run as root directly", launchd.runmode.SUDO_USER_ERROR)
+        self.assertIn("must not run as root directly", launchd.privilege.SUDO_USER_ERROR)
 
     def test_root_runs_only_fixed_tools_directly(self):
         watched = os.path.join(self.tmp, "conf")
@@ -2471,6 +2471,147 @@ class OpenBugsTest(LaunchdTestBase):
         self.assertEqual(self.diff(raw), ["  ~ adopt user/org.example.web (identical plist)"])
 
 
+class DisabledLogDirTest(LaunchdTestBase):
+    LABEL = "org.example.d"
+
+    def daemon_cfg(self, **extra):
+        return self.cfg(daemons={"d": {"command": "x", **extra}})
+
+    def running_daemon_with_user_owned_logs(self):
+        self.assertTrue(self.deploy(self.daemon_cfg()))
+        self.assertIn(self.LABEL, self.fake.loaded)
+        self.user_owned.add(self.env.system_log_dir)
+        self.fake.calls.clear()
+        self.fake.system_calls.clear()
+
+    def no_writes(self):
+        writes = [c for c in self.fake.system_calls if c[0] != launchd.LAUNCHCTL]
+        self.assertEqual(writes, [])
+
+    def test_disabled_daemon_is_stopped_although_its_log_dir_is_not_root_only(self):
+        self.running_daemon_with_user_owned_logs()
+        before = self.state["launchd"]["services"][self.LABEL]["hash"]
+        raw = self.daemon_cfg(disabled=True)
+        changes = self.diff(raw)
+        self.assertIn("not root-only", " ".join(changes))
+        self.assertIn(f"  ~ disable system/{self.LABEL} (bootout only; nothing written)", changes)
+        self.assertFalse(self.deploy(raw))
+        self.assertNotIn(self.LABEL, self.fake.loaded)
+        self.assertIn(self.LABEL, self.fake.disabled)
+        self.no_writes()
+        entry = self.state["launchd"]["services"][self.LABEL]
+        self.assertEqual((entry["hash"], entry["disabled"]), (before, True))
+        self.assertEqual(self.diff(raw), [c for c in changes if not c.startswith("  ~")])
+
+    def test_disabled_daemon_needing_a_rewrite_is_stopped_without_writing(self):
+        self.running_daemon_with_user_owned_logs()
+        with open(self.daemon_path("d"), "rb") as f:
+            old = f.read()
+        self.assertFalse(self.deploy(self.daemon_cfg(command="y", disabled=True)))
+        self.assertNotIn(self.LABEL, self.fake.loaded)
+        self.assertIn(self.LABEL, self.fake.disabled)
+        self.no_writes()
+        with open(self.daemon_path("d"), "rb") as f:
+            self.assertEqual(f.read(), old)
+
+    def test_log_dir_swapped_after_planning_still_lets_disable_proceed(self):
+        self.assertTrue(self.deploy(self.daemon_cfg()))
+        settings, svcs, _e = launchd.parse_launchd(self.daemon_cfg(disabled=True), self.env.home)
+        p = launchd.plan(settings, svcs, self.state, self.env)
+        self.assertEqual(len(p.disable), 1)
+        self.user_owned.add(self.env.system_log_dir)
+        self.fake.system_calls.clear()
+        self.assertFalse(launchd.apply(settings, p, self.state, self.env))
+        self.assertNotIn(self.LABEL, self.fake.loaded)
+        self.assertIn(self.LABEL, self.fake.disabled)
+        self.no_writes()
+
+    def foreign_daemon(self, plist):
+        os.makedirs(self.env.daemons_dir, exist_ok=True)
+        with open(self.daemon_path("d"), "wb") as f:
+            plistlib.dump(plist, f)
+        self.fake.loaded[self.LABEL] = self.daemon_path("d")
+        os.makedirs(self.env.system_log_dir)
+        self.user_owned.add(self.env.system_log_dir)
+
+    def changing_launchctl(self):
+        return [c for c in self.fake.calls if c[0] == launchd.LAUNCHCTL and c[1] != "print"
+                and c[1] != "print-disabled"]  # fmt: skip
+
+    def test_foreign_plist_is_never_disabled_or_booted_out(self):
+        self.foreign_daemon({"Label": self.LABEL, "ProgramArguments": ["/other"]})
+        raw = self.daemon_cfg(disabled=True)
+        self.assertIn(
+            f"  ! skip {self.LABEL}: {self.daemon_path('d')}: exists and is not managed by tools",
+            self.diff(raw),
+        )
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(self.changing_launchctl(), [])
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertIn(self.LABEL, self.fake.loaded)
+        self.assertNotIn(self.LABEL, self.fake.disabled)
+        self.assertNotIn(self.LABEL, (self.state.get("launchd") or {}).get("services") or {})
+
+    def test_identical_untracked_plist_is_stopped(self):
+        raw = self.daemon_cfg(disabled=True)
+        settings, svcs, _e = launchd.parse_launchd(raw, self.env.home)
+        self.foreign_daemon(launchd.desired_plist(svcs[0], settings, self.env))
+        self.assertFalse(self.deploy(raw))
+        self.assertNotIn(self.LABEL, self.fake.loaded)
+        self.assertIn(self.LABEL, self.fake.disabled)
+        self.no_writes()
+        entry = self.state["launchd"]["services"][self.LABEL]
+        self.assertEqual(entry["disabled"], True)
+        self.assertIsNotNone(entry["hash"])
+        self.assertTrue(self.deploy(self.cfg(daemons={})))
+        self.assertNotIn(self.LABEL, self.fake.disabled)
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+        self.assertEqual(self.state["launchd"]["services"], {})
+
+    def test_identical_plist_swapped_before_the_stop_is_left_alone(self):
+        raw = self.daemon_cfg(disabled=True)
+        settings, svcs, _e = launchd.parse_launchd(raw, self.env.home)
+        self.foreign_daemon(launchd.desired_plist(svcs[0], settings, self.env))
+        p = launchd.plan(settings, svcs, self.state, self.env)
+        self.assertEqual(len(p.stop), 1)
+        with open(self.daemon_path("d"), "wb") as f:
+            plistlib.dump({"Label": self.LABEL, "ProgramArguments": ["/other"]}, f)
+        self.fake.calls.clear()
+        self.assertFalse(launchd.apply(settings, p, self.state, self.env))
+        self.assertEqual(self.changing_launchctl(), [])
+        self.assertIn(self.LABEL, self.fake.loaded)
+        self.assertNotIn(self.LABEL, self.state["launchd"]["services"])
+
+    def test_plist_swapped_for_a_foreign_one_after_planning_is_not_stopped(self):
+        raw = self.daemon_cfg(disabled=True)
+        settings, svcs, _e = launchd.parse_launchd(raw, self.env.home)
+        self.foreign_daemon(launchd.desired_plist(svcs[0], settings, self.env))
+        self.user_owned.discard(self.env.system_log_dir)
+        p = launchd.plan(settings, svcs, self.state, self.env)
+        self.assertEqual(len(p.disable), 1)
+        with open(self.daemon_path("d"), "wb") as f:
+            plistlib.dump({"Label": self.LABEL, "ProgramArguments": ["/other"]}, f)
+        self.user_owned.add(self.env.system_log_dir)
+        self.fake.calls.clear()
+        self.assertFalse(launchd.apply(settings, p, self.state, self.env))
+        self.assertEqual(self.changing_launchctl(), [])
+        self.assertIn(self.LABEL, self.fake.loaded)
+
+    def test_enabled_daemon_with_a_non_root_only_log_dir_is_still_held(self):
+        self.running_daemon_with_user_owned_logs()
+        self.assertFalse(self.deploy(self.daemon_cfg(command="y")))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertIn(self.LABEL, self.fake.loaded)
+
+    def test_disabled_daemon_never_written_is_not_created(self):
+        os.makedirs(self.env.system_log_dir)
+        self.cfg(daemons={})
+        self.user_owned.add(self.env.system_log_dir)
+        self.assertFalse(self.deploy(self.daemon_cfg(disabled=True)))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+
 class CliGatingTest(unittest.TestCase):
     def _deploy(self, config, state):
         with (
@@ -2516,7 +2657,7 @@ class CliStatusTest(unittest.TestCase):
         with (
             mock.patch.object(cli, "_invoker", return_value=SimpleNamespace(root=True)),
             mock.patch.object(cli, "_load_merged_config", return_value={"stateFile": "/u/s.json"}),
-            mock.patch.object(cli.runmode, "ROOT_STATE_FILE", "/root/state.json"),
+            mock.patch.object(cli.privilege, "ROOT_STATE_FILE", "/root/state.json"),
             mock.patch.object(cli, "load_json", return_value={}) as load,
             mock.patch.object(cli, "status_rows", return_value=[]),
         ):

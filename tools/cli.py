@@ -4,7 +4,7 @@ import time
 
 import click
 
-from tools import runmode
+from tools import privilege
 from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
@@ -88,32 +88,77 @@ def _load_merged_config(config_paths: list[str]) -> dict:
         sys.exit(1)
 
 
-def _invoker() -> runmode.Invoker:
+def _invoker() -> privilege.Invoker:
     """Who this run acts for; as root, also points `~` and $HOME at SUDO_USER's home."""
     try:
-        inv = runmode.invoker()
-    except runmode.RootModeError as exc:
+        inv = privilege.invoker()
+    except privilege.SudoUserError as exc:
         log(str(exc), Color.RED)
         sys.exit(1)
-    runmode.act_as(inv)
+    privilege.act_as(inv)
     return inv
 
 
-def _root_scope(scope: tuple[str, ...]) -> tuple[str, ...]:
-    """As root only system work runs: the root-capable sections in scope, or all of them."""
-    user_only = [s for s in scope if s not in runmode.ROOT_SECTIONS]
-    if user_only:
-        for section in user_only:
-            log(f"{section} is user-only; run without sudo", Color.RED)
+USER_CHANGES = 3  # exit code of the user diff child: changes pending
+
+
+def _system_scope(scope: tuple[str, ...]) -> tuple[str, ...]:
+    """The root-capable sections of scope (all of them for an empty scope)."""
+    return tuple(s for s in (scope or privilege.ROOT_SECTIONS) if s in privilege.ROOT_SECTIONS)
+
+
+def _user_diff(config_paths: list[str], scope: tuple[str, ...]) -> int:
+    """`tools diff` as the user: 0 when clean, USER_CHANGES when changes are pending."""
+    merged = _load_merged_config(config_paths)
+    clean = show_diff(merged, _resolve_config_dir(config_paths), scope)
+    return 0 if clean else USER_CHANGES
+
+
+def _user_deploy(config_paths: list[str], scope: tuple[str, ...], update: bool) -> int:
+    """`tools deploy --approve` as the user."""
+    merged = _load_merged_config(config_paths)
+    return 0 if _deploy(merged, _resolve_config_dir(config_paths), scope, update) else 1
+
+
+def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple) -> bool:
+    """Both diffs under sudo: system sections as root, the rest in a child dropped to the
+    user. True when there are changes; exits when the user diff fails."""
+    changes = False
+    system = _system_scope(scope)
+    if system:
+        log("As root:", Color.BLUE)
+        merged = _load_merged_config(config_paths)
+        changes = not show_diff(merged, _resolve_config_dir(config_paths), system, root=True)
+    log(f"As {inv.login}:", Color.BLUE)
+    rc = privilege.run_as_user(inv, lambda: _user_diff(config_paths, scope))
+    if rc not in (0, USER_CHANGES):
+        log(f"Diff as {inv.login} failed; nothing deployed", Color.RED)
         sys.exit(1)
-    if scope:
-        return scope
-    log(
-        f"Running as root: only {', '.join(runmode.ROOT_SECTIONS)} (system scope); "
-        "run without sudo for the rest",
-        Color.BLUE,
-    )
-    return runmode.ROOT_SECTIONS
+    return changes or rc == USER_CHANGES
+
+
+def _sudo_deploy(
+    inv: privilege.Invoker, config_paths: list[str], scope: tuple, approve: bool, update: bool
+) -> None:
+    """System sections as root, then every user section in a child dropped to the user.
+    One prompt covers both; a failed system phase stops before the user phase."""
+    if not approve and _sudo_diff(inv, config_paths, scope):
+        _confirm()
+    system = _system_scope(scope)
+    if system:
+        merged = _load_merged_config(config_paths)
+        if not _deploy(merged, _resolve_config_dir(config_paths), system, update, root=True):
+            log(f"System sections failed; not running the rest as {inv.login}", Color.RED)
+            sys.exit(1)
+    if privilege.run_as_user(inv, lambda: _user_deploy(config_paths, scope, update)) != 0:
+        sys.exit(1)
+
+
+def _confirm() -> None:
+    answer = click.prompt("\nType 'yes' to deploy", default="no")
+    if answer != "yes":
+        log("Aborted.", Color.YELLOW)
+        sys.exit(1)
 
 
 def _refuse_root(command: str) -> None:
@@ -135,7 +180,7 @@ def _deploy(
     As root (``root``) only system sections run, against the root-owned state file.
     """
     if root:
-        state_file = runmode.ROOT_STATE_FILE
+        state_file = privilege.ROOT_STATE_FILE
         state = migrate_state_schema(load_json(state_file))
     else:
         # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
@@ -176,7 +221,7 @@ def _deploy(
 
 
 def _run_root_sections(config: dict, state: dict, active: set, persist=lambda: None) -> bool:
-    """Root mode: launchd daemons and system-scope defaults; nothing in user space."""
+    """Under sudo: launchd daemons and system-scope defaults; nothing in user space."""
     success = True
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         success &= install_launchd(
@@ -434,26 +479,23 @@ def main(verbose):
 def deploy(config, scope, approve, update):
     """Apply config to bring system to desired state.
 
-    Under `sudo`, only system work runs (launchd daemons, system defaults).
+    Under `sudo`, system work (launchd daemons, system defaults) runs as root first,
+    then everything else as the invoking user.
     """
     inv = _invoker()
-    if inv.root:
-        scope = _root_scope(tuple(scope))
     config_paths = list(config)
+    if inv.root:
+        _sudo_deploy(inv, config_paths, tuple(scope), approve, update)
+        return
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
 
-    if not approve:
-        has_changes = not show_diff(merged, config_dir, scope, root=inv.root)
-        if has_changes:
-            answer = click.prompt("\nType 'yes' to deploy", default="no")
-            if answer != "yes":
-                log("Aborted.", Color.YELLOW)
-                sys.exit(1)
+    if not approve and not show_diff(merged, config_dir, scope):
+        _confirm()
 
     # Deploy runs even when the preview was clean: --update upgrades and
     # state housekeeping have no diff line of their own.
-    if not _deploy(merged, config_dir, scope, update, root=inv.root):
+    if not _deploy(merged, config_dir, scope, update):
         sys.exit(1)
 
 
@@ -475,12 +517,14 @@ def apply(config, scope, approve, update):
 def diff(config, scope):
     """Show what would change (dry-run)."""
     inv = _invoker()
-    if inv.root:
-        scope = _root_scope(tuple(scope))
     config_paths = list(config)
+    if inv.root:
+        if _sudo_diff(inv, config_paths, tuple(scope)):
+            sys.exit(1)
+        return
     merged = _load_merged_config(config_paths)
     config_dir = _resolve_config_dir(config_paths)
-    if not show_diff(merged, config_dir, scope, root=inv.root):
+    if not show_diff(merged, config_dir, scope):
         sys.exit(1)
 
 
@@ -501,7 +545,7 @@ def status(config):
     inv = _invoker()
     merged = _load_merged_config(list(config))
     if inv.root:
-        state_file = runmode.ROOT_STATE_FILE
+        state_file = privilege.ROOT_STATE_FILE
     else:
         state_file = os.path.expanduser(
             merged.get("stateFile") or "~/.local/state/tools/state.json"

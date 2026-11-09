@@ -57,7 +57,7 @@ import sys
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
-from tools import fsutil, runmode
+from tools import fsutil, privilege
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin_optional
 from tools.util import run_command
@@ -525,7 +525,7 @@ class _Restarts:
 class DefaultsCLI:
     """Every subprocess the defaults and dock providers make goes through here.
 
-    Writes are gated by mode: `system` only as root, the user's scopes only as
+    Writes are gated by who runs tools: `system` only under sudo, the user's scopes only as
     the user. A plist the caller can't read is reported, never escalated.
     """
 
@@ -537,6 +537,8 @@ class DefaultsCLI:
     login: Optional[str] = None  # the invoking user; root restarts only their processes
     readable: Callable[[str], bool] = lambda p: os.access(p, os.R_OK)
     exists: Callable[[str], bool] = os.path.exists
+    stat: Callable[[str], os.stat_result] = os.stat
+    lstat: Callable[[str], os.stat_result] = os.lstat
 
     @classmethod
     def for_host(cls) -> Optional["DefaultsCLI"]:
@@ -545,9 +547,9 @@ class DefaultsCLI:
             return None
         is_root = os.geteuid() == 0
         try:
-            inv = runmode.invoker()
+            inv = privilege.invoker()
             home, login = inv.home, inv.login
-        except runmode.RootModeError:
+        except privilege.SudoUserError:
             home = login = None
         return cls(
             defaults=defaults,
@@ -575,12 +577,26 @@ class DefaultsCLI:
             return "(unknown user home)"
         # `defaults` opens <domain>.plist, which may itself be a symlink into the home.
         candidates = [c for p in paths if p for c in (p, p + ".plist")]
-        return next((p for p in candidates if runmode.under_home(p, self.home)), None)
+        return next((p for p in candidates if privilege.under_home(p, self.home)), None)
+
+    def root_error(self, *paths: Optional[str]) -> Optional[str]:
+        """As root, why `defaults` must not write these system domains: under the user's
+        home, or `<domain>.plist` is a symlink or in a dir a non-root user can change."""
+        if not self.is_root:
+            return None
+        if self.in_home(*paths):
+            return HOME_ERROR
+        for p in dict.fromkeys(p for p in paths if p):
+            why = privilege.root_file_error(p + ".plist", self.stat, self.lstat)
+            if why:
+                return why
+        return None
 
     def _writable(self, scope: str, domain: str, what: str) -> None:
         if scope in self.scopes:
-            if self.in_home(domain):
-                raise DefaultsError(f"{what}: {HOME_ERROR}")
+            why = self.root_error(domain) if scope == "system" else None
+            if why:
+                raise DefaultsError(f"{what}: {why}")
             return
         if scope == "system":
             raise DefaultsError(f"{what}: system defaults need root; {ROOT_HINT}")
@@ -673,7 +689,7 @@ def plan(
         "spec": spec,
         "errors": list(errors),
         "read_errors": [],  # (scope, domain, message)
-        "home_errors": [],  # (scope, domain): root mode, plist under the user's home
+        "root_errors": [],  # (scope, domain, why): under sudo, plist unsafe for root to write
         "set": [],  # (DefaultsKey, current)
         "refresh": [],  # DefaultsKey: already equal, state is stale or retargeted
         "restore": [],  # (state id, (scope, target, key), prior)
@@ -694,16 +710,17 @@ def plan(
         values = current[(scope, domain)]
         return None if isinstance(values, DefaultsError) else values
 
-    def in_home(scope: str, domain: str, *paths) -> bool:
-        if scope != "system" or not cli.in_home(domain, *paths):
+    def unsafe(scope: str, domain: str, *paths) -> bool:
+        why = cli.root_error(domain, *paths) if scope == "system" else None
+        if not why:
             return False
-        if (scope, domain) not in result["home_errors"]:
-            result["home_errors"].append((scope, domain))
+        if not any(e[:2] == (scope, domain) for e in result["root_errors"]):
+            result["root_errors"].append((scope, domain, why))
         return True
 
     keys = [res for res in spec.keys if res.scope in scopes or res.scope in preview]
     for res in keys:
-        if in_home(res.scope, res.domain, res.target):
+        if unsafe(res.scope, res.domain, res.target):
             continue
         values = read(res.scope, res.domain)
         if values is None:
@@ -731,7 +748,7 @@ def plan(
             scope, ident, key = sid
             target = declared.get((scope, ident)) or entry.get("target") or ident
             wid = (scope, target, key)
-            if in_home(scope, target, ident, entry.get("target")):
+            if unsafe(scope, target, ident, entry.get("target")):
                 continue
             values = read(scope, target)
             if values is None:
@@ -850,8 +867,8 @@ def _apply_defaults(
     for scope, domain, msg in p["read_errors"]:
         log(f"defaults: skipping {scope}:{domain}: {msg}", Color.RED)
         success = False
-    for scope, domain in p["home_errors"]:
-        log(f"defaults: skipping {scope}:{domain}: {HOME_ERROR}", Color.RED)
+    for scope, domain, why in p["root_errors"]:
+        log(f"defaults: skipping {scope}:{domain}: {why}", Color.RED)
         success = False
 
     restarts = _Restarts.build(spec, section["restart"])
@@ -964,7 +981,7 @@ def preview_defaults(
     cli: DefaultsCLI,
     restarts: Optional[List[str]] = None,
 ) -> List[str]:
-    preview = () if cli.is_root else ROOT_SCOPES
+    preview = () if cli.is_root or privilege.UNDER_SUDO else ROOT_SCOPES
     p = plan(spec, errors, state, cli, cli.scopes, preview)
     # Keys this run can't write are a note, not a change: deploy would not touch them.
     pending = [res for res, _cur in p["set"] if res.scope not in cli.scopes]
@@ -979,7 +996,7 @@ def preview_defaults(
         for scope, domain, msg in p["read_errors"]
         if scope in cli.scopes
     ]
-    changes += [f"  ! {scope}:{domain} {HOME_ERROR}" for scope, domain in p["home_errors"]]
+    changes += [f"  ! {scope}:{domain} {why}" for scope, domain, why in p["root_errors"]]
     for res, cur in p["set"]:
         if res.scope not in cli.scopes:
             continue
@@ -1010,10 +1027,10 @@ def preview_defaults(
 
 def _note_unmanaged(spec: DefaultsSpec, cli: DefaultsCLI) -> None:
     others = [res for res in spec.keys if res.scope not in cli.scopes]
-    if not others:
+    if not others or privilege.UNDER_SUDO:
         return
     if cli.is_root:
-        debug(f"defaults: {len(others)} user key(s) skipped as root; run without sudo")
+        debug(f"defaults: {len(others)} user key(s) skipped as root; they run as your user")
     else:
         log(f"defaults: {len(others)} system key(s) not managed as user; {ROOT_HINT}", Color.YELLOW)
 

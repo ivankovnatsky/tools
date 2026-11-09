@@ -51,10 +51,10 @@ Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only.
 
-### Root mode (`sudo tools deploy`)
+### Running with sudo (`sudo tools deploy`)
 
-tools never calls sudo. System work (launchd `daemons`, `defaults.system`) is
-applied by running tools itself as root through sudo, like `darwin-rebuild`:
+`sudo tools deploy` runs the whole config, like `darwin-rebuild`; tools itself
+never calls sudo:
 
 ```console
 sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide ~/.local/bin
@@ -63,16 +63,29 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - tools refuses to run as root unless sudo started it for a normal user:
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
-- `~`, `$HOME` and the config resolve exactly as for that user.
-- Only `launchd` (daemons) and `defaults` (`system:` keys) run; without
-  `--scope` tools says so, and `--scope` naming any other section is an error
-  (`brew is user-only; run without sudo`). `watch` and `reconcile` refuse root.
-- Root keeps its own state in `/var/db/tools/state.json` and never reads or
-  writes the user's state file, the `mgmt` key, or anything under the user's
-  home: a daemon whose plist, log dir, log files or `workingDirectory` falls
-  under it is an error (other daemons still deploy).
-- As the normal user, `deploy` leaves daemons and `system:` defaults alone and
-  prints one note per section pointing at `sudo tools deploy --scope ...`.
+- First, as root: `launchd` daemons and `defaults` `system:` keys, with root's
+  own state in `/var/db/tools/state.json`. Root never reads or writes the
+  user's state file, the `mgmt` key, or anything under the user's home: a
+  daemon whose plist, log dir, log files or `workingDirectory` falls under it
+  is an error (other daemons still deploy).
+- Then everything else (all other sections, launchd agents, `user` and
+  `currentHost` defaults) runs in a forked child that has permanently dropped
+  to `SUDO_USER` (`initgroups`, `setgid`, `setuid`; it aborts if it can get
+  uid 0 back). That child is a plain `tools deploy --approve` as the user: same
+  config resolution, the user's state file, `HOME`/`USER`/`LOGNAME`/`SHELL`
+  from the user's account, no `TMPDIR` or `SUDO_*` variables.
+- `PATH` in that child is the one sudo passed, with these added in front when
+  they exist and are missing: `~/.local/bin`, `/opt/homebrew/bin`,
+  `/opt/homebrew/sbin`, `/usr/local/bin`; `/usr/bin:/bin:/usr/sbin:/sbin` go
+  last when missing. Shell rc files are never read.
+- Both diffs are shown first (root's, then the user's from a short-lived
+  dropped child) and one prompt covers both. A failed system phase stops the
+  run before the user phase; a failure in either exits non-zero.
+- `--scope` restricts both phases; a scope without `launchd` or `defaults`
+  skips the root phase. `sudo tools diff` shows both diffs the same way.
+  `watch` and `reconcile` refuse root.
+- Without sudo, `deploy` runs only the user part and prints one note per
+  section pointing at `sudo tools deploy --scope ...` for the system part.
 
 ### Watch
 
@@ -553,8 +566,8 @@ the cleanup removals are skipped (deploy reports failure) and diff shows
 
 `agents` (user domain, `gui/<uid>`) and `daemons` (system domain). macOS only.
 Agents mirror nix-config's home `local.launchd`, daemons its darwin one; see the differences below.
-`tools deploy` manages agents; daemons are deployed by root with
-`sudo tools deploy --scope launchd` (see "Root mode").
+`tools deploy` manages agents; `sudo tools deploy` manages daemons as root, then
+agents as the user (see "Running with sudo").
 
 ```yaml
 launchd:
@@ -602,12 +615,12 @@ Behaviour:
 - Paths only the wrapper uses (`waitForPath(s)`, `dataDir`, `extraDirs`) keep `$NAME`/`${NAME}` for the job's shell to expand at runtime, as nix-config does; `~` is your home for agents and the job's `$HOME` for daemons. Other path options (`workingDirectory`, `logDir`, `stdoutPath`/`stderrPath`, `restartOn`, `keepAlive.pathState`) are read by launchd or tools from the plist or at deploy, so their `$VARS`/`~` expand at deploy from your environment; for a daemon running as another user (root included) they are rejected.
 - `extraDirs` `mode`/`owner`/`group` are rejected unless the job is a root daemon: the wrapper's `chmod`/`chown` would fail under `set -e` and crash-loop the job.
 - `disabled` is compared with launchd's live override (`print-disabled`), so changes made outside tools are corrected.
-- Daemon log paths must be absolute, normalized, without `..`, under `/var/log`. As root, every existing component of a daemon's log dir (and of each log file's parent) must be root-owned and not group/world-writable, checked at plan and again at apply; missing components are created one `mkdir` at a time and each must come out a root-only directory. A failing daemon is not written or loaded.
+- Daemon log paths must be absolute, normalized, without `..`, under `/var/log`. As root, every existing component of a daemon's log dir (and of each log file's parent) must be root-owned and not group/world-writable, checked at plan and again at apply; missing components are created one `mkdir` at a time and each must come out a root-only directory. A failing daemon is not written or loaded; if it is `disabled: true`, it is still disabled and booted out (plist and logs left untouched).
 - State records only steps that succeeded; a failed activation shows as `retry` in `tools diff`.
 - `tools diff` lists every change deploy would make to tracked jobs: creates, updates, adoptions, loads, restarts, removals, and removals held by a config error (`! held: remove ...`).
 - `launchd:`, `launchd.agents` or `launchd.daemons` that is not a mapping (e.g. `[]`, `false`) is a config error that holds every change; only an absent or null key means "no jobs".
 - `tools status` shows one row per domain and label (configured agents and daemons, plus what this run's state tracks).
-- Each run manages one domain with its own state: moving a job from `agents` to `daemons` is removed by `tools deploy` and created by `sudo tools deploy`.
+- Each domain has its own state (root's for daemons, the user's for agents): moving a job from `agents` to `daemons` is created as root and then removed from the user domain by the same `sudo tools deploy`.
 - A plist tools didn't write is never replaced (an identical one is adopted) and never removed.
 - Removal re-reads the plist and stops if it changed since tools wrote it; a disabled label is re-enabled first.
 - An unreadable plist or a malformed state entry for a configured job holds that job and fails the deploy, with a fix hint.
@@ -687,7 +700,10 @@ defaults:
 - `system` keys are written only by root (`sudo tools deploy --scope defaults`),
   which in turn never writes `user`/`currentHost` keys. As the user, `deploy`
   skips them with a note and `diff` previews them read-only; an unreadable
-  plist is reported, never escalated. Each mode keeps its own state.
+  plist is reported, never escalated. Runs under sudo and as your user keep
+  separate state. Under sudo, `<domain>.plist` must not be a symlink and every
+  existing ancestor must be root-owned and not group/world-writable (checked
+  at plan and again before each write); otherwise that domain is an error.
 - `restart` processes are killed once, after `dock:` too, only if a key in
   that domain changed.
 - Any config error holds the whole section: no writes, restores or restarts.

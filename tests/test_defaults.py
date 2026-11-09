@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from fake_defaults import FakeDefaults
@@ -869,6 +870,94 @@ class SystemScopeTest(DefaultsTestBase):
             with self.assertRaises(defaults.DefaultsError):
                 call(self.fake.cli(True))
 
+    def root_view(self, writable=(), user_owned=()):
+        """stat/lstat as on a real host: root-only except the given paths."""
+
+        def view(real):
+            def st(path):
+                r = real(path)
+                mode = r.st_mode | 0o002 if path in writable else r.st_mode & ~0o022
+                return SimpleNamespace(st_uid=1000 if path in user_owned else 0, st_mode=mode)
+
+            return st
+
+        return {"stat": view(os.stat), "lstat": view(os.lstat)}
+
+    def deploy_with(self, raw, **kwargs):
+        spec, errors = parse_defaults(raw)
+        return defaults.apply_defaults(spec, errors, self.state, self.fake.cli(True, **kwargs))
+
+    def shared_dir(self):
+        shared = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, shared)
+        return shared
+
+    def assert_refused(self, domain, why, **kwargs):
+        self.fake.calls.clear()
+        self.state = {}
+        raw = {"system": {domain: {"k": 1}, self.DOMAIN: {"Mode": "Automatic"}}}
+        self.assertIn(f"  ! system:{domain} {why}", self.diff(raw, **kwargs))
+        self.assertFalse(self.deploy_with(raw, **kwargs))
+        self.assertFalse(any(domain in c for c in self.fake.calls))
+        self.assertEqual(self.fake.domain(self.DOMAIN, "system"), {"Mode": "Automatic"})
+        for call in (
+            lambda cli: cli.write("system", domain, "k", 1),
+            lambda cli: cli.delete("system", domain, "k"),
+        ):
+            with self.assertRaisesRegex(defaults.DefaultsError, "symlink|not root-only"):
+                call(self.fake.cli(True, **kwargs))
+
+    def test_root_refuses_system_domains_in_a_user_owned_dir(self):
+        self.root = True
+        shared = self.shared_dir()
+        self.assert_refused(
+            os.path.join(shared, "foo"),
+            f"{shared} is not root-only (root-owned, not group/world-writable)",
+        )
+        self.assert_refused(
+            os.path.join(shared, "missing", "foo"),
+            f"{shared} is not root-only (root-owned, not group/world-writable)",
+        )
+
+    def test_root_refuses_system_domains_in_a_world_writable_dir(self):
+        self.root = True
+        shared = self.shared_dir()
+        sticky = os.path.join(shared, "tmp")
+        os.makedirs(sticky)
+        domain = os.path.join(sticky, "foo")
+        self.assert_refused(
+            domain,
+            f"{sticky} is not root-only (root-owned, not group/world-writable)",
+            **self.root_view(writable={sticky}),
+        )
+
+    def test_root_refuses_a_symlinked_plist_outside_the_home(self):
+        self.root = True
+        shared = self.shared_dir()
+        target = os.path.join(shared, "target.plist")
+        open(target, "w").close()
+        domain = os.path.join(shared, "foo")
+        os.symlink(target, domain + ".plist")
+        self.assert_refused(domain, f"{domain}.plist is a symlink", **self.root_view())
+
+    def test_root_writes_system_domains_in_root_only_dirs(self):
+        self.root = True
+        domain = os.path.join(self.shared_dir(), "foo")
+        self.assertTrue(self.deploy_with({"system": {domain: {"k": 1}}}, **self.root_view()))
+        self.assertIn(("write", domain, "k"), self.fake.writes())
+
+    def test_tracked_domain_whose_dir_turned_user_owned_is_not_restored(self):
+        self.root = True
+        shared = self.shared_dir()
+        domain = os.path.join(shared, "foo")
+        self.assertTrue(self.deploy_with({"system": {domain: {"k": 1}}}, **self.root_view()))
+        self.fake.calls.clear()
+        view = self.root_view(user_owned={shared})
+        self.assertFalse(self.deploy_with({}, **view))
+        self.assertFalse(any("delete" in c for c in self.fake.calls))
+        [keys] = self.managed()["system"].values()
+        self.assertIn("k", keys)
+
     def test_root_never_restores_a_tracked_domain_under_the_home(self):
         self.root = True
         domain = os.path.join(os.path.expanduser("~"), "evil")
@@ -879,7 +968,7 @@ class SystemScopeTest(DefaultsTestBase):
         self.assertFalse(any("delete" in c for c in self.fake.calls))
         self.assertIn("k", self.managed()["system"][domain])
 
-    def test_other_mode_state_is_never_restored(self):
+    def test_state_from_the_other_kind_of_run_is_never_restored(self):
         self.root = True
         self.deploy(self.RAW)
         self.root = False

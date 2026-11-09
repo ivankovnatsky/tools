@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
-from tools import runmode
+from tools import privilege
 from tools.log import Color, debug, log
 from tools.user.files import _parse_mode
 from tools.util import format_diff_bytes, looks_like_secret, run_command
@@ -191,7 +191,7 @@ class Env:
     """Everything the provider touches outside its arguments.
 
     `uid`/`home`/`login` are the login user's, also as root (from SUDO_USER).
-    `euid == 0` is root mode: daemons only. Otherwise agents only.
+    `euid == 0` (under sudo): daemons only. As your user: agents only.
     """
 
     agents_dir: Optional[str] = None  # default <home>/Library/LaunchAgents
@@ -227,9 +227,9 @@ class Env:
     def __post_init__(self):
         if self.uid is None:
             try:
-                inv = runmode.invoker(self.euid)
-            except runmode.RootModeError:
-                inv = runmode.Invoker(True, 0, os.path.expanduser("~"), None)
+                inv = privilege.invoker(self.euid)
+            except privilege.SudoUserError:
+                inv = privilege.Invoker(True, 0, os.path.expanduser("~"), None)
             self.uid = inv.uid
             if self.home is None:
                 self.home = inv.home
@@ -262,7 +262,7 @@ class Env:
 
 def mode_error(env: Env) -> Optional[str]:
     """Why this run can't act at all: root without a non-root user to act for."""
-    return runmode.SUDO_USER_ERROR if env.uid == 0 else None
+    return privilege.SUDO_USER_ERROR if env.uid == 0 else None
 
 
 # --------------------------------------------------------------------------
@@ -877,33 +877,7 @@ def service_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
 
 
 def _root_only(path: str, env: Env) -> bool:
-    """Only root can change what path runs: every component of the original path is
-    root-owned (non-symlinks also not group/world-writable), and so is its canonical target."""
-    if not os.path.isabs(path):
-        return False
-    current = "/"
-    for part in [""] + [c for c in os.path.normpath(path).split(os.sep) if c]:
-        current = os.path.join(current, part) if part else current
-        try:
-            st = env.lstat(current)
-        except OSError:
-            return False
-        if st.st_uid != 0:
-            return False
-        if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022:
-            return False
-    current = os.path.realpath(path)
-    while True:
-        try:
-            st = env.stat(current)
-        except OSError:
-            return False
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            return False
-        parent = os.path.dirname(current)
-        if parent == current:
-            return True
-        current = parent
+    return privilege.root_only(path, env.stat, env.lstat)
 
 
 def system_log_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
@@ -1235,23 +1209,8 @@ def _remove_plist(path: str, domain: str, env: Env) -> bool:
     return True
 
 
-def _existing_ancestor(path: str) -> str:
-    current = os.path.normpath(path)
-    while not os.path.lexists(current):
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return current
-
-
 def root_dir_error(path: str, env: Env) -> Optional[str]:
-    """Why root must not create or write inside dir `path`: its deepest existing component
-    (and every component above it) must be root-owned and not group/world-writable."""
-    existing = _existing_ancestor(path)
-    if not _root_only(existing, env):
-        return f"{existing} is not root-only (root-owned, not group/world-writable)"
-    return None
+    return privilege.root_dir_error(path, env.stat, env.lstat)
 
 
 def _root_dir_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
@@ -1275,7 +1234,7 @@ def _secure_mkdirs(path: str, svc: Service, env: Env) -> bool:
     if why:
         log(f"launchd: {svc.label}: not creating {path}: {why}", Color.RED)
         return False
-    existing = _existing_ancestor(path)
+    existing = privilege.existing_ancestor(path)
     current = existing
     for part in os.path.relpath(os.path.normpath(path), existing).split(os.sep):
         if part in ("", "."):
@@ -1405,7 +1364,7 @@ def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> bool:
         return True
     if _dir_exists(wd, svc.domain, env):
         return True
-    if runmode.under_home(wd, env.home):
+    if privilege.under_home(wd, env.home):
         log(f"launchd: {svc.label}: not creating {wd}: root never writes in user space", Color.RED)
         return svc.disabled
     if not _root_mkdir_ok(wd, env):
@@ -1498,6 +1457,8 @@ class Plan:
     disable: List[Item] = field(default_factory=list)  # enabled -> disabled, plist unchanged
     restart: List[Item] = field(default_factory=list)  # restartOn file changed
     retry: List[Item] = field(default_factory=list)  # last activation failed, plist current
+    # disabled, but its log dirs are not root-only: only disable/bootout, nothing written
+    stop: List[Item] = field(default_factory=list)
     unknown: List[Tuple[str, str]] = field(default_factory=list)  # held: deploy fails
     ignored: List[Tuple[str, str]] = field(default_factory=list)  # malformed state, warn only
     ok: List[Item] = field(default_factory=list)  # nothing to do
@@ -1621,11 +1582,14 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             p.errors.append(f"{svc.name}: cannot build plist: {e}")
             continue
         log_errors = service_errors(svc, settings, env) + home_errors(svc, settings, env)
-        if not log_errors:
-            log_errors = _root_dir_errors(svc, settings, env)
         if log_errors:
             p.errors += log_errors
             continue
+        dir_errors = _root_dir_errors(svc, settings, env)
+        if dir_errors:
+            p.errors += dir_errors
+            if not svc.disabled:
+                continue
         blocked = workdir_block(svc, env)
         if blocked:
             p.blocked.append((svc.label, blocked))
@@ -1656,6 +1620,13 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
         if current is not None:
             item.old_data = dump_plist(current)
         ours = item.tracked is not None and item.tracked.get("hash") is not None
+        if dir_errors:
+            if ours or (exists and current == pl):
+                _plan_stop(p, item, exists, live, env)
+            elif exists:
+                reason = "malformed plist" if current is None else _NOT_OURS
+                p.blocked.append((svc.label, f"{path}: {reason}"))
+            continue
         old_hashes = (item.tracked or {}).get("restartOn") or {}
         item.changed_files = [
             f
@@ -1674,7 +1645,7 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
         elif ours:
             bucket = p.update
         else:
-            reason = "malformed plist" if current is None else "exists and is not managed by tools"
+            reason = "malformed plist" if current is None else _NOT_OURS
             p.blocked.append((svc.label, f"{path}: {reason}"))
             continue
 
@@ -1712,6 +1683,26 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
     for label in sorted(set(tracked) - desired_labels):
         _plan_removal(p, label, tracked[label], settings, env)
     return p
+
+
+_NOT_OURS = "exists and is not managed by tools"
+
+
+def _owned(item: Item, env: Env) -> bool:
+    """tools wrote this job, or the plist on disk is exactly what tools would write."""
+    if (item.tracked or {}).get("hash") is not None:
+        return True
+    exists, current, _readable = read_current(item.path, item.svc.domain, env)
+    return exists and current == item.plist
+
+
+def _plan_stop(p: Plan, item: Item, exists: bool, live: Status, env: Env) -> None:
+    """A disabled job that may still run or load at boot gets disabled and booted out."""
+    svc = item.svc
+    item.loaded = live.loaded
+    item.live_disabled = is_disabled(svc.label, svc.domain, env)
+    if live.loaded or (exists and item.live_disabled is not True):
+        p.stop.append(item)
 
 
 _ENTRY_TYPES = {
@@ -1811,7 +1802,7 @@ def home_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
     return [
         f"{svc.name}: {what} {path} is under {env.home}; root never writes in user space"
         for what, path in targets
-        if runmode.under_home(path, env.home)
+        if privilege.under_home(path, env.home)
     ]
 
 
@@ -1903,8 +1894,32 @@ def _fix_perms(item: Item, env: Env) -> bool:
     return _write_plist(path, item.data, svc.domain, env, mode)
 
 
+def _stop(item: Item, env: Env, services: Dict) -> bool:
+    """Disable and boot out an owned job without writing the plist or logs. A tracked job
+    keeps its hash; an identical untracked one is adopted so removal re-enables it."""
+    svc = item.svc
+    if not _owned(item, env):
+        log(f"launchd: skipping {svc.label}: {item.path}: {_NOT_OURS}", Color.YELLOW)
+        return False
+    if not _set_enabled(svc.label, svc.domain, False, env):
+        return False
+    ok = bootout(svc.label, svc.domain, env)
+    if (item.tracked or {}).get("hash") is not None:
+        services[svc.label] = {**item.tracked, "disabled": True}
+    else:
+        _record(services, item, None if ok else "activate", True)
+    return ok
+
+
 def _converge(item: Item, settings: Settings, env: Env, services: Dict, write: bool, new: bool):
     """Shared steps for every job that needs launchd work; records each step that succeeded."""
+    if item.svc.disabled:
+        dir_errors = _root_dir_errors(item.svc, settings, env)
+        if dir_errors:
+            for err in dir_errors:
+                log(f"launchd: {err}", Color.RED)
+            _stop(item, env, services)
+            return False
     if not _ensure_logs(item, settings, env):
         _record_logs(services, item)
         return False
@@ -2025,6 +2040,12 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
             else:
                 success = False
 
+    for item in p.stop:
+        if _stop(item, env, services):
+            log(f"Disabled launchd job: {item.svc.label} (nothing written)", Color.YELLOW)
+        else:
+            success = False
+
     for item in p.adopt:
         if _ensure_logs(item, settings, env) and _fix_perms(item, env):
             _record(services, item)
@@ -2062,12 +2083,12 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
 
 
 def _note_unmanaged(services: List[Service], env: Env) -> None:
-    """Say which configured jobs this run leaves to the other mode."""
+    """Say which configured jobs this run leaves to a run under sudo or as your user."""
     others = [s for s in services if not can_change(s.domain, env)]
-    if not others:
+    if not others or privilege.UNDER_SUDO:
         return
     if env.root:
-        debug(f"launchd: {len(others)} agent(s) skipped as root; run tools deploy without sudo")
+        debug(f"launchd: {len(others)} agent(s) skipped as root; they run as your user")
     else:
         log(
             f"launchd: {len(others)} daemon(s) not managed as user; "
@@ -2101,7 +2122,18 @@ def install_launchd(
     _note_unmanaged(services, env)
     p = plan(settings, services, state, env, errors)
     ok = apply(settings, p, state, env)
-    work = (p.create, p.update, p.load, p.unload, p.enable, p.disable, p.restart, p.retry, p.remove)
+    work = (
+        p.create,
+        p.update,
+        p.load,
+        p.unload,
+        p.enable,
+        p.disable,
+        p.stop,
+        p.restart,
+        p.retry,
+        p.remove,
+    )
     if not any(work):
         debug("All launchd jobs up to date", Color.BLUE)
     return ok
@@ -2168,6 +2200,7 @@ def diff_launchd(
         changes += _plist_diff(item)
     changes += [f"  ~ disable {name(i)}" for i in p.disable]
     changes += [f"  ~ unload {name(i)} (disabled but loaded)" for i in p.unload]
+    changes += [f"  ~ disable {name(i)} (bootout only; nothing written)" for i in p.stop]
     changes += [f"  ~ enable {name(i)}" for i in p.enable]
     changes += [f"  ~ load {name(i)} (not loaded)" for i in p.load]
     changes += [f"  ~ restart {name(i)} ({', '.join(i.changed_files)} changed)" for i in p.restart]
