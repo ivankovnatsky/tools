@@ -1213,18 +1213,22 @@ def root_dir_error(path: str, env: Env) -> Optional[str]:
     return privilege.root_dir_error(path, env.stat, env.lstat)
 
 
-def _root_dir_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
+def _root_dir_problems(svc: Service, settings: Settings, env: Env) -> List[str]:
     """As root, the dirs a daemon's logs live in must be root-only (checked at plan and apply)."""
     if not env.root or svc.domain != "system":
         return []
     dirs = [log_dir_of(svc, settings, env)]
     dirs += [os.path.dirname(p) for p in log_paths(svc, settings, env)]
-    errors = []
+    problems = []
     for d in dict.fromkeys(dirs):
         why = root_dir_error(d, env)
         if why:
-            errors.append(f"{svc.name}: log dir {d}: {why}")
-    return errors
+            problems.append(f"log dir {d}: {why}")
+    return problems
+
+
+def _root_dir_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
+    return [f"{svc.name}: {p}" for p in _root_dir_problems(svc, settings, env)]
 
 
 def _secure_mkdirs(path: str, svc: Service, env: Env) -> bool:
@@ -1585,11 +1589,13 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
         if log_errors:
             p.errors += log_errors
             continue
-        dir_errors = _root_dir_errors(svc, settings, env)
+        dir_errors = _root_dir_problems(svc, settings, env)
         if dir_errors:
-            p.errors += dir_errors
             if not svc.disabled:
+                p.errors += [f"{svc.name}: {e}" for e in dir_errors]
                 continue
+            # A disabled job only gets stopped, so a bad log dir must not hold the deploy.
+            p.blocked += [(svc.label, e) for e in dir_errors]
         blocked = workdir_block(svc, env)
         if blocked:
             p.blocked.append((svc.label, blocked))
@@ -1911,15 +1917,17 @@ def _stop(item: Item, env: Env, services: Dict) -> bool:
     return ok
 
 
+_STOPPED = "stopped"
+
+
 def _converge(item: Item, settings: Settings, env: Env, services: Dict, write: bool, new: bool):
     """Shared steps for every job that needs launchd work; records each step that succeeded."""
     if item.svc.disabled:
         dir_errors = _root_dir_errors(item.svc, settings, env)
         if dir_errors:
             for err in dir_errors:
-                log(f"launchd: {err}", Color.RED)
-            _stop(item, env, services)
-            return False
+                log(f"launchd: {err}", Color.YELLOW)
+            return _STOPPED if _stop(item, env, services) else False
     if not _ensure_logs(item, settings, env):
         _record_logs(services, item)
         return False
@@ -2035,7 +2043,10 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
     )
     for items, write, new, verb in steps:
         for item in items:
-            if _converge(item, settings, env, services, write, new):
+            result = _converge(item, settings, env, services, write, new)
+            if result == _STOPPED:
+                log(f"Stopped launchd job: {item.svc.label} (log dir not root-only)", Color.YELLOW)
+            elif result:
                 log(f"{verb} launchd job: {item.svc.label}", Color.GREEN)
             else:
                 success = False

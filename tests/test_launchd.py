@@ -2496,19 +2496,34 @@ class DisabledLogDirTest(LaunchdTestBase):
         changes = self.diff(raw)
         self.assertIn("not root-only", " ".join(changes))
         self.assertIn(f"  ~ disable system/{self.LABEL} (bootout only; nothing written)", changes)
-        self.assertFalse(self.deploy(raw))
+        self.assertTrue(self.deploy(raw))
         self.assertNotIn(self.LABEL, self.fake.loaded)
         self.assertIn(self.LABEL, self.fake.disabled)
         self.no_writes()
         entry = self.state["launchd"]["services"][self.LABEL]
         self.assertEqual((entry["hash"], entry["disabled"]), (before, True))
         self.assertEqual(self.diff(raw), [c for c in changes if not c.startswith("  ~")])
+        self.assertTrue(self.deploy(raw))
+
+    def test_stopped_disabled_daemon_with_bad_log_dir_does_not_hold_removals(self):
+        self.assertTrue(
+            self.deploy(self.cfg(daemons={"d": {"command": "x"}, "old": {"command": "z"}}))
+        )
+        self.user_owned.add(self.env.system_log_dir)
+        raw = self.daemon_cfg(disabled=True)
+        self.assertTrue(self.deploy(raw))
+        self.assertNotIn("org.example.old", self.fake.loaded)
+        self.assertFalse(os.path.exists(self.daemon_path("old")))
+        self.assertNotIn("org.example.old", self.state["launchd"]["services"])
+        changes = self.diff(raw)
+        self.assertFalse([c for c in changes if c.startswith(("  ! held", "  ~", "  -"))], changes)
+        self.assertTrue(self.deploy(raw))
 
     def test_disabled_daemon_needing_a_rewrite_is_stopped_without_writing(self):
         self.running_daemon_with_user_owned_logs()
         with open(self.daemon_path("d"), "rb") as f:
             old = f.read()
-        self.assertFalse(self.deploy(self.daemon_cfg(command="y", disabled=True)))
+        self.assertTrue(self.deploy(self.daemon_cfg(command="y", disabled=True)))
         self.assertNotIn(self.LABEL, self.fake.loaded)
         self.assertIn(self.LABEL, self.fake.disabled)
         self.no_writes()
@@ -2522,10 +2537,25 @@ class DisabledLogDirTest(LaunchdTestBase):
         self.assertEqual(len(p.disable), 1)
         self.user_owned.add(self.env.system_log_dir)
         self.fake.system_calls.clear()
-        self.assertFalse(launchd.apply(settings, p, self.state, self.env))
+        self.assertTrue(launchd.apply(settings, p, self.state, self.env))
         self.assertNotIn(self.LABEL, self.fake.loaded)
         self.assertIn(self.LABEL, self.fake.disabled)
         self.no_writes()
+
+    def test_update_stopped_for_a_log_dir_swapped_after_planning_says_stopped(self):
+        self.assertTrue(self.deploy(self.daemon_cfg()))
+        raw = self.daemon_cfg(command="y", disabled=True)
+        settings, svcs, _e = launchd.parse_launchd(raw, self.env.home)
+        p = launchd.plan(settings, svcs, self.state, self.env)
+        self.assertEqual(len(p.update), 1)
+        self.user_owned.add(self.env.system_log_dir)
+        with mock.patch.object(launchd, "log") as log:
+            self.assertTrue(launchd.apply(settings, p, self.state, self.env))
+        notes = [c.args[0] for c in log.call_args_list]
+        self.assertIn(f"Stopped launchd job: {self.LABEL} (log dir not root-only)", notes)
+        self.assertFalse([n for n in notes if n.startswith("Updated launchd job")], notes)
+        self.assertNotIn(self.LABEL, self.fake.loaded)
+        self.assertIn(self.LABEL, self.fake.disabled)
 
     def foreign_daemon(self, plist):
         os.makedirs(self.env.daemons_dir, exist_ok=True)
@@ -2546,7 +2576,7 @@ class DisabledLogDirTest(LaunchdTestBase):
             f"  ! skip {self.LABEL}: {self.daemon_path('d')}: exists and is not managed by tools",
             self.diff(raw),
         )
-        self.assertFalse(self.deploy(raw))
+        self.assertTrue(self.deploy(raw))
         self.assertEqual(self.changing_launchctl(), [])
         self.assertEqual(self.fake.system_calls, [])
         self.assertIn(self.LABEL, self.fake.loaded)
@@ -2557,7 +2587,7 @@ class DisabledLogDirTest(LaunchdTestBase):
         raw = self.daemon_cfg(disabled=True)
         settings, svcs, _e = launchd.parse_launchd(raw, self.env.home)
         self.foreign_daemon(launchd.desired_plist(svcs[0], settings, self.env))
-        self.assertFalse(self.deploy(raw))
+        self.assertTrue(self.deploy(raw))
         self.assertNotIn(self.LABEL, self.fake.loaded)
         self.assertIn(self.LABEL, self.fake.disabled)
         self.no_writes()
@@ -2608,7 +2638,7 @@ class DisabledLogDirTest(LaunchdTestBase):
         os.makedirs(self.env.system_log_dir)
         self.cfg(daemons={})
         self.user_owned.add(self.env.system_log_dir)
-        self.assertFalse(self.deploy(self.daemon_cfg(disabled=True)))
+        self.assertTrue(self.deploy(self.daemon_cfg(disabled=True)))
         self.assertEqual(self.fake.system_calls, [])
         self.assertFalse(os.path.exists(self.daemon_path("d")))
 
