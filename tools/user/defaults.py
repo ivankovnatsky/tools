@@ -298,6 +298,22 @@ def _identity_cache() -> Callable[[str, str], str]:
     return ident_of
 
 
+MAX_PROCESS_NAME = 255
+
+
+def process_name_error(name) -> Optional[str]:
+    """Why name can't be passed to killall as a process name, or None."""
+    if not isinstance(name, str) or not name:
+        return f"process name must be a non-empty string, got {name!r}"
+    if len(name) > MAX_PROCESS_NAME:
+        return f"process name longer than {MAX_PROCESS_NAME} characters: {name[:40]!r}..."
+    if name.startswith("-"):
+        return f"process name must not start with '-': {name!r}"
+    if any(c in name for c in "/\0\n\r"):
+        return f"process name must not contain '/', NUL or newlines: {name!r}"
+    return None
+
+
 def _merge_procs(into: List[str], procs) -> List[str]:
     into += [p for p in procs if p not in into]
     return into
@@ -393,6 +409,10 @@ def parse_defaults(raw) -> Tuple[DefaultsSpec, List[str]]:
             or not all(isinstance(p, str) and p.strip() for p in procs)
         ):
             restart_errors.append(f"restart: {domain!r} must map to a process name or list of them")
+            continue
+        bad = [e for e in (process_name_error(p.strip()) for p in procs) if e]
+        if bad:
+            restart_errors += [f"restart: {domain!r}: {e}" for e in bad]
             continue
         normalized, err = _normalize_domain("restart", domain)
         if err:
@@ -507,7 +527,10 @@ class _Restarts:
             return out
         if (scope, ident) in self.desired:
             return []
-        return list((self.fallback.get(scope) or {}).get(ident, []))
+        procs = (self.fallback.get(scope) or {}).get(ident, [])
+        if not isinstance(procs, list):
+            return []
+        return [p for p in procs if process_name_error(p) is None]
 
     def for_plists(self, plists) -> List[str]:
         out: List[str] = []
@@ -639,12 +662,15 @@ class DefaultsCLI:
         """Kill process so it relaunches with new prefs. Returns a warning or None."""
         if not self.killall:
             return "killall not found"
-        cmd = [self.killall, process]
+        err = process_name_error(process)
+        if err:
+            return err
+        cmd = [self.killall, "--", process]
         if self.is_root:
             # Root's killall matches every user's process; restart only the invoking user's.
             if not self.login:
                 return "no invoking user to restart it for"
-            cmd = [self.killall, "-u", self.login, process]
+            cmd = [self.killall, "-u", self.login, "--", process]
         rc, stdout, stderr = self.run(cmd)
         if rc != 0:
             return (stderr or stdout or "").strip() or f"exit {rc}"

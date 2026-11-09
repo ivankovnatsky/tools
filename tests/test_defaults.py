@@ -1290,11 +1290,11 @@ class RestartTest(DefaultsTestBase):
 
     def test_user_mode_restart_is_plain_killall(self):
         self.fake.cli().restart("Dock")
-        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "Dock"]])
+        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "--", "Dock"]])
 
     def test_root_restarts_only_the_invoking_users_process(self):
         self.fake.cli(True, login="me").restart("Dock")
-        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "-u", "me", "Dock"]])
+        self.assertEqual(self.fake.calls, [["/usr/bin/killall", "-u", "me", "--", "Dock"]])
         self.fake.calls.clear()
         warning = self.fake.cli(True, login=None).restart("Dock")
         self.assertIn("no invoking user", warning)
@@ -1306,7 +1306,31 @@ class RestartTest(DefaultsTestBase):
                "restart": {"/Library/Preferences/com.example.sys": "Dock"}}  # fmt: skip
         self.assertTrue(self.deploy(raw))
         kills = [c for c in self.fake.calls if c[0] == "/usr/bin/killall"]
-        self.assertEqual(kills, [["/usr/bin/killall", "-u", "me", "Dock"]])
+        self.assertEqual(kills, [["/usr/bin/killall", "-u", "me", "--", "Dock"]])
+
+
+class ProcessNameTest(DefaultsTestBase):
+    BAD = ["-uroot", "-9", "a/b", "a\0b", "a\nb", "x" * 256]
+
+    def test_restart_refuses_option_like_or_malformed_names(self):
+        for name in self.BAD:
+            with self.subTest(name=name):
+                self.fake.calls.clear()
+                warning = self.fake.cli(True, login="me").restart(name)
+                self.assertTrue(warning)
+                self.assertEqual(self.fake.calls, [])
+
+    def test_config_rejects_bad_restart_names(self):
+        for name in self.BAD:
+            with self.subTest(name=name):
+                _spec, errors = parse_defaults({"user": {"x": {"k": 1}}, "restart": {"x": name}})
+                self.assertTrue(errors)
+
+    def test_state_fallback_drops_bad_names(self):
+        spec, errors = parse_defaults({})
+        self.assertEqual(errors, [])
+        restarts = defaults._Restarts.build(spec, {"user": {"x": ["-uroot", "Dock", "a/b"]}})
+        self.assertEqual(restarts.entry("user", "x"), ["Dock"])
 
 
 class FailureTest(DefaultsTestBase):

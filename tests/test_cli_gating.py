@@ -526,6 +526,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.events = []
         self.ops = []
         self.results = {}
+        self.queues = {}
 
     def load(self, _paths):
         self.events.append(("load", os.geteuid(), os.environ["HOME"]))
@@ -545,8 +546,10 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
             return privilege.as_user(inv, fn, ops)
 
     def step(self, name):
-        def run(*_a, **_k):
+        def run(*_a, **k):
             self.events.append((name, os.geteuid()))
+            if name in self.queues and "restarts" in k:
+                k["restarts"].extend(self.queues[name])
             return self.results.get((name, os.geteuid()), True)
 
         return run
@@ -561,7 +564,9 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
             mock.patch.object(privilege, "run_as_user", side_effect=self.fake_run_as_user),
             mock.patch.object(cli, "_load_merged_config", side_effect=self.load),
             mock.patch.object(cli, "migrate_state_file"),
-            mock.patch.object(cli, "run_restarts"),
+            mock.patch.object(
+                cli, "run_restarts", side_effect=lambda r: self.events.append(("restart", r))
+            ),
             mock.patch.object(cli.click, "prompt", return_value=prompt) as prompted,
         ):
             for p in patches:
@@ -575,7 +580,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         return result
 
     def steps(self):
-        return [e for e in self.events if e[0] not in ("load",)]
+        return [e for e in self.events if e[0] not in ("load", "restart")]
 
     def test_system_sections_as_root_then_everything_else_as_the_user(self):
         result = self.run_cli(["deploy", "--approve"])
@@ -661,6 +666,72 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIn(("install_dock", 501), self.events)
+
+    def test_restarts_run_once_after_both_phases(self):
+        self.queues = {"install_defaults": ["Dock"], "install_dock": ["Dock", "SystemUIServer"]}
+        result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        restarts = [e for e in self.events if e[0] == "restart"]
+        self.assertEqual(restarts, [("restart", ["Dock", "SystemUIServer"])])
+        self.assertEqual(self.events[-1], restarts[0])
+
+    def test_root_restarts_run_when_the_user_phase_fails_or_is_skipped(self):
+        self.queues = {"install_defaults": ["Dock"]}
+        cases = {
+            "user phase fails": ("install_brew_packages", 501),
+            "user phase skipped": ("install_launchd", 0),
+        }
+        for label, failing in cases.items():
+            with self.subTest(label):
+                self.events.clear()
+                self.results = {failing: False}
+                result = self.run_cli(["deploy", "--approve"])
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertEqual(self.events[-1], ("restart", ["Dock"]))
+                self.assertEqual(len([e for e in self.events if e[0] == "restart"]), 1)
+
+    def test_child_restart_queue_with_bad_names_is_ignored(self):
+        self.queues = {"install_defaults": ["Dock"], "install_dock": ["Finder", "-uroot"]}
+        result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.events[-1], ("restart", ["Dock"]))
+        self.assertIn("invalid process names", result.output)
+
+    def test_oversized_child_restart_queue_neither_blocks_nor_skips_restarts(self):
+        names = [f"p{i:05d}" + "x" * 90 for i in range(1000)]
+        self.queues = {"install_defaults": ["Dock"], "install_dock": names}
+        result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.events[-1], ("restart", ["Dock"]))
+        self.assertIn("too large", result.output)
+
+    def test_interrupt_during_user_phase_still_runs_both_queues(self):
+        self.queues = {"install_defaults": ["Dock"], "install_dock": ["Finder"]}
+        run_as_user = self.fake_run_as_user
+
+        def interrupted(inv, fn):
+            run_as_user(inv, fn)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(self, "fake_run_as_user", side_effect=interrupted):
+            result = self.run_cli(["deploy", "--approve"])
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.events[-1], ("restart", ["Dock", "Finder"]))
+
+    def test_root_restarts_run_when_the_user_child_crashes(self):
+        self.queues = {"install_defaults": ["Dock"]}
+
+        root_load = self.load
+
+        def load(paths):
+            if os.geteuid() != 0:
+                raise RuntimeError("boom")
+            return root_load(paths)
+
+        with mock.patch.object(self, "load", side_effect=load):
+            result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual(self.events[-1], ("restart", ["Dock"]))
 
     def test_failed_user_diff_deploys_nothing(self):
         def show_diff(_c, _d, _s, root=False):

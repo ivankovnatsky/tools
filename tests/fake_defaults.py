@@ -44,6 +44,8 @@ class FakeDefaults:
             if args[1] == "-u":
                 assert self.root, f"-u only as root: {cmd}"
                 args = [args[0], *args[3:]]
+            assert args[1] == "--" and len(args) == 3, f"process name after --: {cmd}"
+            args = [args[0], args[2]]
             if args[1] in self.running:
                 return 0, "", ""
             return 1, "", "No matching processes belonging to you were found"

@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import threading
 import time
 
 import click
@@ -25,7 +27,7 @@ from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.defaults import has_work as defaults_has_work
-from tools.user.defaults import install_defaults, run_restarts
+from tools.user.defaults import install_defaults, process_name_error, run_restarts
 from tools.user.dock import has_work as dock_has_work
 from tools.user.dock import install_dock
 from tools.user.env import export_process as env_export_process
@@ -120,10 +122,47 @@ def _user_diff(config_paths: list[str], scope: tuple[str, ...]) -> int:
     return 0 if clean else USER_CHANGES
 
 
-def _user_deploy(config_paths: list[str], scope: tuple[str, ...], update: bool) -> int:
-    """`tools deploy --approve` as the user."""
-    merged = _load_merged_config(config_paths)
-    return 0 if _deploy(merged, _resolve_config_dir(config_paths), scope, update) else 1
+def _user_deploy(
+    config_paths: list[str], scope: tuple[str, ...], update: bool, restarts_fd: int
+) -> int:
+    """`tools deploy --approve` as the user; its process restarts go to restarts_fd as
+    JSON for the root parent to run instead."""
+    restarts: list = []
+    try:
+        merged = _load_merged_config(config_paths)
+        ok = _deploy(merged, _resolve_config_dir(config_paths), scope, update, restarts=restarts)
+        return 0 if ok else 1
+    finally:
+        data = json.dumps(restarts).encode()
+        while data:
+            data = data[os.write(restarts_fd, data) :]
+
+
+MAX_RESTARTS_PAYLOAD = 64 * 1024
+
+
+def _read_restarts(fd: int, out: list) -> None:
+    """The user child's restart queue from fd into out. Drains to EOF so the child never
+    blocks on a full pipe; an oversized or malformed payload, or a name killall must not
+    see, yields nothing from the child."""
+    data = bytearray()
+    oversized = False
+    while chunk := os.read(fd, 65536):
+        if not oversized:
+            data += chunk
+            oversized = len(data) > MAX_RESTARTS_PAYLOAD
+    if oversized:
+        log("User restart queue too large; ignoring it", Color.YELLOW)
+        return
+    try:
+        restarts = json.loads(bytes(data) or b"[]")
+    except ValueError:
+        log("User restart queue is malformed; ignoring it", Color.YELLOW)
+        return
+    if not isinstance(restarts, list) or any(process_name_error(p) for p in restarts):
+        log("User restart queue has invalid process names; ignoring it", Color.YELLOW)
+        return
+    out += restarts
 
 
 def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple) -> bool:
@@ -147,17 +186,34 @@ def _sudo_deploy(
     inv: privilege.Invoker, config_paths: list[str], scope: tuple, approve: bool, update: bool
 ) -> None:
     """System sections as root, then every user section in a child dropped to the user.
-    One prompt covers both; a failed system phase stops before the user phase."""
+    One prompt covers both; a failed system phase stops before the user phase. Process
+    restarts from both phases run once, at the end."""
     if not approve and _sudo_diff(inv, config_paths, scope):
         _confirm()
     system = _system_scope(scope)
-    if system:
-        merged = _load_merged_config(config_paths)
-        if not _deploy(merged, _resolve_config_dir(config_paths), system, update, root=True):
-            log(f"System sections failed; not running the rest as {inv.login}", Color.RED)
+    restarts: list = []
+    try:
+        if system:
+            merged = _load_merged_config(config_paths)
+            ok = _deploy(merged, _resolve_config_dir(config_paths), system, update, True, restarts)
+            if not ok:
+                log(f"System sections failed; not running the rest as {inv.login}", Color.RED)
+                sys.exit(1)
+        r, w = os.pipe()
+        child_restarts: list = []
+        reader = threading.Thread(target=_read_restarts, args=(r, child_restarts), daemon=True)
+        reader.start()
+        try:
+            rc = privilege.run_as_user(inv, lambda: _user_deploy(config_paths, scope, update, w))
+        finally:
+            os.close(w)
+            reader.join()
+            os.close(r)
+            restarts += child_restarts
+        if rc != 0:
             sys.exit(1)
-    if privilege.run_as_user(inv, lambda: _user_deploy(config_paths, scope, update)) != 0:
-        sys.exit(1)
+    finally:
+        run_restarts(list(dict.fromkeys(restarts)))
 
 
 def _confirm() -> None:
@@ -179,11 +235,13 @@ def _deploy(
     scope: tuple[str, ...] = (),
     update: bool = False,
     root: bool = False,
+    restarts: list | None = None,
 ) -> bool:
     """Apply config to bring system to desired state. Returns True on success.
 
     Already-installed items are only upgraded (pulled, refetched) with ``update``.
     As root (``root``) only system sections run, against the root-owned state file.
+    With ``restarts``, queued process restarts are added there instead of run.
     """
     if root:
         state_file = privilege.ROOT_STATE_FILE
@@ -223,7 +281,7 @@ def _deploy_locked(
     try:
         persist = lambda: save_json(state_file, state)  # noqa: E731
         if root:
-            success = _run_root_sections(config, state, active, persist)
+            success = _run_root_sections(config, state, active, persist, restarts)
         else:
             success = _run_sections(
                 config,
@@ -234,13 +292,23 @@ def _deploy_locked(
                 persist,
                 state_file,
                 update,
+                restarts,
             )
     finally:
         save_json(state_file, state)
     return success
 
 
-def _run_root_sections(config: dict, state: dict, active: set, persist=lambda: None) -> bool:
+def _finish_restarts(restarts: list, deferred: list | None) -> None:
+    if deferred is None:
+        run_restarts(restarts)
+    else:
+        deferred.extend(restarts)
+
+
+def _run_root_sections(
+    config: dict, state: dict, active: set, persist=lambda: None, deferred: list | None = None
+) -> bool:
     """Under sudo: launchd daemons and system-scope defaults; nothing in user space."""
     success = True
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
@@ -256,7 +324,7 @@ def _run_root_sections(config: dict, state: dict, active: set, persist=lambda: N
                 config.get("defaults"), state, restarts=restarts, persist=persist
             )
     finally:
-        run_restarts(restarts)
+        _finish_restarts(restarts, deferred)
     return success
 
 
@@ -269,6 +337,7 @@ def _run_sections(
     persist=lambda: None,
     state_file: str = "",
     update: bool = False,
+    deferred: list | None = None,
 ) -> bool:
     success = True
 
@@ -469,7 +538,7 @@ def _run_sections(
         if "dock" in active and dock_has_work(config.get("dock"), state):
             success &= install_dock(config.get("dock"), state, restarts=restarts, persist=persist)
     finally:
-        run_restarts(restarts)
+        _finish_restarts(restarts, deferred)
     return success
 
 
