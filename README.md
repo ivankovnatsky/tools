@@ -107,11 +107,19 @@ tools watch --config PATH... [--scope SECTION]... [--approve]
 - Change detection polls each file's mode, mtime, size, inode and symlink target
   (dangling links included) every `--poll` seconds (default 1), following
   symlinked directories as the config loader does. Every poll re-stats the whole
-  tree; for a large one, raise `--poll`. Inside a watched directory, hidden
-  files and directories (`.git`, editor swap files such as `.x.swp` and `.#x`,
-  `.DS_Store`) are skipped, as the config loader skips them; a hidden `files:`
-  source there does not trigger a run. Only the `--config` paths are watched:
+  tree; for a large one, raise `--poll`. Only the `--config` paths are watched:
   `include:` files and `files:` sources outside them are not.
+- Inside a watched directory everything is watched except `.git` and tools' own
+  `.tools-*` temp files, plus whatever `ignore_patterns` in that directory's
+  `.tools-watch.json` lists (same rules as nix-config's `.rebuild.json`): a
+  plain name excludes a file or directory of that name at any depth; a pattern
+  with `*` is a glob matched against the relative path at any depth. The file
+  is re-read when it changes; a missing one means no patterns, an invalid one
+  is warned about and treated as empty. Example:
+
+  ```json
+  { "ignore_patterns": ["README.md", ".direnv", "*.sync-conflict-*", "*.swp"] }
+  ```
 - The state file and `mgmt.key` next to it (and their `.lock` and `.tmp`
   siblings) are never watched. Other deploy targets inside a watched directory make each
   deploy trigger the next; keep them outside.

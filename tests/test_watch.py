@@ -78,15 +78,100 @@ class SnapshotTest(unittest.TestCase):
             names = sorted(os.path.relpath(p, d) for p in snap)
         self.assertEqual(names, ["cfg/a.yaml", "cfg/machines/host.yaml", "extra.yaml"])
 
-    def test_skips_hidden_files_and_dirs(self):
+    def test_watches_dot_paths_but_skips_git_and_tools_temp_files(self):
         with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, ".hidden"))
-            for rel in ("a.yaml", ".a.yaml.swp", ".#a.yaml", ".DS_Store", ".hidden/x.yaml"):
+            os.makedirs(os.path.join(d, "dotfiles", ".config", "app"))
+            os.makedirs(os.path.join(d, ".git"))
+            for rel in (
+                "a.yaml",
+                ".sops.yaml",
+                ".DS_Store",
+                "dotfiles/.config/app/rc",
+                ".git/HEAD",
+                ".tools-abc123",
+                "dotfiles/.tools-def456",
+            ):
                 with open(os.path.join(d, rel), "w") as f:
                     f.write("x")
             snap = watch.snapshot([d])
-            names = sorted(os.path.basename(p) for p in snap)
-        self.assertEqual(names, ["a.yaml"])
+            names = sorted(os.path.relpath(p, os.path.realpath(d)) for p in snap)
+        self.assertEqual(names, [".DS_Store", ".sops.yaml", "a.yaml", "dotfiles/.config/app/rc"])
+
+    def _tree(self, d, rels, ignore=None):
+        for rel in rels:
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(d, rel), "w") as f:
+                f.write("x")
+        if ignore is not None:
+            with open(os.path.join(d, watch.IGNORE_FILE), "w") as f:
+                f.write(ignore)
+
+    def _names(self, d):
+        return sorted(os.path.relpath(p, os.path.realpath(d)) for p in watch.snapshot([d]))
+
+    def test_honours_ignore_patterns_from_file(self):
+        rels = (
+            "a.yaml",
+            "README.md",
+            "dotfiles/notes.md",
+            ".direnv/env",
+            "dotfiles/.direnv/env",
+            "dotfiles/.config/rc",
+            "dotfiles/rc.sync-conflict-20260101-abc",
+            "result-bin/x",
+            "dotfiles/.config/.DS_Store",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(
+                d,
+                rels,
+                '{"ignore_patterns": ["*.md", ".direnv/", "*.sync-conflict-*",'
+                ' "result*", ".DS_Store"]}',
+            )
+            names = self._names(d)
+        self.assertEqual(names, ["a.yaml", "dotfiles/.config/rc"])
+
+    def test_missing_ignore_file_watches_everything_but_builtins(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d, ("a.yaml", ".direnv/env", "__pycache__/x.pyc", ".git/HEAD"))
+            names = self._names(d)
+        self.assertEqual(names, [".direnv/env", "__pycache__/x.pyc", "a.yaml"])
+
+    def test_invalid_ignore_file_warns_and_uses_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d, ("a.md",), "{not json")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                names = self._names(d)
+                self._names(d)
+        self.assertEqual(names, ["a.md"])
+        self.assertEqual(out.getvalue().count("Ignoring invalid"), 1)
+
+    def test_ignore_file_is_reread_when_it_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d, ("a.md", "b.yaml"), '{"ignore_patterns": []}')
+            self.assertIn("a.md", self._names(d))
+            with open(os.path.join(d, watch.IGNORE_FILE), "w") as f:
+                f.write('{"ignore_patterns": ["*.md", "x"]}')
+            self.assertNotIn("a.md", self._names(d))
+
+    def test_change_under_dot_dir_triggers_and_git_does_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "dotfiles", ".config"))
+            os.makedirs(os.path.join(d, ".git"))
+            rc = os.path.join(d, "dotfiles", ".config", "rc")
+            head = os.path.join(d, ".git", "HEAD")
+            for path in (rc, head):
+                with open(path, "w") as f:
+                    f.write("x")
+            before = watch.snapshot([d])
+            with open(head, "w") as f:
+                f.write("yy")
+            self.assertEqual(watch.changed_paths(before, watch.snapshot([d])), [])
+            with open(rc, "w") as f:
+                f.write("yy")
+            changed = watch.changed_paths(before, watch.snapshot([d]))
+        self.assertEqual(changed, [os.path.realpath(rc)])
 
     def test_is_excluded_matches_path_and_dot_suffixed_siblings(self):
         exclude = {"/s/state.json"}

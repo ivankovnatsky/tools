@@ -1,5 +1,7 @@
 """Polling file watcher behind `tools watch`."""
 
+import fnmatch
+import json
 import os
 import shlex
 import shutil
@@ -15,6 +17,11 @@ from tools.log import Color, log
 LOG_PREFIX = "[tools watch]"
 TMUX_WINDOW = "tools-watch"
 MAX_LISTED = 10
+IGNORE_FILE = ".tools-watch.json"
+BUILTIN_SKIP_DIRS = {".git"}
+TEMP_PREFIX = ".tools-"
+
+_ignore_cache: dict = {}
 
 
 def wlog(message: str, color: str = "") -> None:
@@ -22,12 +29,58 @@ def wlog(message: str, color: str = "") -> None:
     log(f"{stamp} {LOG_PREFIX} {message}", color)
 
 
+def load_ignores(root: str) -> list[str]:
+    """Return `ignore_patterns` from `<root>/.tools-watch.json`, re-read when it changes.
+
+    A missing file means no patterns; an unreadable or invalid one is warned
+    about once per version and also means none.
+    """
+    path = os.path.join(root, IGNORE_FILE)
+    try:
+        st = os.stat(path)
+    except OSError:
+        _ignore_cache.pop(path, None)
+        return []
+    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    cached = _ignore_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        with open(path) as f:
+            raw = json.load(f).get("ignore_patterns", [])
+        if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+            raise ValueError("ignore_patterns must be a list of strings")
+        patterns = [p.rstrip("/") for p in raw if p.rstrip("/")]
+    except (OSError, ValueError, AttributeError) as exc:
+        wlog(f"Ignoring invalid {path}: {exc}", Color.YELLOW)
+        patterns = []
+    _ignore_cache[path] = (key, patterns)
+    return patterns
+
+
+def is_ignored(rel: str, patterns) -> bool:
+    """Match a root-relative path the way nix-config's rebuild watch does.
+
+    A plain name matches any path component; a pattern with `*` is a glob
+    matched against the relative path and against every trailing sub-path.
+    """
+    parts = rel.split(os.sep)
+    for pattern in patterns:
+        if "*" in pattern:
+            if any(fnmatch.fnmatchcase("/".join(parts[i:]), pattern) for i in range(len(parts))):
+                return True
+        elif pattern in parts:
+            return True
+    return False
+
+
 def snapshot(paths) -> dict:
     """Map every file under `paths` to its identity; missing paths are absent.
 
     Symlinked directories are followed, as the config loader follows them;
-    each directory is walked once, so link loops end. Hidden files and
-    directories under a directory root are skipped, as the loader skips them.
+    each directory is walked once, so link loops end. `.git`, tools' own
+    `.tools-*` temp files, and paths matching the root's `.tools-watch.json`
+    `ignore_patterns` are left out.
     """
     result: dict = {}
     for root in paths:
@@ -35,6 +88,7 @@ def snapshot(paths) -> dict:
         if not os.path.isdir(root):
             _stat_into(result, root)
             continue
+        patterns = load_ignores(root)
         seen: set = set()
         for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
             try:
@@ -46,9 +100,19 @@ def snapshot(paths) -> dict:
                 dirnames[:] = []
                 continue
             seen.add((st.st_dev, st.st_ino))
-            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            reldir = os.path.relpath(dirpath, root)
+            reldir = "" if reldir == "." else reldir
+
+            def rel(name, reldir=reldir):
+                return os.path.join(reldir, name) if reldir else name
+
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in BUILTIN_SKIP_DIRS and not is_ignored(rel(d), patterns)
+            )
             for name in filenames:
-                if not name.startswith("."):
+                if not name.startswith(TEMP_PREFIX) and not is_ignored(rel(name), patterns):
                     _stat_into(result, os.path.join(dirpath, name))
     return result
 
