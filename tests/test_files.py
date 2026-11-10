@@ -970,3 +970,68 @@ class MoveAsideTest(unittest.TestCase):
         self.assertEqual(_read(self.target), "fresh = 1\n")
         [backup] = _backups(self.target)
         self.assertEqual(_read(backup), "raced\n")
+
+
+class SkipTest(MoveAsideTest):
+    def test_skipped_entry_is_not_written_and_keeps_its_record(self):
+        self.assertTrue(self.deploy(self.entries())[0])
+        record = dict(self.state["files"][self.target])
+        _write(self.target, "app rewrote this\n")
+        _write(os.path.join(self.d, "src"), "fresh = 2\n")
+        skipped = self.entries(skip=True, onChange="false", onUpdate="false")
+
+        self.assertEqual(self.diff(skipped), [f"  = skip {self.target} (skip: true; not written)"])
+        with mock.patch("tools.user.files.log") as log:
+            ok = files.install_files(skipped, self.d, self.state, update=True)
+        self.assertTrue(ok)
+        self.assertIn("skipped", repr(log.call_args_list))
+        self.assertEqual(_read(self.target), "app rewrote this\n")
+        self.assertEqual(_backups(self.target), [])
+        self.assertEqual(self.state["files"][self.target], record)
+
+        # Flipped off: the edited target is moved aside once, as before.
+        self.assertEqual(
+            self.diff(self.entries()), [_replace_row(self.target, "modified since tools wrote it")]
+        )
+
+    def test_skipped_untracked_target_is_not_tracked(self):
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries(skip=True))[0])
+        self.assertEqual(_read(self.target), "mine\n")
+        self.assertNotIn(self.target, self.state.get("files", {}))
+
+    def test_skip_on_dir_entry_is_a_config_error(self):
+        _write(os.path.join(self.d, "tree", "a.conf"), "a\n")
+        entries = [{"dir": "tree", "skip": True}]
+        ok, _ = self.deploy(entries)
+        self.assertFalse(ok)
+        self.assertIn("not dir: trees", self.diff(entries)[0])
+
+    def test_non_bool_skip_is_a_config_error(self):
+        ok, _ = self.deploy(self.entries(skip="yes"))
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(self.target))
+        self.assertIn("`skip` must be a bool", self.diff(self.entries(skip="yes"))[0])
+
+    def test_pending_hook_of_skipped_entry_neither_runs_nor_is_dropped(self):
+        marker = os.path.join(self.d, "ran")
+        hook = f"touch {marker}"
+        self.state = {"onChange": {"files": {hook: [self.target]}}}
+        skipped = self.entries(skip=True, onChange=hook)
+        self.assertEqual(self.diff(skipped), [f"  = skip {self.target} (skip: true; not written)"])
+        self.assertTrue(self.deploy(skipped)[0])
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.state["onChange"], {"files": {hook: [self.target]}})
+
+        self.assertTrue(self.deploy(self.entries(onChange=hook))[0])
+        self.assertTrue(os.path.exists(marker))
+        self.assertNotIn("onChange", self.state)
+
+    def test_only_skipped_rows_do_not_count_as_changes(self):
+        from tools.diff import _print_sections
+
+        with mock.patch("tools.diff.log"):
+            self.assertTrue(_print_sections([("files", ["  = skip /x (skip: true; not written)"])]))
+            self.assertFalse(
+                _print_sections([("files", ["  = skip /x (skip: true)", "  + create /y"])])
+            )

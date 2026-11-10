@@ -11,6 +11,7 @@ Input is plain, already-resolved data keyed by template name::
         "secrets": False,                    # force secret handling
         "restartUnits": ["launchd:org.example.app"],
         "onChange": "shell command",         # run once after a write
+        "skip": False,                       # keep declared, but do not write
       },
     }
 
@@ -32,7 +33,7 @@ from tools import fsutil
 from tools.log import Color, debug, log
 from tools.placeholders import PlaceholderError, Resolver
 from tools.serialize import FORMATS, SerializeError, serialize
-from tools.util import format_diff_bytes, looks_like_secret, parse_on_change
+from tools.util import format_diff_bytes, looks_like_secret, parse_on_change, skipped_row
 
 _KEYS = {
     "path",
@@ -45,6 +46,7 @@ _KEYS = {
     "restartUnits",
     "quote",
     "onChange",
+    "skip",
 }
 DEFAULT_MODE = 0o400
 
@@ -64,6 +66,7 @@ class Template:
     notify: Tuple[str, ...] = ()
     quote: bool = True
     on_change: Optional[str] = None
+    skip: bool = False
 
 
 def parse_templates(
@@ -128,6 +131,9 @@ def parse_templates(
             if not isinstance(quote, bool) or ("quote" in spec and fmt != "env"):
                 raise ValueError(f"{name}: quote must be a bool and only applies to format env")
             on_change = parse_on_change(spec.get("onChange"), name)
+            skip = spec.get("skip", False)
+            if not isinstance(skip, bool):
+                raise ValueError(f"{name}: skip must be a bool")
             mode = fsutil.parse_mode(spec.get("mode"), f"templates.{name}")
             fsutil.check_owner(spec.get("owner"), f"{name}: owner")
             fsutil.check_owner(spec.get("group"), f"{name}: group")
@@ -148,6 +154,7 @@ def parse_templates(
                 notify=tuple(notify),
                 quote=quote,
                 on_change=on_change,
+                skip=skip,
             )
         )
     return result, errors
@@ -185,7 +192,7 @@ def secret_refs(t: Template) -> set:
 @dataclass
 class Change:
     template: Template
-    # create | update | replace | chmod | adopt | unchanged | pending | error
+    # create | update | replace | chmod | adopt | unchanged | pending | skip | error
     action: str
     desired: Optional[bytes] = None
     secret: bool = False
@@ -229,6 +236,16 @@ def plan(
     changes: List[Change] = []
     held = False
     for t in templates:
+        if t.skip:
+            if select is not None and not select(t.target):
+                continue
+            if t.target in conflicts:
+                changes.append(
+                    Change(t, "error", error=f"{t.name}: {t.target} is {conflicts[t.target]}")
+                )
+            else:
+                changes.append(Change(t, "skip"))
+            continue
         if select is not None and not select(t.target):
             # Reported by the plan that selects it; here it only holds removals.
             if tail and not held:
@@ -370,6 +387,9 @@ def apply(
             log(f"templates: {ch.error}", Color.RED)
             res.success = False
             continue
+        if ch.action == "skip":
+            log(f"templates: skipped {t.target} (skip: true)", Color.YELLOW)
+            continue
         if ch.action == "unchanged":
             fsutil.refresh_dev(t.target, installed[t.target])
             if ch.secret and not installed[t.target].get("secret"):
@@ -434,6 +454,9 @@ def describe(p: Plan) -> List[str]:
         t = ch.template
         if ch.action == "error":
             rows.append(f"  ! {ch.error}")
+            continue
+        if ch.action == "skip":
+            rows.append(skipped_row(t.target))
             continue
         if ch.action == "pending":
             rows.append(f"  ~ render {t.target} (pending: {ch.error})")

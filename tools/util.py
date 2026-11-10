@@ -69,18 +69,30 @@ def add_pending_hooks(state: Dict, section: str, hooks: Dict[str, List[str]]) ->
         known += [p for p in paths if p not in known]
 
 
-def settle_hooks(state: Dict, section: str, hooks: Dict[str, List[str]], declared) -> bool:
-    """Run ``hooks`` plus still-pending ones; a failure stays pending in state."""
+def settle_hooks(
+    state: Dict, section: str, hooks: Dict[str, List[str]], declared, held=frozenset()
+) -> bool:
+    """Run ``hooks`` plus still-pending ones; a failure stays pending in state.
+
+    Pending ``held`` commands (declared only by ``skip: true`` entries) neither
+    run nor drop out of state.
+    """
     merged = pending_hooks(state, section, declared)
+    pending = (state.get("onChange") or {}).get(section)
+    kept = {
+        cmd: paths
+        for cmd, paths in (pending.items() if isinstance(pending, dict) else ())
+        if cmd in held and cmd not in declared
+    }
     for cmd, paths in hooks.items():
         merged.setdefault(cmd, [])
         merged[cmd] += [p for p in paths if p not in merged[cmd]]
     store = state.setdefault("onChange", {})
     # Recorded before running, so an interrupted deploy still retries.
-    store[section] = merged
+    store[section] = {**kept, **merged}
     failed = run_hooks(section, merged)
-    if failed:
-        store[section] = failed
+    if failed or kept:
+        store[section] = {**kept, **failed}
     else:
         store.pop(section, None)
     if not store:
@@ -95,6 +107,14 @@ def parse_on_change(value, label: str, key: str = "onChange") -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label}: {key} must be a non-empty string, got {value!r}")
     return value
+
+
+# Diff rows starting with this are notes, not changes: they never prompt.
+SKIPPED_ROW = "  = skip "
+
+
+def skipped_row(target: str) -> str:
+    return f"{SKIPPED_ROW}{target} (skip: true; not written)"
 
 
 def get_pkg_version(pkg_info: Dict) -> str:

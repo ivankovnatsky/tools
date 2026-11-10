@@ -183,6 +183,14 @@ Notable keys:
       mode: "0644"
   ```
 
+- `skip: true` (on a `source`/`target` or `directory` entry, or a template; not
+  on `dir:` trees) keeps the entry declared but
+  writes nothing: the target is neither written nor removed, its state record
+  stays as is, and its hooks do not run. Diff and deploy list it as
+  `= skip <target>`, which alone does not prompt. Use it for files an app
+  rewrites (recent-project lists and the like), and flip it off for one deploy
+  to push repo changes; the target is then treated as before (moved aside once
+  if it changed since tools wrote it).
 - `directory: true` ensures the directory (and its parents) exists and applies
   `mode`. Only a directory tools created is tracked, and it is removed only
   while empty; parents and pre-existing directories are never removed. Other

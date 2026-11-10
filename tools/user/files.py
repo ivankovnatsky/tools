@@ -477,14 +477,22 @@ class Entry(NamedTuple):
     on_change: Optional[str] = None
     directory: bool = False
     on_update: Optional[str] = None
+    skip: bool = False
 
 
-def declared_hooks(entries) -> set:
-    """Every onChange in the raw config, including entries that fail to resolve."""
+def declared_hooks(entries, skipped: bool = False) -> set:
+    """Every onChange in the raw config, including entries that fail to resolve.
+
+    Entries with ``skip: true`` count only with ``skipped`` (and then only they do).
+    """
     if not isinstance(entries, list):
         return set()
     return {
-        e["onChange"] for e in entries if isinstance(e, dict) and isinstance(e.get("onChange"), str)
+        e["onChange"]
+        for e in entries
+        if isinstance(e, dict)
+        and isinstance(e.get("onChange"), str)
+        and (e.get("skip") is True) == skipped
     }
 
 
@@ -531,6 +539,9 @@ def _resolve_entries(
       - dir entry:       {dir: <path>, mode?, secrets?, onChange?, onUpdate?}
       - file entry:      {source, target, mode?, secrets?, onChange?, onUpdate?}
       - directory entry: {target, directory: true, mode?, onChange?, onUpdate?}
+
+    ``skip: true`` keeps an entry declared but unwritten (see `install_files`);
+    it is rejected on a dir entry.
 
     The ``secrets`` flag, when true, suppresses inline content diffs in
     both ``tools deploy`` and ``tools diff`` for that entry. On a dir
@@ -591,6 +602,15 @@ def _resolve_entries(
             )
             continue
         entry_secrets = secrets_raw
+        skip = entry.get("skip", False)
+        if not isinstance(skip, bool):
+            errors.append(f"`skip` must be a bool, got {type(skip).__name__} in {entry!r}")
+            continue
+        if skip and "dir" in entry:
+            errors.append(
+                f"skip is supported on single files and templates, not dir: trees: {entry!r}"
+            )
+            continue
         if entry_system != system:
             continue
 
@@ -603,7 +623,9 @@ def _resolve_entries(
                 errors.append(f"a directory entry takes `target` and no `source`/`dir`: {entry!r}")
                 continue
             target = os.path.normpath(os.path.expanduser(str(entry["target"])))
-            file_pairs.append(Entry(target, None, entry_mode, False, on_change, True, on_update))
+            file_pairs.append(
+                Entry(target, None, entry_mode, False, on_change, True, on_update, skip)
+            )
             continue
 
         if "dir" in entry:
@@ -628,6 +650,7 @@ def _resolve_entries(
                             on_change,
                             False,
                             on_update,
+                            skip,
                         )
                     )
             continue
@@ -639,7 +662,7 @@ def _resolve_entries(
                 errors.append(f"source not found: {entry['source']}")
                 continue
             file_pairs.append(
-                Entry(target, source, entry_mode, entry_secrets, on_change, False, on_update)
+                Entry(target, source, entry_mode, entry_secrets, on_change, False, on_update, skip)
             )
             continue
 
@@ -686,7 +709,8 @@ def install_files(
     ``private_root`` is the sops secretsDir: directory entries inside it are
     created with its mode and registered with the sops section's created dirs.
 
-    See `_resolve_entries` for the supported entry shapes.
+    See `_resolve_entries` for the supported entry shapes. A ``skip`` entry is
+    neither written nor removed, and its state record is kept as is.
 
     Any legacy ``configFiles`` state from an earlier `tools` version is
     left untouched; nothing is auto-migrated, so previously deployed
@@ -724,6 +748,11 @@ def install_files(
                 held[target] = state_files[target]
             if e.on_update:
                 unsettled.add(e.on_update)
+            continue
+        if e.skip:
+            log(f"files: skipped {target} (skip: true)", Color.YELLOW)
+            if target in state_files:
+                held[target] = state_files[target]
             continue
         if e.directory:
             created = state.setdefault("sops", {}).setdefault("createdDirs", [])
@@ -830,7 +859,9 @@ def install_files(
         merged.update(managed)
         state["files"] = merged
 
-    settled = settle_hooks(state, "files", hooks, declared_hooks(entries))
+    settled = settle_hooks(
+        state, "files", hooks, declared_hooks(entries), declared_hooks(entries, skipped=True)
+    )
     success &= settled
 
     if update:

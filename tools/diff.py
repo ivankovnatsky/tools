@@ -34,9 +34,11 @@ from tools.user.ollama_models import diff_ollama_models
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
 from tools.util import (
+    SKIPPED_ROW,
     format_diff_bytes,
     get_pkg_source,
     looks_like_secret,
+    skipped_row,
     version_changed,
 )
 
@@ -278,6 +280,9 @@ def _diff_files(
         reason = _conflict(target, conflicts) or (root_target_error(target) if system else None)
         if reason:
             changes.append(f"  ! refusing {target}: {reason}")
+            continue
+        if e.skip:
+            changes.append(skipped_row(target))
             continue
         before = len(changes)
 
@@ -655,10 +660,14 @@ def _root_sections(config: dict, config_dir: str, scope, load_json, migrate_stat
     return sections
 
 
+def _is_change(item) -> bool:
+    return not (isinstance(item, str) and item.startswith(SKIPPED_ROW))
+
+
 def _print_sections(sections: list) -> bool:
-    has_changes = False
+    """Print every row; only rows other than `skip: true` notes count as changes."""
+    has_changes = any(_is_change(item) for _, items in sections for item in items)
     if sections:
-        has_changes = True
         for i, (title, items) in enumerate(sections):
             prefix = "\n" if i > 0 else ""
             log(f"{prefix}{title}:", Color.BLUE)

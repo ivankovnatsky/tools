@@ -520,20 +520,27 @@ def deploy_templates(
     return res.success
 
 
-def template_hooks(raw) -> set:
-    """Every onChange in the raw templates config, parseable or not."""
+def template_hooks(raw, skipped: bool = False) -> set:
+    """Every onChange in the raw templates config, parseable or not.
+
+    Templates with ``skip: true`` count only with ``skipped`` (and then only they do).
+    """
     if not isinstance(raw, Mapping):
         return set()
     return {
         s["onChange"]
         for s in raw.values()
-        if isinstance(s, Mapping) and isinstance(s.get("onChange"), str)
+        if isinstance(s, Mapping)
+        and isinstance(s.get("onChange"), str)
+        and (s.get("skip") is True) == skipped
     }
 
 
 def run_template_hooks(raw, state: Dict) -> bool:
     """Templates' onChange commands, once after every phase has written."""
-    return util.settle_hooks(state, "templates", {}, template_hooks(raw))
+    return util.settle_hooks(
+        state, "templates", {}, template_hooks(raw), template_hooks(raw, skipped=True)
+    )
 
 
 def plan_sops(

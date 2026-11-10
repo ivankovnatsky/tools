@@ -951,5 +951,48 @@ class FixesTest(TemplatesTestBase):
         )
 
 
+class SkipTest(TemplatesTestBase):
+    def test_skipped_template_not_written_record_kept(self):
+        self.deploy(self.tpl({"a": 1}))
+        record = dict(self.state["templates"]["installed"][self.target])
+        os.chmod(self.target, 0o600)
+        with open(self.target, "w") as f:
+            f.write("app rewrote this\n")
+        raw = self.tpl({"a": 2}, skip=True, onChange="false")
+
+        self.assertEqual(self.diff(raw), [f"  = skip {self.target} (skip: true; not written)"])
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok)
+        self.assertIn("skipped", out)
+        self.assertEqual(self.read(), "app rewrote this\n")
+        self.assertEqual(backups(self.target), [])
+        self.assertEqual(self.state["templates"]["installed"][self.target], record)
+
+        self.assertEqual(
+            self.diff(self.tpl({"a": 2})),
+            [replace_row(self.target, "modified since tools wrote it")],
+        )
+
+    def test_skipped_template_does_not_render(self):
+        raw = self.tpl({"p": "${sops:missing}"}, skip=True)
+        self.assertEqual(self.diff(raw), [f"  = skip {self.target} (skip: true; not written)"])
+        self.assertTrue(self.deploy(raw)[0])
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_pending_hook_of_skipped_template_neither_runs_nor_is_dropped(self):
+        marker = os.path.join(self.tmp, "ran")
+        hook = f"touch {marker}"
+        self.state = {"onChange": {"templates": {hook: [self.target]}}}
+        raw = self.tpl({"a": 1}, skip=True, onChange=hook)
+        self.assertEqual(self.diff(raw), [f"  = skip {self.target} (skip: true; not written)"])
+        self.assertTrue(self.deploy(raw)[0])
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.state["onChange"], {"templates": {hook: [self.target]}})
+
+    def test_non_bool_skip_rejected(self):
+        _, errors = templates.parse_templates(self.tpl({"a": 1}, skip="yes"))
+        self.assertEqual(errors, ["app: skip must be a bool"])
+
+
 if __name__ == "__main__":
     unittest.main()
