@@ -1,8 +1,28 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 from tools.user import brew
+
+_real_brew_prefixes = brew._brew_prefixes
+_prefix_patch = []
+
+
+def setUpModule():
+    # Keep the host's Homebrew prefix (and any nix-homebrew marker) out of the tests.
+    tmp = tempfile.TemporaryDirectory()
+    patcher = mock.patch.object(brew, "_brew_prefixes", return_value=[tmp.name])
+    patcher.start()
+    _prefix_patch.extend([patcher, tmp])
+
+
+def tearDownModule():
+    patcher, tmp = _prefix_patch
+    patcher.stop()
+    tmp.cleanup()
+    _prefix_patch.clear()
 
 
 class BrewBootstrapTest(unittest.TestCase):
@@ -712,6 +732,105 @@ class BrewDiffTest(unittest.TestCase):
     def test_errors_are_shown(self):
         rows = self._diff({"onActivation": {"cleanup": "all"}}, {}, FakeBrew())
         self.assertIn("errors", rows)
+
+
+class BrewNixManagedTest(unittest.TestCase):
+    """While nix-homebrew owns the prefix, brew is refused before any command."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.prefix = tmp.name
+        os.makedirs(os.path.join(self.prefix, "Library", ".homebrew-is-managed-by-nix"))
+        patches = (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_prefixes", return_value=[self.prefix]),
+            mock.patch.object(brew, "run_command", side_effect=AssertionError("ran a command")),
+            mock.patch.object(brew, "_bootstrap_brew", side_effect=AssertionError("bootstrapped")),
+        )
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_deploy_refuses_with_work_pending(self):
+        state = {}
+        with mock.patch.object(brew, "_brew_bin", return_value=None):
+            self.assertFalse(brew.install_brew_packages({"brews": ["a"]}, state))
+        self.assertEqual(state, {})
+
+    def test_deploy_refuses_cleanup(self):
+        state = {"brew": {"brews": ["a"], "casks": [], "taps": [], "masApps": {}}}
+        before = json.loads(json.dumps(state))
+        with mock.patch.object(brew, "_brew_bin", return_value="/brew"):
+            ok = brew.install_brew_packages(
+                {"brews": ["a"], "onActivation": {"cleanup": "zap"}}, state
+            )
+        self.assertFalse(ok)
+        self.assertEqual(state, before)
+
+    def test_diff_shows_the_refusal(self):
+        with mock.patch.object(brew, "_brew_bin", return_value="/brew"):
+            rows = dict(brew.diff_brew({"brews": ["a"], "onActivation": {"cleanup": "zap"}}, {}))
+        self.assertEqual(list(rows), ["errors"])
+        (row,) = rows["errors"]
+        self.assertIn("managed by nix-homebrew", row)
+        self.assertIn(os.path.join(self.prefix, "Library", ".homebrew-is-managed-by-nix"), row)
+
+    def test_in_sync_is_still_a_noop(self):
+        state = {"brew": {"brews": ["a"], "casks": [], "taps": [], "masApps": {}}}
+        self.assertTrue(brew.install_brew_packages({"brews": ["a"]}, state))
+        self.assertEqual(brew.diff_brew({"brews": ["a"]}, state), [])
+
+    def test_no_marker_no_refusal(self):
+        os.rmdir(os.path.join(self.prefix, "Library", ".homebrew-is-managed-by-nix"))
+        self.assertIsNone(brew._nix_managed_error())
+
+
+class BrewPrefixTest(unittest.TestCase):
+    def _prefix(self, found, table="/opt/homebrew/bin/brew"):
+        with (
+            mock.patch.object(brew, "_brew_bin", return_value=found),
+            mock.patch.object(brew, "system_path", return_value=table),
+        ):
+            return _real_brew_prefixes()
+
+    def test_arm64_brew_checks_both_known_prefixes(self):
+        self.assertEqual(self._prefix("/opt/homebrew/bin/brew"), ["/opt/homebrew", "/usr/local"])
+
+    def test_intel_brew_checks_both_known_prefixes(self):
+        self.assertEqual(self._prefix("/usr/local/bin/brew"), ["/opt/homebrew", "/usr/local"])
+
+    def test_checks_every_known_prefix_when_brew_is_absent(self):
+        self.assertEqual(self._prefix(None), ["/opt/homebrew", "/usr/local"])
+
+    def test_brew_found_outside_a_prefix_still_checks_known_prefixes(self):
+        self.assertEqual(
+            self._prefix("/run/current-system/sw/bin/brew"),
+            ["/opt/homebrew", "/usr/local", "/run/current-system/sw"],
+        )
+
+    def test_absent_brew_with_intel_marker_refuses_before_bootstrap(self):
+        with tempfile.TemporaryDirectory() as root:
+            arm, intel = os.path.join(root, "opt"), os.path.join(root, "usr-local")
+            marker = os.path.join(intel, "Homebrew", "Library", ".homebrew-is-managed-by-nix")
+            os.makedirs(marker)
+            state = {}
+            with (
+                mock.patch.object(brew.sys, "platform", "darwin"),
+                mock.patch.object(brew, "_brew_prefixes", return_value=[arm, intel]),
+                mock.patch.object(brew, "_brew_bin", return_value=None),
+                mock.patch.object(brew, "run_command", side_effect=AssertionError("ran")),
+                mock.patch.object(brew, "_bootstrap_brew", side_effect=AssertionError("boot")),
+            ):
+                self.assertFalse(brew.install_brew_packages({"brews": ["a"]}, state))
+            self.assertEqual(state, {})
+
+    def test_intel_marker_under_homebrew_library_refuses(self):
+        with tempfile.TemporaryDirectory() as prefix:
+            marker = os.path.join(prefix, "Homebrew", "Library", ".homebrew-is-managed-by-nix")
+            os.makedirs(marker)
+            with mock.patch.object(brew, "_brew_prefixes", return_value=[prefix]):
+                self.assertIn(marker, brew._nix_managed_error())
 
 
 if __name__ == "__main__":

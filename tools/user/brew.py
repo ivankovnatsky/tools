@@ -6,10 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tools.log import Color, debug, log
-from tools.system_paths import system_bin, system_bin_optional
+from tools.system_paths import system_bin, system_bin_optional, system_path
 from tools.util import run_command
 
 _BREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+# nix-homebrew's Library is <prefix>/Library on arm64, <prefix>/Homebrew/Library on Intel.
+_NIX_MANAGED_MARKERS = (
+    os.path.join("Library", ".homebrew-is-managed-by-nix"),
+    os.path.join("Homebrew", "Library", ".homebrew-is-managed-by-nix"),
+)
 
 
 def _normalize_tap(tap: str) -> str:
@@ -26,6 +31,37 @@ def _brew_bin() -> str | None:
     if path:
         return path
     return shutil.which("brew")
+
+
+def _brew_prefixes() -> List[str]:
+    """Homebrew prefixes to check: the known ones, plus the one the found brew
+    lives under (`<prefix>/bin/brew`).
+
+    Not resolved through symlinks: nix-homebrew's `bin/brew` points into /nix/store.
+    """
+    prefixes = []
+    for path in (system_path("brew"), "/opt/homebrew/bin/brew", "/usr/local/bin/brew", _brew_bin()):
+        prefix = os.path.dirname(os.path.dirname(path)) if path else None
+        if prefix and prefix not in prefixes:
+            prefixes.append(prefix)
+    return prefixes
+
+
+def _nix_managed_error() -> str | None:
+    """Refusal message while nix-homebrew owns the Homebrew prefix.
+
+    Its brew and taps are read-only store paths, and bootstrapping would run
+    the Homebrew installer over them.
+    """
+    for prefix in _brew_prefixes():
+        for rel in _NIX_MANAGED_MARKERS:
+            marker = os.path.join(prefix, rel)
+            if os.path.lexists(marker):
+                return (
+                    f"Homebrew at {prefix} is managed by nix-homebrew ({marker} exists); "
+                    "refusing to manage it until it is moved to a regular Homebrew install"
+                )
+    return None
 
 
 def _bootstrap_brew() -> str | None:
@@ -574,6 +610,10 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
         debug("All brew packages in sync", Color.BLUE)
         return unchanged()
 
+    if refusal := _nix_managed_error():
+        log(f"brew: {refusal}", Color.RED)
+        return False
+
     brew = _brew_bin()
     if not brew and not planned:
         return unchanged()
@@ -768,6 +808,8 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
 
     prev = state.get("brew", {})
     plan = _plan(spec, prev)
+    if (any(plan.values()) or spec.cleanup) and (refusal := _nix_managed_error()):
+        return [("errors", [f"    ! {refusal}"])]
     clean = _no_cleanup()
     notes = []
     if spec.cleanup and (brew := _brew_bin()):

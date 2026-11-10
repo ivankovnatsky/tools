@@ -59,6 +59,11 @@ def _table():
     return _LINUX
 
 
+def system_path(name: str) -> str | None:
+    """Return the hardcoded path for a system binary, whether or not it exists."""
+    return _table().get(name)
+
+
 def system_bin(name: str) -> str:
     """Return the absolute path to a system binary.
 
