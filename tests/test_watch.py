@@ -354,6 +354,38 @@ class SourcePathsTest(unittest.TestCase):
             self.assertIn(expected, paths)
         self.assertNotIn("/c/~/d", paths)
 
+    def test_mgmt_collects_only_path_fields(self):
+        config = {
+            "mgmt": {
+                "nextdns": {
+                    "profiles": {
+                        "p": {
+                            "profileFile": "tpl/p.json",
+                            "apiKeyFile": "/s/key",
+                            "profileIdDir": "ids",
+                            "vars": {"a": ".", "b": "tpl"},
+                            "varsFiles": {"c": "v/c"},
+                        }
+                    }
+                },
+                "syncthing": {
+                    "configDir": "st",
+                    "baseUrl": "http://@h@",
+                    "baseUrlFiles": {"h": "h"},
+                },
+                "forgejo": {"workPath": "work", "forgejoBin": "bin/forgejo"},
+            }
+        }
+        paths = cli._source_paths(config, "/c")
+        self.assertEqual(
+            sorted(paths),
+            ["/c/h", "/c/ids", "/c/st", "/c/tpl/p.json", "/c/v/c", "/s/key"],
+        )
+
+    def test_links_sources(self):
+        config = {"links": [{"source": "/c/l/src", "target": "~/l"}, {"bad": 1}]}
+        self.assertIn("/c/l/src", cli._source_paths(config, "/c"))
+
 
 class IsWatchedTest(unittest.TestCase):
     def test_file_and_dir_entries(self):
@@ -521,6 +553,59 @@ class WatchCommandTest(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self.assertEqual(self._count_runs_after_edit(rel, create=create), 1)
+
+    def _count_runs_after(self, setup, action):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            self._host_config(d)
+            setup(d)
+            edits = []
+
+            def deploy(*_):
+                if not edits:
+                    edits.append(1)
+                    action(d)
+                return True
+
+            result, dep = self._watch(d, deploy)
+        self.assertEqual(result.exit_code, 0, result.output)
+        return dep.call_count
+
+    @staticmethod
+    def _repoint(link, target):
+        os.remove(link)
+        os.symlink(target, link)
+
+    def test_repointed_symlinked_host_file_triggers(self):
+        def setup(d):
+            host = os.path.join(d, "machines", "h.yaml")
+            os.rename(host, os.path.join(d, "machines", "h-a.yaml"))
+            with open(os.path.join(d, "machines", "h-b.yaml"), "w") as f:
+                f.write(f"stateFile: {d}/state/state.json\n")
+            os.symlink("h-a.yaml", host)
+
+        def action(d):
+            self._repoint(os.path.join(d, "machines", "h.yaml"), "h-b.yaml")
+
+        self.assertEqual(self._count_runs_after(setup, action), 2)
+
+    def test_repointed_symlinked_source_triggers(self):
+        def setup(d):
+            with open(os.path.join(d, "machines", "h.yaml"), "a") as f:
+                f.write("  - source: src/link.conf\n    target: ~/l.conf\n")
+            os.symlink("a.conf", os.path.join(d, "src", "link.conf"))
+
+        def action(d):
+            self._repoint(os.path.join(d, "src", "link.conf"), "unused.conf")
+
+        self.assertEqual(self._count_runs_after(setup, action), 2)
+
+    def test_new_preferred_host_file_triggers(self):
+        def action(d):
+            with open(os.path.join(d, "machines", "h.json"), "w") as f:
+                f.write(f'{{"stateFile": "{d}/state/state.json"}}')
+
+        self.assertEqual(self._count_runs_after(lambda d: None, action), 2)
 
     def test_watched_set_follows_config_edits(self):
         with tempfile.TemporaryDirectory() as d:

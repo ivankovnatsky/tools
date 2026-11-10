@@ -201,6 +201,9 @@ def _load_host_config(
     host_file = None
     for suffix in SUPPORTED_SUFFIXES:
         candidate = os.path.join(machines_dir, hostname + suffix)
+        if loaded is not None:
+            # A higher-priority candidate appearing later changes which file loads.
+            loaded.append(os.path.abspath(candidate))
         if os.path.isfile(candidate):
             host_file = candidate
             break

@@ -45,6 +45,7 @@ from tools.user.launchd import has_work as launchd_has_work
 from tools.user.launchd import install_launchd, status_rows
 from tools.user.links import has_work as links_has_work
 from tools.user.links import install_links
+from tools.user.links import resolve as links_resolve
 from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
@@ -677,6 +678,11 @@ def _written_paths(config: dict) -> set[str]:
     return {state_file, os.path.realpath(mgmt_key_path(state_file))}
 
 
+# mgmt path keys besides `*File`; forgejo's workPath and forgejoBin are not sources.
+_MGMT_PATH_KEYS = {"configDir", "profileIdDir"}
+_MGMT_PATH_MAPS = {"baseUrlFiles", "varsFiles"}
+
+
 def _source_paths(config: dict, config_dir: str) -> list[str]:
     """Paths the sections read their sources from: files, sops files, local skills, mgmt files."""
     paths = files_source_paths(config.get("files"), config_dir)
@@ -692,18 +698,24 @@ def _source_paths(config: dict, config_dir: str) -> list[str]:
             if isinstance(src, dict) and src.get("path") is not None
         ]
 
-    def strings(value):
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, dict):
-            for v in value.values():
-                yield from strings(v)
-        elif isinstance(value, list):
-            for v in value:
-                yield from strings(v)
+    links_desired, _ = links_resolve(config.get("links") or [])
+    paths += links_desired.values()
 
-    # Every mgmt path goes through spec.path; other strings resolve to paths nothing reads.
-    for value in strings(config.get("mgmt")):
+    def mgmt_paths(value):
+        if isinstance(value, list):
+            for v in value:
+                yield from mgmt_paths(v)
+        if not isinstance(value, dict):
+            return
+        for key, v in value.items():
+            if isinstance(v, str) and (key.endswith("File") or key in _MGMT_PATH_KEYS):
+                yield v
+            elif key in _MGMT_PATH_MAPS and isinstance(v, dict):
+                yield from (p for p in v.values() if isinstance(p, str))
+            else:
+                yield from mgmt_paths(v)
+
+    for value in mgmt_paths(config.get("mgmt")):
         path = mgmt_spec.path({"p": value}, "p", "mgmt", config_dir)
         if path:
             paths.append(path)
@@ -744,7 +756,10 @@ def _watch_run(
         excluded.update(_written_paths(merged))
     config_dir = _resolve_config_dir(config_paths)
     if watched is not None:
-        watched.update(os.path.realpath(p) for p in sources + _source_paths(merged, config_dir))
+        for p in sources + _source_paths(merged, config_dir):
+            # snapshot() keys a symlink by its own name, so watch the link as well as its target.
+            watched.add(os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)))
+            watched.add(os.path.realpath(p))
     if approve:
         ok = _deploy(merged, config_dir, scope)
     else:
