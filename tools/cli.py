@@ -6,7 +6,7 @@ import time
 
 import click
 
-from tools import privilege
+from tools import privilege, selection
 from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
@@ -116,6 +116,46 @@ def _invoker() -> privilege.Invoker:
     return inv
 
 
+def _selection(scope, only) -> tuple[tuple[str, ...], selection.Only]:
+    """(sections to run, --only items); exits on a malformed or conflicting --only."""
+    try:
+        parsed = selection.parse(only)
+        return selection.combine(scope, parsed), parsed
+    except selection.SelectionError as exc:
+        log(str(exc), Color.RED)
+        sys.exit(1)
+
+
+def _read_state(config: dict, root: bool) -> dict:
+    """The state a run would act on, read without migrating anything."""
+    from tools.state import find_state_file
+
+    if root:
+        return migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
+    return migrate_state_schema(load_json(find_state_file(state_file)))
+
+
+def _check_only(config: dict, config_paths: list[str], only, root: bool = False) -> None:
+    """Exit before anything runs when --only can't: config errors in a narrowed section,
+    a name that matches nothing, or state whose other records can't be set aside."""
+    if not only:
+        return
+    config_dir = _resolve_config_dir(config_paths)
+    errors = selection.unmatched(only, config, config_dir)
+    if not errors:
+        errors = selection.state_errors(only, config, config_dir, _read_state(config, root))
+    for err in errors:
+        log(err, Color.RED)
+    if errors:
+        sys.exit(1)
+
+
+def _user_check(config_paths: list[str], only) -> int:
+    _check_only(_load_merged_config(config_paths), config_paths, only)
+    return 0
+
+
 USER_CHANGES = 3  # exit code of the user diff child: changes pending
 
 
@@ -124,22 +164,26 @@ def _system_scope(scope: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(s for s in (scope or privilege.ROOT_SECTIONS) if s in privilege.ROOT_SECTIONS)
 
 
-def _user_diff(config_paths: list[str], scope: tuple[str, ...]) -> int:
+def _user_diff(config_paths: list[str], scope: tuple[str, ...], only=None) -> int:
     """`tools diff` as the user: 0 when clean, USER_CHANGES when changes are pending."""
     merged = _load_merged_config(config_paths)
-    clean = show_diff(merged, _resolve_config_dir(config_paths), scope)
+    _check_only(merged, config_paths, only)
+    clean = show_diff(merged, _resolve_config_dir(config_paths), scope, only=only)
     return 0 if clean else USER_CHANGES
 
 
 def _user_deploy(
-    config_paths: list[str], scope: tuple[str, ...], update: bool, restarts_fd: int
+    config_paths: list[str], scope: tuple[str, ...], update: bool, restarts_fd: int, only=None
 ) -> int:
     """`tools deploy --approve` as the user; its process restarts go to restarts_fd as
     JSON for the root parent to run instead."""
     restarts: list = []
     try:
         merged = _load_merged_config(config_paths)
-        ok = _deploy(merged, _resolve_config_dir(config_paths), scope, update, restarts=restarts)
+        _check_only(merged, config_paths, only)
+        ok = _deploy(
+            merged, _resolve_config_dir(config_paths), scope, update, restarts=restarts, only=only
+        )
         return 0 if ok else 1
     finally:
         data = json.dumps(restarts).encode()
@@ -174,7 +218,7 @@ def _read_restarts(fd: int, out: list) -> None:
     out += restarts
 
 
-def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple) -> bool:
+def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple, only=None) -> bool:
     """Both diffs under sudo: system sections as root, the rest in a child dropped to the
     user. True when there are changes; exits when the user diff fails."""
     changes = False
@@ -182,9 +226,12 @@ def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple) ->
     if system:
         log("As root:", Color.BLUE)
         merged = _load_merged_config(config_paths)
-        changes = not show_diff(merged, _resolve_config_dir(config_paths), system, root=True)
+        _check_only(merged, config_paths, only, root=True)
+        changes = not show_diff(
+            merged, _resolve_config_dir(config_paths), system, root=True, only=only
+        )
     log(f"As {inv.login}:", Color.BLUE)
-    rc = privilege.run_as_user(inv, lambda: _user_diff(config_paths, scope))
+    rc = privilege.run_as_user(inv, lambda: _user_diff(config_paths, scope, only))
     if rc not in (0, USER_CHANGES):
         log(f"Diff as {inv.login} failed; nothing deployed", Color.RED)
         sys.exit(1)
@@ -192,19 +239,31 @@ def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple) ->
 
 
 def _sudo_deploy(
-    inv: privilege.Invoker, config_paths: list[str], scope: tuple, approve: bool, update: bool
+    inv: privilege.Invoker,
+    config_paths: list[str],
+    scope: tuple,
+    approve: bool,
+    update: bool,
+    only=None,
 ) -> None:
     """System sections as root, then every user section in a child dropped to the user.
     One prompt covers both; a failed system phase stops before the user phase. Process
     restarts from both phases run once, at the end."""
-    if not approve and _sudo_diff(inv, config_paths, scope):
+    if only:
+        # Both phases' --only checks before either runs anything.
+        _check_only(_load_merged_config(config_paths), config_paths, only, root=True)
+        if privilege.run_as_user(inv, lambda: _user_check(config_paths, only)) != 0:
+            log(f"--only check as {inv.login} failed; nothing deployed", Color.RED)
+            sys.exit(1)
+    if not approve and _sudo_diff(inv, config_paths, scope, only):
         _confirm()
     system = _system_scope(scope)
     restarts: list = []
     try:
         if system:
             merged = _load_merged_config(config_paths)
-            ok = _deploy(merged, _resolve_config_dir(config_paths), system, update, True, restarts)
+            config_dir = _resolve_config_dir(config_paths)
+            ok = _deploy(merged, config_dir, system, update, True, restarts, only)
             if not ok:
                 log(f"System sections failed; not running the rest as {inv.login}", Color.RED)
                 sys.exit(1)
@@ -213,7 +272,9 @@ def _sudo_deploy(
         reader = threading.Thread(target=_read_restarts, args=(r, child_restarts), daemon=True)
         reader.start()
         try:
-            rc = privilege.run_as_user(inv, lambda: _user_deploy(config_paths, scope, update, w))
+            rc = privilege.run_as_user(
+                inv, lambda: _user_deploy(config_paths, scope, update, w, only)
+            )
         finally:
             os.close(w)
             reader.join()
@@ -245,6 +306,7 @@ def _deploy(
     update: bool = False,
     root: bool = False,
     restarts: list | None = None,
+    only: selection.Only | None = None,
 ) -> bool:
     """Apply config to bring system to desired state. Returns True on success.
 
@@ -263,7 +325,7 @@ def _deploy(
     # Overlapping runs (watch, scheduled and manual deploys) would otherwise
     # each save their own copy and drop the other's records.
     with state_lock(state_file):
-        return _deploy_locked(config, config_dir, state_file, scope, update, root, restarts)
+        return _deploy_locked(config, config_dir, state_file, scope, update, root, restarts, only)
 
 
 def _deploy_locked(
@@ -274,6 +336,7 @@ def _deploy_locked(
     update: bool,
     root: bool,
     restarts: list | None = None,
+    only: selection.Only | None = None,
 ) -> bool:
     if not root:
         migrate_state_file(state_file)
@@ -283,27 +346,48 @@ def _deploy_locked(
 
     success = True
     paths = config.get("paths", {})
+    view = selection.view(only or {}, config, config_dir)
 
     # The reconcilers mutate `state` in memory as they install/remove; the
     # try/finally guarantees those mutations reach disk even when a later
     # section crashes. Without it, packages installed earlier in the same run
     # become permanently unowned.
     try:
-        persist = lambda: save_json(state_file, state)  # noqa: E731
-        if root:
-            success = _run_root_sections(config, config_dir, state, active, persist, restarts)
-        else:
-            success = _run_sections(
-                config,
-                config_dir,
-                state,
-                paths,
-                active,
-                persist,
-                state_file,
-                update,
-                restarts,
-            )
+        # Mid-run saves must carry the records set aside for --only too.
+        persist = lambda: save_json(state_file, view.merged(state) if view else state)  # noqa: E731
+        if view:
+            try:
+                view.hide(state)
+            except selection.SelectionError as exc:
+                log(str(exc), Color.RED)
+                return False
+        try:
+            if root:
+                success = _run_root_sections(
+                    view.config if view else config,
+                    config_dir,
+                    state,
+                    active,
+                    persist,
+                    restarts,
+                )
+            else:
+                success = _run_sections(
+                    view.config if view else config,
+                    config_dir,
+                    state,
+                    paths,
+                    active,
+                    persist,
+                    state_file,
+                    update,
+                    restarts,
+                    full_config=config,
+                    view=view,
+                )
+        finally:
+            if view:
+                view.restore(state)
     finally:
         save_json(state_file, state)
     return success
@@ -357,16 +441,26 @@ def _run_sections(
     state_file: str = "",
     update: bool = False,
     deferred: list | None = None,
+    full_config: dict | None = None,
+    view: selection.View | None = None,
 ) -> bool:
+    """With --only, ``config`` is the narrowed config and ``view`` holds the state records
+    set aside; ownership is still judged on ``full_config`` and the whole state."""
     success = True
+    full = full_config if full_config is not None else config
 
-    moves = secrets_flow.move_between_sections(
-        state,
-        files_entries=config.get("files"),
-        sops_raw=config.get("sops"),
-        templates_raw=config.get("templates"),
-        config_dir=config_dir,
-        fetch_raw=config.get("fetch"),
+    # Moves rewrite records of any section, so a narrowed run leaves them to a full one.
+    moves = (
+        []
+        if view
+        else secrets_flow.move_between_sections(
+            state,
+            files_entries=config.get("files"),
+            sops_raw=config.get("sops"),
+            templates_raw=config.get("templates"),
+            config_dir=config_dir,
+            fetch_raw=config.get("fetch"),
+        )
     )
     for move in moves:
         log(f"Moved: {move}", Color.GREEN)
@@ -375,16 +469,16 @@ def _run_sections(
 
     def registry():
         return secrets_flow.ownership_conflicts(
-            files_entries=config.get("files"),
-            sops_raw=config.get("sops"),
-            templates_raw=config.get("templates"),
-            links_raw=config.get("links"),
-            skills_raw=config.get("skills"),
-            state=state,
+            files_entries=full.get("files"),
+            sops_raw=full.get("sops"),
+            templates_raw=full.get("templates"),
+            links_raw=full.get("links"),
+            skills_raw=full.get("skills"),
+            state=view.merged(state) if view else state,
             config_dir=config_dir,
-            git_repos_raw=config.get("gitRepos"),
-            env_raw=config.get("env"),
-            fetch_raw=config.get("fetch"),
+            git_repos_raw=full.get("gitRepos"),
+            env_raw=full.get("env"),
+            fetch_raw=full.get("fetch"),
         )
 
     # Before anything installs: uv/npm/... must see the session env (e.g.
@@ -578,6 +672,12 @@ def main(verbose):
 @click.option(
     "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
 )
+@click.option(
+    "--only",
+    multiple=True,
+    metavar="SECTION:NAME",
+    help=f"Run only this item of a section (repeatable; {', '.join(selection.SUPPORTED)}).",
+)
 @click.option("--approve", is_flag=True, help="Skip confirmation prompt.")
 @click.option(
     "--update",
@@ -588,37 +688,40 @@ def main(verbose):
         "and run files onUpdate hooks."
     ),
 )
-def deploy(config, scope, approve, update):
+def deploy(config, scope, only, approve, update):
     """Apply config to bring system to desired state.
 
     Under `sudo`, system work (system files, launchd daemons, system defaults) runs as
     root first, then everything else as the invoking user.
     """
     inv = _invoker()
+    scope, only = _selection(scope, only)
     config_paths = list(config)
     if inv.root:
-        _sudo_deploy(inv, config_paths, tuple(scope), approve, update)
+        _sudo_deploy(inv, config_paths, scope, approve, update, only)
         return
     merged = _load_merged_config(config_paths)
+    _check_only(merged, config_paths, only)
     config_dir = _resolve_config_dir(config_paths)
 
-    if not approve and not show_diff(merged, config_dir, scope):
+    if not approve and not show_diff(merged, config_dir, scope, only=only):
         _confirm()
 
     # Deploy runs even when the preview was clean: --update upgrades and
     # state housekeeping have no diff line of their own.
-    if not _deploy(merged, config_dir, scope, update):
+    if not _deploy(merged, config_dir, scope, update, only=only):
         sys.exit(1)
 
 
 @main.command(hidden=True)
 @click.option("--config", multiple=True, default=["."])
 @click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
+@click.option("--only", multiple=True)
 @click.option("--approve", is_flag=True)
 @click.option("--update", is_flag=True)
-def apply(config, scope, approve, update):
+def apply(config, scope, only, approve, update):
     """Alias for deploy."""
-    deploy.callback(config, scope, approve, update)
+    deploy.callback(config, scope, only, approve, update)
 
 
 @main.command()
@@ -626,26 +729,35 @@ def apply(config, scope, approve, update):
 @click.option(
     "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Diff only these sections."
 )
-def diff(config, scope):
+@click.option(
+    "--only",
+    multiple=True,
+    metavar="SECTION:NAME",
+    help=f"Run only this item of a section (repeatable; {', '.join(selection.SUPPORTED)}).",
+)
+def diff(config, scope, only):
     """Show what would change (dry-run)."""
     inv = _invoker()
+    scope, only = _selection(scope, only)
     config_paths = list(config)
     if inv.root:
-        if _sudo_diff(inv, config_paths, tuple(scope)):
+        if _sudo_diff(inv, config_paths, scope, only):
             sys.exit(1)
         return
     merged = _load_merged_config(config_paths)
+    _check_only(merged, config_paths, only)
     config_dir = _resolve_config_dir(config_paths)
-    if not show_diff(merged, config_dir, scope):
+    if not show_diff(merged, config_dir, scope, only=only):
         sys.exit(1)
 
 
 @main.command(hidden=True)
 @click.option("--config", multiple=True, default=["."])
 @click.option("--scope", multiple=True, type=click.Choice(ALL_SECTIONS))
-def plan(config, scope):
+@click.option("--only", multiple=True)
+def plan(config, scope, only):
     """Alias for diff."""
-    diff.callback(config, scope)
+    diff.callback(config, scope, only)
 
 
 @main.command()
@@ -744,6 +856,7 @@ def _watch_run(
     files,
     excluded: set | None = None,
     watched: set | None = None,
+    only: selection.Only | None = None,
 ) -> None:
     action = "deploy" if approve else "diff"
     wlog("=" * 60)
@@ -760,6 +873,7 @@ def _watch_run(
         watched.clear()
     try:
         merged = _load_merged_config(config_paths, sources)
+        _check_only(merged, config_paths, only)
     except SystemExit:
         wlog("Config failed to load; still watching", Color.RED)
         return
@@ -775,10 +889,11 @@ def _watch_run(
             # snapshot() keys a symlink by its own name, so watch the link as well as its target.
             watched.add(os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)))
             watched.add(os.path.realpath(p))
+    narrowed = {"only": only} if only else {}
     if approve:
-        ok = _deploy(merged, config_dir, scope)
+        ok = _deploy(merged, config_dir, scope, **narrowed)
     else:
-        ok = show_diff(merged, config_dir, scope)
+        ok = show_diff(merged, config_dir, scope, **narrowed)
     elapsed = f"{time.monotonic() - started:.1f}s"
     if approve and ok:
         wlog(f"Deploy successful ({elapsed})", Color.GREEN)
@@ -796,6 +911,12 @@ def _watch_run(
 )
 @click.option(
     "--scope", multiple=True, type=click.Choice(ALL_SECTIONS), help="Run only these sections."
+)
+@click.option(
+    "--only",
+    multiple=True,
+    metavar="SECTION:NAME",
+    help=f"Run only this item of a section (repeatable; {', '.join(selection.SUPPORTED)}).",
 )
 @click.option(
     "--approve",
@@ -817,9 +938,10 @@ def _watch_run(
     help="Seconds between scans of the config paths.",
 )
 @click.option("--tmux", is_flag=True, help="Run in tmux: session <hostname>, window tools-watch.")
-def watch(config, scope, approve, debounce, poll, tmux):
+def watch(config, scope, only, approve, debounce, poll, tmux):
     """Watch the config paths and redeploy when they change."""
     _refuse_root("watch")
+    scope, only = _selection(scope, only)
     config_paths = list(config)
     missing = [p for p in config_paths if not os.path.exists(p)]
     if missing:
@@ -837,7 +959,7 @@ def watch(config, scope, approve, debounce, poll, tmux):
     watched: set = set()
 
     def run(files):
-        _watch_run(config_paths, scope, approve, files, excluded, watched)
+        _watch_run(config_paths, scope, approve, files, excluded, watched, only)
 
     try:
         watch_loop(

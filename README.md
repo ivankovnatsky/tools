@@ -8,9 +8,9 @@ reconciled from a YAML/JSON/TOML config against a local state file.
 ## Usage
 
 ```console
-tools diff   [--config PATH]... [--scope SECTION]...   # dry-run preview
-tools deploy [--config PATH]... [--scope SECTION]... [--approve] [--update]
-tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
+tools diff   [--config PATH]... [--scope SECTION]... [--only SECTION:NAME]...   # dry-run preview
+tools deploy [--config PATH]... [--scope SECTION]... [--only SECTION:NAME]... [--approve] [--update]
+tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--approve]   # see Watch
 ```
 
 - `tools diff` shows what deploy would change and **exits 1 when changes are
@@ -42,11 +42,46 @@ tools watch  --config PATH... [--scope SECTION]... [--approve]     # see Watch
   **Relative `files:` sources always resolve against the first `--config` path's
   directory**, so keep file-carrying sections there.
 - `--scope` limits the run to named sections (repeatable).
+- `--only SECTION:NAME` limits a section to single items (repeatable; see
+  below).
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
 Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 `sops`, `templates`, `files`, `fetch`, `env`, `skills`, `links`, `brew`,
 `ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `mgmt`.
+
+### Single items (`--only`)
+
+`--only SECTION:NAME` runs one item of a section instead of all of it, e.g.
+`tools deploy --only brew:jq --only launchd:caddy`. It works with `diff`,
+`deploy` (with `--update` too, under `sudo` in both phases) and `watch`.
+
+| Section | NAME |
+| --- | --- |
+| `brew` | a formula, cask, tap or `masApps` name |
+| `uv`, `npm` | a package name |
+| `files` | a target path (`~` allowed), or the `dir:` of a tree entry for the whole tree |
+| `templates` | a template name |
+| `launchd` | an agent or daemon name, or its label |
+| `defaults` | a domain, in every scope that declares it |
+
+- Only the selected items run; with `--only` alone the run covers just the
+  named sections. `--scope X` and `--only X:...` for the same section is an
+  error, as is an unknown section, a section not listed above, or a name that
+  matches nothing in config.
+- A narrowed run never removes anything. Every other item of the section is
+  left alone: not removed, restored, moved aside, restarted or forgotten, and
+  its state record is kept as it is. `brew` `onActivation.cleanup`,
+  moves between `files`/`sops`/`templates`/`fetch`, a `defaults` key dropped
+  from a selected domain, and pending `onChange` hooks of other entries wait
+  for a full run. `npm` `configFile` is not written.
+- `tools diff` with the same `--only` shows exactly what deploy would do.
+- A `uv` tool dir or `npm` prefix that changed since the last deploy is an
+  error: run that section whole first.
+- Any config error in a narrowed section refuses the run, even in an entry
+  that is not selected.
+- A selected `masApps` app whose App Store id changed is an error: run `brew`
+  whole.
 
 `tools status [--config PATH]...` prints the live state of managed launchd jobs
 (loaded, pid, last exit code). It is read-only.

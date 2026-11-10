@@ -432,7 +432,7 @@ class WatchCommandTest(unittest.TestCase):
 
         with (
             mock.patch.object(cli, "watch_loop", side_effect=loop),
-            mock.patch.object(cli, "_deploy", side_effect=deploy or (lambda *a: True)) as dep,
+            mock.patch.object(cli, "_deploy", side_effect=deploy or (lambda *a, **k: True)) as dep,
             mock.patch("tools.config._get_hostname", return_value="h"),
         ):
             result = CliRunner().invoke(
@@ -453,7 +453,7 @@ class WatchCommandTest(unittest.TestCase):
             d = os.path.realpath(d)
             state = self._state_config(d)
 
-            def deploy(*_):
+            def deploy(*_, **__):
                 for path in (state, state + ".tmp", os.path.join(d, "state", "mgmt.key")):
                     with open(path, "a") as f:
                         f.write("x")
@@ -469,7 +469,7 @@ class WatchCommandTest(unittest.TestCase):
             state = self._state_config(d)
             edits = []
 
-            def deploy(*_):
+            def deploy(*_, **__):
                 with open(state, "a") as f:
                     f.write("x")
                 if not edits:
@@ -522,7 +522,7 @@ class WatchCommandTest(unittest.TestCase):
             self._host_config(d)
             edits = []
 
-            def deploy(*_):
+            def deploy(*_, **__):
                 if not edits:
                     edits.append(1)
                     with open(os.path.join(d, rel), "w" if create else "a") as f:
@@ -613,7 +613,7 @@ class WatchCommandTest(unittest.TestCase):
             self._host_config(d)
             step = []
 
-            def deploy(*_):
+            def deploy(*_, **__):
                 step.append(1)
                 if len(step) == 1:
                     with open(os.path.join(d, "machines", "h.yaml"), "a") as f:

@@ -4,7 +4,7 @@ import os
 import stat
 from typing import Dict, List
 
-from tools import privilege
+from tools import privilege, selection
 from tools.config import SECTIONS
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
@@ -393,17 +393,26 @@ def _empty_after(directory: str, removed) -> bool:
 
 
 def show_diff(
-    config: dict, config_dir: str, scope: tuple[str, ...] = (), root: bool = False
+    config: dict,
+    config_dir: str,
+    scope: tuple[str, ...] = (),
+    root: bool = False,
+    only: "selection.Only | None" = None,
 ) -> bool:
     """Show what deploy would change. Returns True if no changes needed.
 
     As root (``root``) only system sections are diffed, against the root-owned state file.
+    With ``only``, narrowed sections are diffed exactly as deploy narrows them.
     """
     from tools.state import find_state_file, load_json, migrate_state_schema
 
+    view = selection.view(only or {}, config, config_dir)
     if root:
+        state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+        if view and not _hide(view, state):
+            return False
         return _print_sections(
-            _root_sections(config, config_dir, scope, load_json, migrate_state_schema)
+            _root_sections(view.config if view else config, config_dir, scope, state)
         )
 
     state = {}
@@ -416,6 +425,11 @@ def show_diff(
     state_file = find_state_file(state_file)
     if os.path.exists(state_file):
         state = migrate_state_schema(load_json(state_file))
+    full, full_state = config, state
+    if view:
+        if not _hide(view, state):
+            return False
+        config, full_state = view.config, view.merged(state)
 
     active = set(scope) if scope else set(ALL_SECTIONS)
     paths = config.get("paths", {})
@@ -484,29 +498,33 @@ def show_diff(
     )
     if run_sops or run_templates:
         decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
-    # In memory only: diff never saves state.
-    moves = secrets_flow.move_between_sections(
-        state,
-        files_entries=config.get("files"),
-        sops_raw=config.get("sops"),
-        templates_raw=config.get("templates"),
-        config_dir=config_dir,
-        fetch_raw=config.get("fetch"),
+    # In memory only: diff never saves state. A narrowed deploy makes no moves.
+    moves = (
+        []
+        if view
+        else secrets_flow.move_between_sections(
+            state,
+            files_entries=config.get("files"),
+            sops_raw=config.get("sops"),
+            templates_raw=config.get("templates"),
+            config_dir=config_dir,
+            fetch_raw=config.get("fetch"),
+        )
     )
     if moves:
         sections.append(("move", [f"~ move {m}" for m in moves]))
     conflicts = secrets_flow.ownership_conflicts(
-        files_entries=config.get("files"),
-        sops_raw=config.get("sops"),
-        templates_raw=config.get("templates"),
-        links_raw=config.get("links"),
-        skills_raw=config.get("skills"),
-        state=state,
+        files_entries=full.get("files"),
+        sops_raw=full.get("sops"),
+        templates_raw=full.get("templates"),
+        links_raw=full.get("links"),
+        skills_raw=full.get("skills"),
+        state=full_state,
         config_dir=config_dir,
-        git_repos_raw=config.get("gitRepos"),
+        git_repos_raw=full.get("gitRepos"),
         clone_pending="gitRepos" in active,
-        env_raw=config.get("env"),
-        fetch_raw=config.get("fetch"),
+        env_raw=full.get("env"),
+        fetch_raw=full.get("fetch"),
     )
     # Same order as deploy: paths inside a gitRepos destination after the clone.
     inside = secrets_flow.paths_in_repos(
@@ -638,10 +656,19 @@ def show_diff(
     return _print_sections(sections)
 
 
-def _root_sections(config: dict, config_dir: str, scope, load_json, migrate_state_schema) -> list:
+def _hide(view, state: dict) -> bool:
+    """Set aside unselected records; a failure aborts, never reads as pending changes."""
+    try:
+        view.hide(state)
+    except selection.SelectionError as exc:
+        log(str(exc), Color.RED)
+        raise SystemExit(1) from exc
+    return True
+
+
+def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
     """Under sudo: system files, launchd daemons and system-scope defaults; nothing in
     user space."""
-    state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
     if "files" in active and files_has_system_work(config.get("files"), state):

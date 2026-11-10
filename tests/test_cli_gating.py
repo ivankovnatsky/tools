@@ -7,6 +7,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 from tools import cli, privilege
+from tools.state import save_json
 
 
 class DeployGatingTest(unittest.TestCase):
@@ -618,7 +619,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def test_one_prompt_covers_both_diffs(self):
         seen = []
 
-        def show_diff(_cfg, _dir, scope, root=False):
+        def show_diff(_cfg, _dir, scope, root=False, only=None):
             seen.append((root, os.geteuid(), tuple(scope)))
             return False
 
@@ -630,7 +631,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
 
     def test_only_user_changes_still_prompt_and_no_means_nothing_runs(self):
         result = self.run_cli(
-            ["deploy"], prompt="no", show_diff=lambda _c, _d, _s, root=False: root
+            ["deploy"], prompt="no", show_diff=lambda _c, _d, _s, root=False, only=None: root
         )
         self.assertEqual(result.exit_code, 1, result.output)
         self.prompted.assert_called_once()
@@ -653,6 +654,53 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(
             self.steps(), [("install_launchd", 0), ("drop", 501), ("install_launchd", 501)]
         )
+
+    def test_only_narrows_both_phases(self):
+        self.config["launchd"]["labelPrefix"] = "org.x"
+        self.config["launchd"]["daemons"]["other"] = {"command": "z"}
+        seen = []
+        step = self.step
+
+        def recording(name):
+            run = step(name)
+
+            def wrapped(raw, *a, **k):
+                seen.append((name, os.geteuid(), raw))
+                return run(raw, *a, **k)
+
+            return wrapped
+
+        with mock.patch.object(self, "step", side_effect=recording):
+            result = self.run_cli(
+                ["deploy", "--approve", "--only", "launchd:d", "--only", "brew:a"]
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            [(n, uid) for n, uid, _raw in seen],
+            [("install_launchd", 0), ("install_brew_packages", 501), ("install_launchd", 501)],
+        )
+        for name, _uid, raw in seen:
+            if name == "install_launchd":
+                self.assertEqual(raw["daemons"], {"d": {"command": "x"}})
+                self.assertEqual(raw["agents"], {})
+
+        self.events.clear()
+        result = self.run_cli(["deploy", "--approve", "--only", "launchd:nope"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("launchd:nope: no such item", result.output)
+        self.assertEqual(self.steps(), [])
+
+    def test_only_user_state_failure_stops_before_the_root_phase(self):
+        self.config["launchd"]["labelPrefix"] = "org.x"
+        save_json(self.user_state, {"version": 2, "launchd": {"services": ["broken"]}})
+        for args in (["deploy", "--approve"], ["deploy"]):
+            with self.subTest(args=args):
+                self.events.clear()
+                result = self.run_cli([*args, "--only", "launchd:d"])
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertIn("state for launchd is malformed", result.output)
+                self.assertEqual(self.steps(), [("drop", 501)])
+                self.prompted.assert_not_called()
 
     def test_failed_system_phase_stops_before_the_user_phase(self):
         self.results[("install_launchd", 0)] = False
@@ -734,7 +782,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(self.events[-1], ("restart", ["Dock"]))
 
     def test_failed_user_diff_deploys_nothing(self):
-        def show_diff(_c, _d, _s, root=False):
+        def show_diff(_c, _d, _s, root=False, only=None):
             if not root:
                 raise SystemExit(1)
             return False
@@ -748,7 +796,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def test_diff_runs_both_phases(self):
         seen = []
 
-        def show_diff(_cfg, _dir, scope, root=False):
+        def show_diff(_cfg, _dir, scope, root=False, only=None):
             seen.append((root, os.geteuid()))
             return not root
 

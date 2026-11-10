@@ -148,7 +148,7 @@ class StateLockTest(unittest.TestCase):
             save_json(state_file, {"version": STATE_VERSION})
             first_inside = threading.Event()
 
-            def section(config, _dir, state, _paths, _active, persist, *_a):
+            def section(config, _dir, state, _paths, _active, persist, *_a, **_k):
                 state.setdefault("records", []).append(config["name"])
                 if config["name"] == "a":
                     first_inside.set()
