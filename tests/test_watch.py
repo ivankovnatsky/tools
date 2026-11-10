@@ -382,6 +382,10 @@ class SourcePathsTest(unittest.TestCase):
             ["/c/h", "/c/ids", "/c/st", "/c/tpl/p.json", "/c/v/c", "/s/key"],
         )
 
+    def test_mgmt_skips_non_string_keys(self):
+        config = {"mgmt": {"nextdns": {"profiles": {"p": {"vars": {1: "x"}}}}}}
+        self.assertEqual(cli._source_paths(config, "/c"), [])
+
     def test_links_sources(self):
         config = {"links": [{"source": "/c/l/src", "target": "~/l"}, {"bad": 1}]}
         self.assertIn("/c/l/src", cli._source_paths(config, "/c"))

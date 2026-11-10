@@ -835,6 +835,8 @@ def _source_paths(config: dict, config_dir: str) -> list[str]:
         if not isinstance(value, dict):
             return
         for key, v in value.items():
+            if not isinstance(key, str):
+                continue
             if isinstance(v, str) and (key.endswith("File") or key in _MGMT_PATH_KEYS):
                 yield v
             elif key in _MGMT_PATH_MAPS and isinstance(v, dict):
