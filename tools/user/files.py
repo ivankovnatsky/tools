@@ -343,6 +343,22 @@ def _removal_order(targets, records: Dict) -> List[str]:
     return sorted(targets, key=lambda t: (is_dir(t), -t.count(os.sep) if is_dir(t) else 0))
 
 
+def _entry_source(entry: Dict[str, object], config_dir: str) -> str:
+    """The config-dir path a `dir` or `source` entry reads."""
+    return os.path.join(config_dir, str(entry["dir"] if "dir" in entry else entry["source"]))
+
+
+def source_paths(entries, config_dir: str) -> List[str]:
+    """Every `dir` tree and `source` file the `files:` entries read, existing or not."""
+    if not isinstance(entries, list):
+        return []
+    return [
+        _entry_source(e, config_dir)
+        for e in entries
+        if isinstance(e, dict) and not e.get("directory") and ("dir" in e or "source" in e)
+    ]
+
+
 def _resolve_entries(
     entries: List[Dict[str, object]], config_dir: str
 ) -> Tuple[List[Entry], List[str]]:
@@ -411,7 +427,7 @@ def _resolve_entries(
             continue
 
         if "dir" in entry:
-            source_dir = os.path.join(config_dir, str(entry["dir"]))
+            source_dir = _entry_source(entry, config_dir)
             if not os.path.isdir(source_dir):
                 errors.append(f"source directory not found: {entry['dir']}")
                 continue
@@ -437,7 +453,7 @@ def _resolve_entries(
             continue
 
         if "source" in entry and "target" in entry:
-            source = os.path.join(config_dir, str(entry["source"]))
+            source = _entry_source(entry, config_dir)
             target = os.path.normpath(os.path.expanduser(str(entry["target"])))
             if not os.path.isfile(source):
                 errors.append(f"source not found: {entry['source']}")

@@ -12,6 +12,7 @@ from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
 from tools.mgmt import has_work as mgmt_has_work
 from tools.mgmt import install_mgmt, release_mgmt
+from tools.mgmt import spec as mgmt_spec
 from tools.mgmt.keys import key_path as mgmt_key_path
 from tools.state import (
     load_json,
@@ -36,6 +37,7 @@ from tools.user.env import install_env
 from tools.user.fetch import has_work as fetch_has_work
 from tools.user.fetch import install_fetch
 from tools.user.files import install_files
+from tools.user.files import source_paths as files_source_paths
 from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
 from tools.user.go import install_go_packages
@@ -49,8 +51,9 @@ from tools.user.ollama_models import install_ollama_models
 from tools.user.pi import install_pi_packages
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
+from tools.user.skills import source_root as skills_source_root
 from tools.user.uv import install_uv_packages
-from tools.watch import is_excluded, log_files, run_in_tmux, snapshot, watch_loop, wlog
+from tools.watch import is_excluded, is_watched, log_files, run_in_tmux, snapshot, watch_loop, wlog
 
 
 def _resolve_config_dir(config_paths: list[str]) -> str:
@@ -66,15 +69,18 @@ def _resolve_config_dir(config_paths: list[str]) -> str:
     return os.path.abspath(os.path.dirname(first))
 
 
-def _load_merged_config(config_paths: list[str]) -> dict:
-    """Load and merge config from one or more paths."""
+def _load_merged_config(config_paths: list[str], sources: list | None = None) -> dict:
+    """Load and merge config from one or more paths.
+
+    Every config file and template file read is appended to `sources`.
+    """
     config: dict = {}
     for config_path in config_paths:
         try:
             if os.path.isdir(config_path):
-                loaded = load_config_dir(config_path)
+                loaded = load_config_dir(config_path, sources)
             else:
-                loaded = load_config(config_path)
+                loaded = load_config(config_path, loaded=sources)
         except (
             ConfigError,
             FileNotFoundError,
@@ -90,7 +96,7 @@ def _load_merged_config(config_paths: list[str]) -> dict:
             sys.exit(1)
         config = deep_merge(config, loaded)
     try:
-        return resolve_config(config, _resolve_config_dir(config_paths))
+        return resolve_config(config, _resolve_config_dir(config_paths), sources=sources)
     except ConfigError as exc:
         log(f"Config error: {exc}", Color.RED)
         sys.exit(1)
@@ -671,12 +677,46 @@ def _written_paths(config: dict) -> set[str]:
     return {state_file, os.path.realpath(mgmt_key_path(state_file))}
 
 
+def _source_paths(config: dict, config_dir: str) -> list[str]:
+    """Paths the sections read their sources from: files, sops files, local skills, mgmt files."""
+    paths = files_source_paths(config.get("files"), config_dir)
+    paths += [
+        s.sops_file for s in sops_section.parse_sops(config.get("sops")).secrets if s.sops_file
+    ]
+    skills = config.get("skills")
+    skill_sources = skills.get("sources") if isinstance(skills, dict) else None
+    if isinstance(skill_sources, dict):
+        paths += [
+            skills_source_root(name, src, "", config_dir)
+            for name, src in skill_sources.items()
+            if isinstance(src, dict) and src.get("path") is not None
+        ]
+
+    def strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for v in value.values():
+                yield from strings(v)
+        elif isinstance(value, list):
+            for v in value:
+                yield from strings(v)
+
+    # Every mgmt path goes through spec.path; other strings resolve to paths nothing reads.
+    for value in strings(config.get("mgmt")):
+        path = mgmt_spec.path({"p": value}, "p", "mgmt", config_dir)
+        if path:
+            paths.append(path)
+    return paths
+
+
 def _watch_run(
     config_paths: list[str],
     scope: tuple[str, ...],
     approve: bool,
     files,
     excluded: set | None = None,
+    watched: set | None = None,
 ) -> None:
     action = "deploy" if approve else "diff"
     wlog("=" * 60)
@@ -687,8 +727,12 @@ def _watch_run(
         wlog(f"Running initial {action} on startup")
     wlog("=" * 60)
     started = time.monotonic()
+    sources: list = []
+    if watched is not None:
+        # Until a config loads, every change under the config paths counts.
+        watched.clear()
     try:
-        merged = _load_merged_config(config_paths)
+        merged = _load_merged_config(config_paths, sources)
     except SystemExit:
         wlog("Config failed to load; still watching", Color.RED)
         return
@@ -699,6 +743,8 @@ def _watch_run(
         excluded.clear()
         excluded.update(_written_paths(merged))
     config_dir = _resolve_config_dir(config_paths)
+    if watched is not None:
+        watched.update(os.path.realpath(p) for p in sources + _source_paths(merged, config_dir))
     if approve:
         ok = _deploy(merged, config_dir, scope)
     else:
@@ -758,9 +804,10 @@ def watch(config, scope, approve, debounce, poll, tmux):
     wlog(f"Mode: {mode}; debounce {debounce:g}s, poll {poll:g}s")
 
     excluded = _written_paths({})
+    watched: set = set()
 
     def run(files):
-        _watch_run(config_paths, scope, approve, files, excluded)
+        _watch_run(config_paths, scope, approve, files, excluded, watched)
 
     try:
         watch_loop(
@@ -768,7 +815,11 @@ def watch(config, scope, approve, debounce, poll, tmux):
             run,
             poll=poll,
             debounce=debounce,
-            ignore=lambda path: is_excluded(os.path.realpath(path), excluded),
+            ignore=lambda path: (
+                is_excluded(os.path.realpath(path), excluded)
+                or bool(watched)
+                and not is_watched(path, watched)
+            ),
         )
     except KeyboardInterrupt:
         wlog("Received interrupt, stopping...")

@@ -141,6 +141,14 @@ def is_excluded(path: str, exclude) -> bool:
     return any(path == e or path.startswith(e + ".") for e in exclude)
 
 
+def is_watched(path: str, watched) -> bool:
+    """True for a path, or its real path, that is in `watched` or inside one of its directories."""
+    for p in {path, os.path.realpath(path)}:
+        if any(p == w or p.startswith(w.rstrip(os.sep) + os.sep) for w in watched):
+            return True
+    return False
+
+
 def changed_paths(old: dict, new: dict) -> list[str]:
     return sorted(p for p in old.keys() | new.keys() if old.get(p) != new.get(p))
 

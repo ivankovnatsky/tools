@@ -335,6 +335,35 @@ class WatchRunTest(unittest.TestCase):
         self.assertIn("Config failed to load", out)
 
 
+class SourcePathsTest(unittest.TestCase):
+    def test_sections_sources(self):
+        config = {
+            "files": [
+                {"dir": "dot"},
+                {"source": "s/a", "target": "~/a"},
+                {"target": "~/d", "directory": True},
+            ],
+            "sops": {"secrets": {"k": {"sopsFile": "/c/secrets/k.yaml", "key": "a", "path": "/x"}}},
+            "skills": {
+                "sources": {"local": {"path": "skills", "subdir": "sub"}, "r": {"url": "u"}}
+            },
+            "mgmt": {"nextdns": {"profiles": {"p": {"profileFile": "tpl/p.json"}}}},
+        }
+        paths = cli._source_paths(config, "/c")
+        for expected in ("/c/dot", "/c/s/a", "/c/secrets/k.yaml", "/c/skills/sub", "/c/tpl/p.json"):
+            self.assertIn(expected, paths)
+        self.assertNotIn("/c/~/d", paths)
+
+
+class IsWatchedTest(unittest.TestCase):
+    def test_file_and_dir_entries(self):
+        watched = {"/c/machines/h.yaml", "/c/dot"}
+        self.assertTrue(watch.is_watched("/c/machines/h.yaml", watched))
+        self.assertTrue(watch.is_watched("/c/dot/a/b", watched))
+        self.assertFalse(watch.is_watched("/c/dotfiles/a", watched))
+        self.assertFalse(watch.is_watched("/c/machines/other.yaml", watched))
+
+
 class TmuxTargetTest(unittest.TestCase):
     def test_window_is_matched_exactly(self):
         self.assertEqual(watch.tmux_target("mini"), "=mini:=tools-watch")
@@ -413,7 +442,7 @@ class WatchCommandTest(unittest.TestCase):
                     f.write("x")
                 if not edits:
                     edits.append(1)
-                    with open(os.path.join(d, "extra.yaml"), "w") as f:
+                    with open(os.path.join(d, "machines", "h.yaml"), "a") as f:
                         f.write("vars: {a: 1}\n")
                 return True
 
@@ -432,6 +461,95 @@ class WatchCommandTest(unittest.TestCase):
         self.assertIsNone(result.exception)
         self.assertIn("Config failed to load", result.output)
         dep.assert_not_called()
+
+    def _host_config(self, d):
+        """Host h with an include, a template, a `dir:` source and a file source."""
+        for sub in ("machines/h", "machines/other", "dot/sub", "tpl", "src", "state"):
+            os.makedirs(os.path.join(d, sub))
+        files = {
+            "machines/h.yaml": (
+                f"include: [h/extra.yaml]\nstateFile: {d}/state/state.json\n"
+                "files:\n  - dir: dot\n  - source: src/a.conf\n    target: ~/a.conf\n"
+            ),
+            "machines/h/extra.yaml": (
+                "templates:\n  t:\n    path: /tmp/tools-watch-test-t\n    file: tpl/t.json\n"
+            ),
+            "machines/other.yaml": "vars: {a: 1}\n",
+            "dot/sub/x": "x",
+            "tpl/t.json": "{}",
+            "src/a.conf": "a",
+            "src/unused.conf": "u",
+        }
+        for rel, text in files.items():
+            with open(os.path.join(d, rel), "w") as f:
+                f.write(text)
+
+    def _count_runs_after_edit(self, rel, *, create=False):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            self._host_config(d)
+            edits = []
+
+            def deploy(*_):
+                if not edits:
+                    edits.append(1)
+                    with open(os.path.join(d, rel), "w" if create else "a") as f:
+                        f.write("\n")
+                return True
+
+            result, dep = self._watch(d, deploy)
+        self.assertEqual(result.exit_code, 0, result.output)
+        return dep.call_count
+
+    def test_host_file_include_and_sources_trigger(self):
+        for rel, create in (
+            ("machines/h.yaml", False),
+            ("machines/h/extra.yaml", False),
+            ("tpl/t.json", False),
+            ("src/a.conf", False),
+            ("dot/sub/x", False),
+            ("dot/sub/new", True),
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(self._count_runs_after_edit(rel, create=create), 2)
+
+    def test_other_files_do_not_trigger(self):
+        for rel, create in (
+            ("machines/other.yaml", False),
+            ("src/unused.conf", False),
+            ("new.yaml", True),
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(self._count_runs_after_edit(rel, create=create), 1)
+
+    def test_watched_set_follows_config_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            self._host_config(d)
+            step = []
+
+            def deploy(*_):
+                step.append(1)
+                if len(step) == 1:
+                    with open(os.path.join(d, "machines", "h.yaml"), "a") as f:
+                        f.write("  - source: src/unused.conf\n    target: ~/u.conf\n")
+                elif len(step) == 2:
+                    with open(os.path.join(d, "src", "unused.conf"), "a") as f:
+                        f.write("x")
+                return True
+
+            result, dep = self._watch(d, deploy, polls=12)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(dep.call_count, 3, result.output)
+
+    def test_failed_load_watches_everything(self):
+        watched = {"/old"}
+        with (
+            mock.patch.object(cli, "_load_merged_config", side_effect=SystemExit(1)),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli._watch_run(["/cfg"], (), False, [], None, watched)
+        self.assertEqual(watched, set())
 
     def test_watch_run_refreshes_exclusions(self):
         excluded = {"/old"}

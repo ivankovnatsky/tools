@@ -1,7 +1,7 @@
 import json
 import os
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 SUPPORTED_SUFFIXES = (".json", ".yaml", ".yml", ".toml")
 
@@ -103,7 +103,9 @@ def _load_raw(path: str) -> Dict[str, Any]:
     raise ValueError(f"Unsupported config file suffix {suffix!r}: {path}")
 
 
-def load_config(path: str, _seen: Optional[Dict[str, None]] = None) -> Dict[str, Any]:
+def load_config(
+    path: str, _seen: Optional[Dict[str, None]] = None, loaded: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """Load a config file and resolve include directives.
 
     If the file contains an ``include:`` key with a list of relative
@@ -112,9 +114,12 @@ def load_config(path: str, _seen: Optional[Dict[str, None]] = None) -> Dict[str,
     so local values override included ones.
 
     Paths in ``include:`` are resolved relative to the directory
-    containing the file that declares them.
+    containing the file that declares them. Every file read is appended to
+    ``loaded``.
     """
     abs_path = os.path.abspath(path)
+    if loaded is not None:
+        loaded.append(abs_path)
 
     # Insertion-ordered dict-as-set: the error message renders the actual
     # include chain, not an arbitrary set ordering.
@@ -150,7 +155,7 @@ def load_config(path: str, _seen: Optional[Dict[str, None]] = None) -> Dict[str,
                 f"include: {inc_path!r} resolved to {resolved} but file does not exist "
                 f"(included from {path})"
             )
-        included = load_config(resolved, _seen)
+        included = load_config(resolved, _seen, loaded)
         merged = deep_merge(merged, included)
 
     return deep_merge(merged, data)
@@ -165,7 +170,7 @@ def _get_hostname() -> str:
     return hostname
 
 
-def load_config_dir(path: str) -> Dict[str, Any]:
+def load_config_dir(path: str, loaded: Optional[List[str]] = None) -> Dict[str, Any]:
     """Load config for the current host from a tools-config directory.
 
     The directory must contain ``machines/``. The loader detects the
@@ -183,10 +188,12 @@ def load_config_dir(path: str) -> Dict[str, Any]:
             "directory with machines/<hostname>.yaml"
         )
 
-    return _load_host_config(path, machines_dir)
+    return _load_host_config(path, machines_dir, loaded)
 
 
-def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
+def _load_host_config(
+    config_dir: str, machines_dir: str, loaded: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """Load config for the current host from machines/<hostname>.*."""
     hostname = _get_hostname()
 
@@ -203,7 +210,7 @@ def _load_host_config(config_dir: str, machines_dir: str) -> Dict[str, Any]:
         # now reads as "remove everything we track" rather than "nothing to do".
         raise ConfigError(f"No machine config found for hostname {hostname!r} in {machines_dir}")
 
-    return load_config(host_file)
+    return load_config(host_file, loaded=loaded)
 
 
 # --------------------------------------------------------------------------
@@ -237,7 +244,9 @@ def _prepare_sops(raw: Any, config_dir: Optional[str]) -> Any:
     return out
 
 
-def _prepare_templates(raw: Any, resolver, config_dir: Optional[str]) -> Any:
+def _prepare_templates(
+    raw: Any, resolver, config_dir: Optional[str], sources: Optional[List[str]] = None
+) -> Any:
     from tools.placeholders import PlaceholderError
 
     if not isinstance(raw, dict):
@@ -259,6 +268,8 @@ def _prepare_templates(raw: Any, resolver, config_dir: Optional[str]) -> Any:
             if not isinstance(source, str) or not source:
                 raise ConfigError(f"{where}.file must be a non-empty path string")
             source = _config_relative(source, config_dir)
+            if sources is not None:
+                sources.append(source)
             try:
                 with open(source, "r", encoding="utf-8") as f:
                     spec["content"] = f.read()
@@ -300,6 +311,7 @@ def resolve_config(
     config: Dict[str, Any],
     config_dir: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
+    sources: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Resolve placeholders across a fully merged config.
 
@@ -309,7 +321,7 @@ def resolve_config(
     for the render-time pass. Relative ``sopsFile`` and template
     ``source`` paths resolve against ``config_dir``. A ``${NAME}`` that
     is not a var stays literal; the environment is read only through
-    ``${env:NAME}``.
+    ``${env:NAME}``. Template ``file`` paths read are appended to ``sources``.
     """
     from tools.placeholders import PlaceholderError, Resolver
 
@@ -330,7 +342,7 @@ def resolve_config(
             if key in ("vars", "sops"):
                 continue
             if key == "templates":
-                out[key] = _prepare_templates(value, resolver, config_dir)
+                out[key] = _prepare_templates(value, resolver, config_dir, sources)
             else:
                 out[key] = resolver.resolve(value, key)
         if raw_vars:
