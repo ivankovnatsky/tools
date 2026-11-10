@@ -819,6 +819,19 @@ written, restored or deleted, and Dock tiles added, changed or removed
 | Config error | eval fails | section held |
 | `diff` | none | per key, restarts listed once |
 
+## settingsctl
+
+`settingsctl:` runs settingsctl (`settings` on `PATH`) on every deploy, as the
+user and on macOS only. Each declared list is passed as is; settingsctl decides
+what to change. `diff` shows the commands deploy would run.
+
+```yaml
+settingsctl:
+  fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess --enable
+  accessibility: [Hammerspoon, kitty]         # settings accessibility set
+  loginItems: [Hammerspoon, LosslessSwitcher] # settings login set
+```
+
 ## mgmt
 
 `mgmt:` configures running services through their HTTP APIs (ported from the

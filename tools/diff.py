@@ -31,6 +31,7 @@ from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
 from tools.user.ollama_models import diff_ollama_models
+from tools.user.settingsctl import diff_settingsctl
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
 from tools.util import (
@@ -591,6 +592,11 @@ def show_diff(
         changes = diff_flatpak(config.get("flatpak", {}) or {}, state)
         if changes:
             sections.append(("flatpak", changes))
+
+    if "settingsctl" in active and config.get("settingsctl") is not None:
+        changes = diff_settingsctl(config.get("settingsctl"))
+        if changes:
+            sections.append(("settingsctl", changes))
 
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         changes = diff_launchd(

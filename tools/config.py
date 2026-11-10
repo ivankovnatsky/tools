@@ -24,6 +24,7 @@ SECTIONS = (
     "brew",
     "ollamaModels",
     "flatpak",
+    "settingsctl",
     "launchd",
     "defaults",
     "dock",

@@ -51,6 +51,7 @@ from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
 from tools.user.pi import install_pi_packages
+from tools.user.settingsctl import install_settingsctl
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
 from tools.user.skills import source_root as skills_source_root
@@ -522,6 +523,10 @@ def _run_sections(
 
     if "flatpak" in active:
         success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state, update)
+
+    # After uv (installs settingsctl) and brew (installs the apps it grants).
+    if "settingsctl" in active and config.get("settingsctl") is not None:
+        success &= install_settingsctl(config.get("settingsctl"))
 
     # After files, so restartOn hashes see files written in this run.
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
