@@ -3,6 +3,7 @@ import os
 import stat
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+from tools import privilege
 from tools.fsutil import (
     FORCE_REMOVED,
     aside_refused,
@@ -198,8 +199,17 @@ def _replace(target: str, reason: str, existing: Optional[bytes] = None) -> File
     return FilePlan("replace", reason, existing)
 
 
-def plan_file(target: str, desired: bytes, desired_mode: int, record) -> FilePlan:
-    """What deploying ``desired`` to ``target`` does; shared by deploy and diff."""
+def _uid(path: str) -> int:
+    return os.lstat(path).st_uid
+
+
+def plan_file(
+    target: str, desired: bytes, desired_mode: int, record, owner: Optional[int] = None
+) -> FilePlan:
+    """What deploying ``desired`` to ``target`` does; shared by deploy and diff.
+
+    With ``owner`` (0 for system entries), a file owned by anyone else is replaced
+    whatever it holds: its owner could change it after any check."""
     if not os.path.lexists(target):
         return FilePlan("create")
     if os.path.islink(target):
@@ -211,6 +221,8 @@ def plan_file(target: str, desired: bytes, desired_mode: int, record) -> FilePla
             existing = f.read()
     except OSError as e:
         return FilePlan("error", f"cannot read {target}: {e}")
+    if owner is not None and _uid(target) != owner:
+        return _replace(target, f"not owned by uid {owner}", existing)
     if existing == desired:
         if stat.S_IMODE(os.lstat(target).st_mode) == desired_mode:
             return FilePlan("unchanged", existing=existing)
@@ -229,8 +241,11 @@ def _copy_file(
     *,
     secrets: bool = False,
     record=None,
+    owner: Optional[int] = None,
 ) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
+
+    ``owner``: see `plan_file`.
 
     Returns (result, source_hash) where result is:
     True if written, False on error, None if up to date.
@@ -252,7 +267,7 @@ def _copy_file(
 
     source_hash = hashlib.sha256(desired).hexdigest()
     desired_mode = mode if mode is not None else stat.S_IMODE(os.stat(source).st_mode)
-    fp = plan_file(target, desired, desired_mode, record)
+    fp = plan_file(target, desired, desired_mode, record, owner)
     try:
         dirname = os.path.dirname(target)
         if fp.action == "create" and dirname:
@@ -263,7 +278,7 @@ def _copy_file(
             return True, source_hash
     except FileExistsError:
         # Appeared since planning: judge it like any existing file.
-        fp = plan_file(target, desired, desired_mode, record)
+        fp = plan_file(target, desired, desired_mode, record, owner)
     except OSError as e:
         log(f"Failed to write {target}: {e}", Color.RED)
         return False, source_hash
@@ -304,6 +319,74 @@ def _copy_file(
     if diff_body:
         print(diff_body)
     return True, source_hash
+
+
+SYSTEM_HINT = "run sudo tools deploy --scope files"
+SYSTEM_KEYS = {"source", "target", "mode", "secrets"}
+SYSTEM_KEY_ERROR = "`system` is not needed: targets outside the user's home are system files"
+
+
+def _system_entry_error(entry: Dict) -> Optional[str]:
+    """Why a system entry (target outside the user's home) is invalid: root writes
+    only plain source/target files."""
+    extra = sorted(set(entry) - SYSTEM_KEYS)
+    if extra:
+        return f"a system entry takes only {sorted(SYSTEM_KEYS)}, not {extra}: {entry!r}"
+    if "source" not in entry:
+        return f"a system entry needs `source` and `target`: {entry!r}"
+    return None
+
+
+def is_system_entry(entry, home: Optional[str] = None) -> bool:
+    """A root-owned file: its target is an absolute path outside the user's home."""
+    if not isinstance(entry, dict) or "dir" in entry or "target" not in entry:
+        return False
+    target = os.path.normpath(os.path.expanduser(str(entry["target"])))
+    home = os.path.expanduser("~") if home is None else home
+    return os.path.isabs(target) and not privilege.under_home(target, home)
+
+
+def has_system_work(entries, state: Dict) -> bool:
+    """Root's `files` run: system entries declared, or files tracked in root's state."""
+    declared = isinstance(entries, list) and any(is_system_entry(e) for e in entries)
+    return declared or bool(state.get("files"))
+
+
+def system_pending(entries, config_dir: str) -> List[str]:
+    """As the user: system targets whose content or mode differ (read-only)."""
+    resolved, _errors = _resolve_entries(entries, config_dir, system=True)
+    pending = []
+    for e in resolved:
+        try:
+            with open(e.source, "rb") as f:
+                desired = f.read()
+            mode = e.mode if e.mode is not None else stat.S_IMODE(os.stat(e.source).st_mode)
+        except OSError:
+            pending.append(e.target)
+            continue
+        if plan_file(e.target, desired, mode, None, 0).action != "unchanged":
+            pending.append(e.target)
+    return pending
+
+
+def note_system(entries, config_dir: str) -> None:
+    """As the user (not under sudo): one note for system files deploy leaves to root."""
+    if privilege.UNDER_SUDO:
+        return
+    pending = system_pending(entries, config_dir)
+    if pending:
+        log(
+            f"files: {len(pending)} system file(s) differ ({', '.join(pending)}); {SYSTEM_HINT}",
+            Color.YELLOW,
+        )
+
+
+def root_target_error(target: str) -> Optional[str]:
+    """As root, why `target` must not be written: under the user's home, or its
+    directory can be changed by a non-root user."""
+    if privilege.under_home(target, os.path.expanduser("~")):
+        return "under the user's home; root never writes in user space"
+    return privilege.root_dir_error(os.path.dirname(os.path.normpath(target)))
 
 
 class Entry(NamedTuple):
@@ -360,7 +443,7 @@ def source_paths(entries, config_dir: str) -> List[str]:
 
 
 def _resolve_entries(
-    entries: List[Dict[str, object]], config_dir: str
+    entries: List[Dict[str, object]], config_dir: str, system: bool = False
 ) -> Tuple[List[Entry], List[str]]:
     """Expand a `files:` config into a flat list of `Entry`.
 
@@ -374,6 +457,11 @@ def _resolve_entries(
     entry it propagates to every file walked under that tree.
 
     File and directory entries take precedence over dir entries on the same target.
+
+    An entry whose target is an absolute path outside the user's home is a
+    root-owned system file (``source``, ``target``, ``mode?``, ``secrets?``),
+    deployed only by root (`sudo tools deploy`). ``system`` selects which kind is
+    resolved; the other kind is still validated.
 
     Returns (resolved, errors). `resolved` is deduped by target, last-write-wins.
     `errors` contains human-readable messages about malformed entries.
@@ -394,6 +482,15 @@ def _resolve_entries(
         if "force" in entry:
             errors.append(f"{FORCE_REMOVED}: {entry!r}")
             continue
+        if "system" in entry:
+            errors.append(f"{SYSTEM_KEY_ERROR}: {entry!r}")
+            continue
+        entry_system = is_system_entry(entry, home)
+        if entry_system:
+            err = _system_entry_error(entry)
+            if err:
+                errors.append(err)
+                continue
         try:
             entry_mode = _parse_mode(entry.get("mode"))
         except (TypeError, ValueError) as e:
@@ -413,6 +510,8 @@ def _resolve_entries(
             )
             continue
         entry_secrets = secrets_raw
+        if entry_system != system:
+            continue
 
         directory = entry.get("directory", False)
         if not isinstance(directory, bool):
@@ -491,8 +590,12 @@ def install_files(
     conflicts: Optional[Dict[str, str]] = None,
     private_root: Optional[str] = None,
     update: bool = False,
+    system: bool = False,
 ) -> bool:
     """Deploy files declared in the `files:` config section.
+
+    ``system`` (root under `sudo tools deploy`, with root's state) deploys only
+    entries whose target is outside the user's home; otherwise those are left alone with a note.
 
     With ``update``, each distinct ``onUpdate`` command runs once afterwards,
     changed or not, provided all its entries converged and onChange succeeded.
@@ -513,10 +616,12 @@ def install_files(
     managed: Dict[str, Dict] = {}
     hooks: Dict[str, List[str]] = {}
 
-    resolved, errors = _resolve_entries(entries, config_dir)
+    resolved, errors = _resolve_entries(entries, config_dir, system)
     for err in errors:
         log(f"files: {err}", Color.RED)
         success = False
+    if not system:
+        note_system(entries, config_dir)
     declared = [e.target for e in resolved]
     # State keys match declared targets by file identity, not spelling.
     state_files = respell(dict(state.get("files", {}) or {}), declared)
@@ -527,7 +632,7 @@ def install_files(
     unsettled = set()
     for e in _ordered(resolved):
         target = e.target
-        reason = _conflict(target, conflicts)
+        reason = _conflict(target, conflicts) or (root_target_error(target) if system else None)
         if reason:
             log(f"files: refusing {target}: {reason}", Color.RED)
             success = False
@@ -548,7 +653,12 @@ def install_files(
         else:
             record = state_files.get(target)
             result, source_hash = _copy_file(
-                e.source, target, e.mode, secrets=e.secrets, record=record
+                e.source,
+                target,
+                e.mode,
+                secrets=e.secrets,
+                record=record,
+                owner=0 if system else None,
             )
             if source_hash and result is not False:
                 managed[target] = _record(target, source_hash)
@@ -584,6 +694,12 @@ def install_files(
                     kept[target] = record
                     continue
                 if not os.path.exists(target):
+                    continue
+                unsafe = root_target_error(target) if system else None
+                if unsafe:
+                    log(f"files: not removing {target}: {unsafe}; still tracked", Color.RED)
+                    kept[target] = record
+                    success = False
                     continue
                 is_dir = isinstance(record, dict) and record.get("dir")
                 if is_dir and _released_dir(target, conflicts):

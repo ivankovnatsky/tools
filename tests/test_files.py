@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tmp_home import setUpModule, tearDownModule  # noqa: F401
+
 from tools.user import files
 
 

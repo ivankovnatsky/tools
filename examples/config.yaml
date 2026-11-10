@@ -135,6 +135,9 @@ files: []
 #   target: ~/.config/nvim/lua/config/pack.lua
 #   onChange: nvim --headless +qa
 #   onUpdate: nvim --headless "+lua vim.pack.update(nil, { force = true })" +qa
+# - source: etc/shells            # root-owned, outside ~: `sudo tools deploy`
+#   target: /etc/shells
+#   mode: "0644"
 
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.

@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tmp_home import setUpModule, tearDownModule  # noqa: F401
+
 from tools import fsutil
 from tools.user import secrets_flow, templates
 from tools.user.sops import Decryptor, parse_sops

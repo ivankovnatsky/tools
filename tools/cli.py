@@ -36,6 +36,7 @@ from tools.user.env import has_work as env_has_work
 from tools.user.env import install_env
 from tools.user.fetch import has_work as fetch_has_work
 from tools.user.fetch import install_fetch
+from tools.user.files import has_system_work as files_has_system_work
 from tools.user.files import install_files
 from tools.user.files import source_paths as files_source_paths
 from tools.user.flatpak import install_flatpak_packages
@@ -289,7 +290,7 @@ def _deploy_locked(
     try:
         persist = lambda: save_json(state_file, state)  # noqa: E731
         if root:
-            success = _run_root_sections(config, state, active, persist, restarts)
+            success = _run_root_sections(config, config_dir, state, active, persist, restarts)
         else:
             success = _run_sections(
                 config,
@@ -315,10 +316,19 @@ def _finish_restarts(restarts: list, deferred: list | None) -> None:
 
 
 def _run_root_sections(
-    config: dict, state: dict, active: set, persist=lambda: None, deferred: list | None = None
+    config: dict,
+    config_dir: str,
+    state: dict,
+    active: set,
+    persist=lambda: None,
+    deferred: list | None = None,
 ) -> bool:
-    """Under sudo: launchd daemons and system-scope defaults; nothing in user space."""
+    """Under sudo: system files, launchd daemons and system-scope defaults; nothing in
+    user space."""
     success = True
+    # Before daemons, whose restartOn may name these files.
+    if "files" in active and files_has_system_work(config.get("files"), state):
+        success &= install_files(config.get("files") or [], config_dir, state, system=True)
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         success &= install_launchd(
             config.get("launchd"),
@@ -576,8 +586,8 @@ def main(verbose):
 def deploy(config, scope, approve, update):
     """Apply config to bring system to desired state.
 
-    Under `sudo`, system work (launchd daemons, system defaults) runs as root first,
-    then everything else as the invoking user.
+    Under `sudo`, system work (system files, launchd daemons, system defaults) runs as
+    root first, then everything else as the invoking user.
     """
     inv = _invoker()
     config_paths = list(config)

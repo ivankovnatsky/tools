@@ -63,13 +63,14 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - tools refuses to run as root unless sudo started it for a normal user:
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
-- First, as root: `launchd` daemons and `defaults` `system:` keys, with root's
-  own state in `/var/db/tools/state.json`. Root never reads or writes the
+- First, as root: `files` entries outside the user's home, `launchd` daemons and
+  `defaults` `system:` keys, with root's own state in
+  `/var/db/tools/state.json`. Root never reads or writes the
   user's state file, the `mgmt` key, or anything under the user's home: a
   daemon whose plist, log dir, log files or `workingDirectory` falls under it
   is an error (other daemons still deploy).
-- Then everything else (all other sections, launchd agents, `user` and
-  `currentHost` defaults) runs in a forked child that has permanently dropped
+- Then everything else (all other sections, other `files` entries, launchd
+  agents, `user` and `currentHost` defaults) runs in a forked child that has permanently dropped
   to `SUDO_USER` (`initgroups`, `setgid`, `setuid`; it aborts if it can get
   uid 0 back). That child is a plain `tools deploy --approve` as the user: same
   config resolution, the user's state file, `HOME`/`USER`/`LOGNAME`/`SHELL`
@@ -81,8 +82,8 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - Both diffs are shown first (root's, then the user's from a short-lived
   dropped child) and one prompt covers both. A failed system phase stops the
   run before the user phase; a failure in either exits non-zero.
-- `--scope` restricts both phases; a scope without `launchd` or `defaults`
-  skips the root phase. `sudo tools diff` shows both diffs the same way.
+- `--scope` restricts both phases; a scope without `files`, `launchd` or
+  `defaults` skips the root phase. `sudo tools diff` shows both diffs the same way.
   `watch` and `reconcile` refuse root.
 - Without sudo, `deploy` runs only the user part and prints one note per
   section pointing at `sudo tools deploy --scope ...` for the system part.
@@ -158,6 +159,23 @@ Notable keys:
   hold others.
 - An existing target that differs is replaced; one tools did not write, or
   that changed since, is moved aside first (see Ownership).
+- An entry whose `target` is an absolute path outside the user's home (after
+  `~` expansion, symlinks resolved) is a root-owned system file, deployed only
+  by `sudo tools deploy` and tracked in root's state. It takes only `source`,
+  `target`, `mode` and `secrets`; a target in a directory a non-root user can
+  change is refused. A target not owned by root is replaced even when its
+  content matches. As the user, deploy and diff leave it alone and print one
+  note listing the system files that differ. The usual move-aside rule applies
+  (an `/etc/static` symlink is moved aside like a file). A `system:` key is an
+  error: the target alone decides.
+
+  ```yaml
+  files:
+    - source: etc/shells
+      target: /etc/shells
+      mode: "0644"
+  ```
+
 - `directory: true` ensures the directory (and its parents) exists and applies
   `mode`. Only a directory tools created is tracked, and it is removed only
   while empty; parents and pre-existing directories are never removed. Other

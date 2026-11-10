@@ -1,9 +1,9 @@
 """Who tools acts for: the login user, or root via `sudo tools deploy` on that user's behalf.
 
-Under sudo, root does only system work (launchd daemons, `defaults` system scope), keeps
-its own state in `ROOT_STATE_FILE` and never writes in the user's home; everything else
-runs in a forked child that has permanently dropped to the user (`run_as_user`).
-tools itself never calls sudo.
+Under sudo, root does only system work (`files` system entries, launchd daemons,
+`defaults` system scope), keeps its own state in `ROOT_STATE_FILE` and never writes in
+the user's home; everything else runs in a forked child that has permanently dropped to
+the user (`run_as_user`). tools itself never calls sudo.
 """
 
 import os
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
 ROOT_STATE_FILE = "/var/db/tools/state.json"
-ROOT_SECTIONS = ("launchd", "defaults")
+ROOT_SECTIONS = ("launchd", "defaults", "files")
 
 SUDO_USER_ERROR = (
     "tools must not run as root directly; run it as your user, "

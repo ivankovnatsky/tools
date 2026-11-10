@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tmp_home import setUpModule, tearDownModule  # noqa: F401
+
 from tools import cli
 from tools.config import ConfigError, resolve_config
 from tools.user import env, secrets_flow

@@ -23,6 +23,7 @@ from tools.user.env import diff_env
 from tools.user.env import has_work as env_has_work
 from tools.user.fetch import diff_fetch
 from tools.user.fetch import has_work as fetch_has_work
+from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.git_repos import is_checkout
 from tools.user.launchd import diff_launchd
@@ -226,11 +227,19 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
     return changes
 
 
-def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, conflicts=None):
+def _diff_files(
+    entries: List[Dict[str, object]],
+    config_dir: str,
+    state: Dict,
+    conflicts=None,
+    system: bool = False,
+):
     """Dry-run for the unified `files:` section.
 
     Resolves entries via `_resolve_entries`, compares each desired entry
     against the live filesystem, and accounts for cleanup against state.
+    ``system`` (root) covers only entries whose target is outside the user's home;
+    as the user they get a note instead.
     """
     from tools.fsutil import aside_note, removal_blocked, respell, same_file_as
     from tools.user.files import (
@@ -243,16 +252,20 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
         _removal_order,
         _resolve_entries,
         declared_hooks,
+        note_system,
         plan_file,
+        root_target_error,
     )
     from tools.util import pending_hooks
 
     changes: List[str] = []
     hooks: Dict[str, None] = {}
 
-    resolved, errors = _resolve_entries(entries, config_dir)
+    resolved, errors = _resolve_entries(entries, config_dir, system)
     for err in errors:
         changes.append(f"  ! {err}")
+    if not system:
+        note_system(entries, config_dir)
     declared = [e.target for e in resolved]
     state_files = respell(dict(state.get("files", {}) or {}), declared)
 
@@ -260,7 +273,7 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
     for e in _ordered(resolved):
         target, source, desired_mode, secrets = e.target, e.source, e.mode, e.secrets
         managed_targets.add(target)
-        reason = _conflict(target, conflicts)
+        reason = _conflict(target, conflicts) or (root_target_error(target) if system else None)
         if reason:
             changes.append(f"  ! refusing {target}: {reason}")
             continue
@@ -285,7 +298,13 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
                 continue
             source_mode = stat.S_IMODE(os.stat(source).st_mode)
             effective_mode = desired_mode if desired_mode is not None else source_mode
-            fp = plan_file(target, src_bytes, effective_mode, state_files.get(target))
+            fp = plan_file(
+                target,
+                src_bytes,
+                effective_mode,
+                state_files.get(target),
+                0 if system else None,
+            )
             if fp.action == "create":
                 changes.append(f"  + create {target}")
             elif fp.action == "error":
@@ -324,6 +343,10 @@ def _diff_files(entries: List[Dict[str, object]], config_dir: str, state: Dict, 
                 changes.append(f"  ~ keep {target} (is {blocked}; not removed)")
                 continue
             if os.path.exists(target):
+                unsafe = root_target_error(target) if system else None
+                if unsafe:
+                    changes.append(f"  ! not removing {target}: {unsafe}")
+                    continue
                 if isinstance(record, dict) and record.get("dir"):
                     if _released_dir(target, conflicts):
                         changes.append(
@@ -369,7 +392,9 @@ def show_diff(
     from tools.state import find_state_file, load_json, migrate_state_schema
 
     if root:
-        return _print_sections(_root_sections(config, scope, load_json, migrate_state_schema))
+        return _print_sections(
+            _root_sections(config, config_dir, scope, load_json, migrate_state_schema)
+        )
 
     state = {}
     state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
@@ -598,11 +623,16 @@ def show_diff(
     return _print_sections(sections)
 
 
-def _root_sections(config: dict, scope, load_json, migrate_state_schema) -> list:
-    """Under sudo: launchd daemons and system-scope defaults; nothing in user space."""
+def _root_sections(config: dict, config_dir: str, scope, load_json, migrate_state_schema) -> list:
+    """Under sudo: system files, launchd daemons and system-scope defaults; nothing in
+    user space."""
     state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
+    if "files" in active and files_has_system_work(config.get("files"), state):
+        changes = _diff_files(config.get("files") or [], config_dir, state, system=True)
+        if changes:
+            sections.append(("files", changes))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         changes = diff_launchd(
             config.get("launchd"),

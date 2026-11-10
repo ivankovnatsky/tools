@@ -8,6 +8,8 @@ import unittest
 import urllib.error
 from unittest import mock
 
+from tmp_home import setUpModule, tearDownModule  # noqa: F401
+
 from tools import cli, diff
 from tools.user import fetch, secrets_flow
 from tools.user.files import _record as files_record
