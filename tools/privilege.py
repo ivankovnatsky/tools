@@ -164,6 +164,27 @@ def existing_ancestor(path: str) -> str:
     return current
 
 
+def user_mode(st: os.stat_result, inv: Invoker) -> int:
+    """The rwx bits (0-7) of st that apply to the invoking user (SUDO_USER under sudo,
+    not root), by uid and groups."""
+    if st.st_uid == inv.uid:
+        return (st.st_mode >> 6) & 7
+    try:
+        pw = pwd.getpwuid(inv.uid)
+        groups = os.getgrouplist(pw.pw_name, pw.pw_gid)
+    except KeyError:
+        groups = [inv.gid] if inv.gid is not None else os.getgroups()
+    if st.st_gid in groups:
+        return (st.st_mode >> 3) & 7
+    return st.st_mode & 7
+
+
+def user_can_write(path: str, inv: Optional[Invoker] = None, stat_fn: StatFn = os.stat) -> bool:
+    """The invoking user may write path, by its mode bits (see `user_mode`)."""
+    inv = invoker() if inv is None else inv
+    return bool(user_mode(stat_fn(path), inv) & 2)
+
+
 def root_dir_error(
     path: str, stat_fn: StatFn = os.stat, lstat_fn: StatFn = os.lstat
 ) -> Optional[str]:

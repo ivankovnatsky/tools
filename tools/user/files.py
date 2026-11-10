@@ -323,11 +323,11 @@ def _copy_file(
 
 SYSTEM_HINT = "run sudo tools deploy --scope files"
 SYSTEM_KEYS = {"source", "target", "mode", "secrets"}
-SYSTEM_KEY_ERROR = "`system` is not needed: targets outside the user's home are system files"
+SYSTEM_KEY_ERROR = "`system` is not needed: targets the user cannot write are system files"
 
 
 def _system_entry_error(entry: Dict) -> Optional[str]:
-    """Why a system entry (target outside the user's home) is invalid: root writes
+    """Why a system entry (target the user cannot write) is invalid: root writes
     only plain source/target files."""
     extra = sorted(set(entry) - SYSTEM_KEYS)
     if extra:
@@ -337,13 +337,66 @@ def _system_entry_error(entry: Dict) -> Optional[str]:
     return None
 
 
-def is_system_entry(entry, home: Optional[str] = None) -> bool:
-    """A root-owned file: its target is an absolute path outside the user's home."""
+def _user_mode(path: str, st: os.stat_result, inv) -> int:
+    return privilege.user_mode(st, inv)
+
+
+def _decision_dir(target: str, directory: bool, inv, lstat_fn=os.lstat, readlink_fn=os.readlink):
+    """Walk down from `/` towards target (its parent, for a file), following symlinks
+    by reading them, and stop at a missing component or a directory the invoking user
+    cannot search. Root and the user stop at the same place. Returns the last directory
+    reached, its lstat, and whether that is the target itself."""
+    parts = [p for p in os.path.normpath(target).split(os.sep) if p]
+    if not directory:
+        parts = parts[:-1]
+    current, st = "/", lstat_fn("/")
+    links = 0
+    while parts:
+        if not _user_mode(current, st, inv) & 1:
+            break
+        part = parts.pop(0)
+        if part == "..":
+            current = os.path.dirname(current)
+            st = lstat_fn(current)
+            continue
+        nxt = os.path.join(current, part)
+        try:
+            nst = lstat_fn(nxt)
+        except OSError:
+            parts.insert(0, part)
+            break
+        if stat.S_ISLNK(nst.st_mode):
+            links += 1
+            if links > 40:
+                parts.insert(0, part)
+                break
+            link = readlink_fn(nxt)
+            if os.path.isabs(link):
+                current, st = "/", lstat_fn("/")
+            parts[:0] = [p for p in link.split(os.sep) if p and p != "."]
+            continue
+        if not stat.S_ISDIR(nst.st_mode):
+            parts.insert(0, part)
+            break
+        current, st = nxt, nst
+    return current, st, directory and not parts
+
+
+def is_system_entry(entry) -> bool:
+    """A root-owned file: its target is an absolute path the invoking user cannot
+    manage. See `_decision_dir`: an existing `directory` target reached by the walk is
+    the user's when they own it; otherwise the user must be able to write the
+    directory the walk stopped at."""
     if not isinstance(entry, dict) or "dir" in entry or "target" not in entry:
         return False
     target = os.path.normpath(os.path.expanduser(str(entry["target"])))
-    home = os.path.expanduser("~") if home is None else home
-    return os.path.isabs(target) and not privilege.under_home(target, home)
+    if not os.path.isabs(target):
+        return False
+    inv = privilege.invoker()
+    path, st, reached = _decision_dir(target, entry.get("directory") is True, inv)
+    if reached:
+        return st.st_uid != inv.uid
+    return not _user_mode(path, st, inv) & 2
 
 
 def has_system_work(entries, state: Dict) -> bool:
@@ -352,11 +405,28 @@ def has_system_work(entries, state: Dict) -> bool:
     return declared or bool(state.get("files"))
 
 
-def system_pending(entries, config_dir: str) -> List[str]:
-    """As the user: system targets whose content or mode differ (read-only)."""
+def other_run_targets(entries, config_dir: str, system: bool) -> List[str]:
+    """Declared targets the other run (root or user) deploys; never removed by this one."""
+    resolved, _errors = _resolve_entries(entries, config_dir, not system)
+    return [e.target for e in resolved]
+
+
+def system_pending(entries, config_dir: str) -> Tuple[List[str], List[str]]:
+    """As the user: system targets whose content or mode differ, and those the user
+    cannot read to check (read-only)."""
     resolved, _errors = _resolve_entries(entries, config_dir, system=True)
-    pending = []
+    pending, unchecked = [], []
     for e in resolved:
+        try:
+            os.lstat(e.target)
+        except PermissionError:
+            unchecked.append(e.target)
+            continue
+        except OSError:
+            pass
+        if os.path.isfile(e.target) and not os.access(e.target, os.R_OK):
+            unchecked.append(e.target)
+            continue
         try:
             with open(e.source, "rb") as f:
                 desired = f.read()
@@ -366,27 +436,37 @@ def system_pending(entries, config_dir: str) -> List[str]:
             continue
         if plan_file(e.target, desired, mode, None, 0).action != "unchanged":
             pending.append(e.target)
-    return pending
+    return pending, unchecked
 
 
 def note_system(entries, config_dir: str) -> None:
     """As the user (not under sudo): one note for system files deploy leaves to root."""
     if privilege.UNDER_SUDO:
         return
-    pending = system_pending(entries, config_dir)
+    pending, unchecked = system_pending(entries, config_dir)
     if pending:
         log(
             f"files: {len(pending)} system file(s) differ ({', '.join(pending)}); {SYSTEM_HINT}",
             Color.YELLOW,
         )
+    if unchecked:
+        log(
+            f"files: cannot check {len(unchecked)} system file(s) ({', '.join(unchecked)})",
+            Color.YELLOW,
+        )
 
 
 def root_target_error(target: str) -> Optional[str]:
-    """As root, why `target` must not be written: under the user's home, or its
-    directory can be changed by a non-root user."""
-    if privilege.under_home(target, os.path.expanduser("~")):
+    """As root, why `target` must not be written: it is the user's home or above it,
+    its directory is under the home, or a non-root user can change that directory. A
+    symlink at target is replaced, not followed."""
+    parent = os.path.dirname(os.path.normpath(target))
+    home = os.path.expanduser("~")
+    if privilege.under_home(home, target):
+        return "the user's home or a directory above it"
+    if privilege.under_home(parent, home):
         return "under the user's home; root never writes in user space"
-    return privilege.root_dir_error(os.path.dirname(os.path.normpath(target)))
+    return privilege.root_dir_error(parent)
 
 
 class Entry(NamedTuple):
@@ -458,8 +538,9 @@ def _resolve_entries(
 
     File and directory entries take precedence over dir entries on the same target.
 
-    An entry whose target is an absolute path outside the user's home is a
-    root-owned system file (``source``, ``target``, ``mode?``, ``secrets?``),
+    An entry whose target is an absolute path in a directory the invoking user
+    cannot write (nearest existing ancestor) is a root-owned system file
+    (``source``, ``target``, ``mode?``, ``secrets?``),
     deployed only by root (`sudo tools deploy`). ``system`` selects which kind is
     resolved; the other kind is still validated.
 
@@ -485,7 +566,7 @@ def _resolve_entries(
         if "system" in entry:
             errors.append(f"{SYSTEM_KEY_ERROR}: {entry!r}")
             continue
-        entry_system = is_system_entry(entry, home)
+        entry_system = is_system_entry(entry)
         if entry_system:
             err = _system_entry_error(entry)
             if err:
@@ -595,7 +676,8 @@ def install_files(
     """Deploy files declared in the `files:` config section.
 
     ``system`` (root under `sudo tools deploy`, with root's state) deploys only
-    entries whose target is outside the user's home; otherwise those are left alone with a note.
+    entries whose target directory the user cannot write; otherwise those are left alone
+    with a note.
 
     With ``update``, each distinct ``onUpdate`` command runs once afterwards,
     changed or not, provided all its entries converged and onChange succeeded.
@@ -617,6 +699,8 @@ def install_files(
     hooks: Dict[str, List[str]] = {}
 
     resolved, errors = _resolve_entries(entries, config_dir, system)
+    # Classified before anything is written: a chmod below can change the answer.
+    others = other_run_targets(entries, config_dir, system)
     for err in errors:
         log(f"files: {err}", Color.RED)
         success = False
@@ -682,6 +766,9 @@ def install_files(
         for target in _removal_order(state_files, state_files):
             if target not in managed and target not in held and target not in released:
                 record = state_files.get(target)
+                if same_file_as(target, others):
+                    kept[target] = record
+                    continue
                 blocked = removal_blocked(conflicts, target)
                 twin = same_file_as(target, declared)
                 if twin:

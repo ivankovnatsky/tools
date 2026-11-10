@@ -63,7 +63,7 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - tools refuses to run as root unless sudo started it for a normal user:
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
-- First, as root: `files` entries outside the user's home, `launchd` daemons and
+- First, as root: `files` entries the user cannot write, `launchd` daemons and
   `defaults` `system:` keys, with root's own state in
   `/var/db/tools/state.json`. Root never reads or writes the
   user's state file, the `mgmt` key, or anything under the user's home: a
@@ -159,13 +159,20 @@ Notable keys:
   hold others.
 - An existing target that differs is replaced; one tools did not write, or
   that changed since, is moved aside first (see Ownership).
-- An entry whose `target` is an absolute path outside the user's home (after
-  `~` expansion, symlinks resolved) is a root-owned system file, deployed only
+- Whether an absolute `target` (after `~` expansion) is a user or a system
+  file follows Unix permissions for the invoking user (`SUDO_USER` under
+  sudo): walk down from `/` towards the target's directory (following
+  symlinks, not the target itself), stopping at a missing path or a directory
+  the user cannot search. An existing `directory: true` target reached this
+  way is the user's when they own it; anything else is the user's when they
+  can write the directory where the walk stopped. Otherwise it is a root-owned
+  system file, deployed only
   by `sudo tools deploy` and tracked in root's state. It takes only `source`,
   `target`, `mode` and `secrets`; a target in a directory a non-root user can
   change is refused. A target not owned by root is replaced even when its
   content matches. As the user, deploy and diff leave it alone and print one
-  note listing the system files that differ. The usual move-aside rule applies
+  note listing the system files that differ (and any it cannot read to
+  check). The usual move-aside rule applies
   (an `/etc/static` symlink is moved aside like a file). A `system:` key is an
   error: the target alone decides.
 

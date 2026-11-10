@@ -4,8 +4,6 @@ import os
 import tempfile
 import unittest
 
-from tmp_home import setUpModule, tearDownModule  # noqa: F401
-
 from tools import cli
 from tools.user import secrets_flow
 from tools.user.files import _file_hash, _record

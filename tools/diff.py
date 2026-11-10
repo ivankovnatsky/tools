@@ -238,7 +238,7 @@ def _diff_files(
 
     Resolves entries via `_resolve_entries`, compares each desired entry
     against the live filesystem, and accounts for cleanup against state.
-    ``system`` (root) covers only entries whose target is outside the user's home;
+    ``system`` (root) covers only entries whose target directory the user cannot write;
     as the user they get a note instead.
     """
     from tools.fsutil import aside_note, removal_blocked, respell, same_file_as
@@ -253,6 +253,7 @@ def _diff_files(
         _resolve_entries,
         declared_hooks,
         note_system,
+        other_run_targets,
         plan_file,
         root_target_error,
     )
@@ -262,6 +263,7 @@ def _diff_files(
     hooks: Dict[str, None] = {}
 
     resolved, errors = _resolve_entries(entries, config_dir, system)
+    others = other_run_targets(entries, config_dir, system)
     for err in errors:
         changes.append(f"  ! {err}")
     if not system:
@@ -335,6 +337,8 @@ def _diff_files(
     for target in _removal_order(state_files, state_files) if not errors else ():
         if target not in managed_targets:
             record = state_files.get(target)
+            if same_file_as(target, others):
+                continue
             blocked = removal_blocked(conflicts, target)
             twin = same_file_as(target, declared)
             if twin:
