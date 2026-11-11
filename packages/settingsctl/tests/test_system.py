@@ -89,7 +89,7 @@ class SubcommandTestBase(unittest.TestCase):
         self.zones = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(self.zones))
         for zone, data in (
-            ("Europe/Zaporozhye", b"zone"),
+            ("Etc/Linked", b"zone"),
             ("Europe/Uzhgorod", b"zone"),
             ("Europe/Berlin", b"b"),
         ):
@@ -99,7 +99,7 @@ class SubcommandTestBase(unittest.TestCase):
                 f.write(data)
         self.link = os.path.join(self.zones, "localtime")
         self.mac.zone_link = self.set_zone
-        self.set_zone("Europe/Zaporozhye")
+        self.set_zone("Etc/Linked")
         patches = [
             mock.patch.object(timezone, "ZONEINFO", self.zones),
             mock.patch.object(timezone, "LOCALTIME", self.link),
@@ -159,7 +159,7 @@ class TimezoneTest(SubcommandTestBase):
     def test_get_matches_linked_names(self):
         rc, out = self.cli("timezone", "get", "Europe/Uzhgorod", "--json")
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), {"timeZone": "Europe/Zaporozhye", "matches": True})
+        self.assertEqual(json.loads(out), {"timeZone": "Etc/Linked", "matches": True})
         rc, out = self.cli("timezone", "get", "Europe/Berlin", "--json")
         self.assertEqual(json.loads(out)["matches"], False)
 

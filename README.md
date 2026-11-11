@@ -932,7 +932,7 @@ settingsctl:
 ```
 
 - Reads use `settings <cmd> get --json`. A time zone linked to the declared
-  one in tzdata (e.g. Europe/Uzhgorod and Europe/Zaporozhye) is not drift, since automatic
+  one in tzdata is not drift, since automatic
   time zone may pick either. Remote Login is on when `com.openssh.sshd` is
   enabled and loaded, off when it is neither.
 - Host settings run in the sudo phase; root never runs the other keys. Without

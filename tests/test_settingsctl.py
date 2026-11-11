@@ -138,7 +138,7 @@ class FakeSettings:
     def __init__(self):
         self.names = {"hostName": "Ivans-Mac-mini", "localHostName": "Ivans-Mac-mini"}
         self.names["computerName"] = "Mac"
-        self.zone, self.matches = "Europe/Zaporozhye", True
+        self.zone, self.matches = "Etc/Linked", True
         self.sleep = {"AC Power": {"computer": "never", "display": 10, "disk": "never"}}
         self.sshd = {"remoteLogin": True, "enabled": True, "loaded": True}
         self.browser = {"defaultBrowser": "firefox", "browsers": ["safari", "firefox"]}
@@ -260,8 +260,8 @@ class HostKeysTest(unittest.TestCase):
 
     def test_read_failure_fails_root_phase(self):
         self.fake.fail.add("timezone")
-        self.assertTrue(self.diff({"timeZone": "Europe/Zaporozhye"})[0].startswith("  ? timeZone"))
-        self.assertFalse(self.install({"timeZone": "Europe/Zaporozhye"}))
+        self.assertTrue(self.diff({"timeZone": "Etc/Linked"})[0].startswith("  ? timeZone"))
+        self.assertFalse(self.install({"timeZone": "Etc/Linked"}))
 
     def test_root_never_uses_its_own_path(self):
         kw = {"which": lambda _: "/root/bin/settings", "paths": None}
@@ -324,7 +324,7 @@ class WiringTest(unittest.TestCase):
         ):
             self.assertTrue(cli._deploy({"settingsctl": MINI}, "/tmp", root=True))
             inst.assert_not_called()
-            raw = {**MINI, "timeZone": "Europe/Zaporozhye"}
+            raw = {**MINI, "timeZone": "Etc/Linked"}
             paths = {"uvBin": "/x"}
             self.assertTrue(cli._deploy({"settingsctl": raw, "paths": paths}, "/tmp", root=True))
             inst.assert_called_once_with(raw, paths)

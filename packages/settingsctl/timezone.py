@@ -1,6 +1,6 @@
 """Timezone: get or set the system time zone (macOS only).
 
-Two names linked to one tzdata file (e.g. Europe/Uzhgorod and Europe/Zaporozhye) are the
+Two names linked to one tzdata file are the
 same zone: automatic time zone may pick either, so neither counts as a change.
 """
 
@@ -63,7 +63,7 @@ def register(cli):
         """Get or set the time zone (macOS only; set needs root)
 
         `get ZONE` also reports whether the current zone matches ZONE, counting
-        linked names (e.g. Europe/Uzhgorod, Europe/Zaporozhye) as one zone.
+        linked names as one zone.
         """
         if not is_macos():
             print("Time zone settings only available on macOS", file=sys.stderr)
