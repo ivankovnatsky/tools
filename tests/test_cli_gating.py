@@ -398,6 +398,7 @@ class RootInvocation:
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch("os.geteuid", return_value=0),
             mock.patch("pwd.getpwnam", side_effect=_getpwnam),
+            mock.patch("tools.config._PINNED_HOSTNAME", None),
         ):
             return CliRunner().invoke(cli.main, args)
 
@@ -715,6 +716,14 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def steps(self):
         return [e for e in self.events if e[0] not in ("load", "restart")]
 
+    def test_machine_is_pinned_before_either_phase_loads_config(self):
+        with mock.patch.object(
+            cli, "pin_hostname", side_effect=lambda: self.events.append(("pin",))
+        ):
+            result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.events[0], ("pin",))
+
     def test_system_sections_as_root_then_everything_else_as_the_user(self):
         result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -757,7 +766,9 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
 
         result = self.run_cli(["deploy"], show_diff=show_diff)
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(seen, [(True, 0, ("launchd", "defaults", "files")), (False, 501, ())])
+        self.assertEqual(
+            seen, [(True, 0, ("launchd", "defaults", "files", "settingsctl")), (False, 501, ())]
+        )
         self.prompted.assert_called_once()
         self.assertIn(("install_brew_packages", 501), self.events)
 

@@ -1543,5 +1543,57 @@ class CliGatingTest(unittest.TestCase):
         self.assertEqual(fake.writes(), [])
 
 
+class ActivateSettingsTest(DefaultsTestBase):
+    ACTIVATE = "/System/Library/activateSettings"
+
+    def setUp(self):
+        super().setUp()
+        self.activated = []
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[0] == self.ACTIVATE:
+                self.activated.append(list(cmd))
+                return 0, "", ""
+            return orig(cmd, env, cwd)
+
+        self.fake.run = run
+
+    def deploy(self, raw):
+        spec, errors = parse_defaults(raw)
+        cli = self.fake.cli(self.root, activate_settings=self.ACTIVATE)
+        return defaults.apply_defaults(spec, errors, self.state, cli)
+
+    def test_runs_once_after_user_writes_only(self):
+        raw = {"user": {"com.example.a": {"k": 1}, "com.example.b": {"k": 2}}}
+        self.assertEqual(
+            self.diff(raw, activate_settings=self.ACTIVATE)[-1], "  ~ run activateSettings -u"
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.activated, [[self.ACTIVATE, "-u"]])
+
+        self.activated.clear()
+        self.assertEqual(self.diff(raw, activate_settings=self.ACTIVATE), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.activated, [])
+
+    def test_runs_after_restore(self):
+        self.deploy({"user": {"com.example.a": {"k": 1}}})
+        self.activated.clear()
+        self.assertTrue(self.deploy({}))
+        self.assertEqual(self.activated, [[self.ACTIVATE, "-u"]])
+
+    def test_never_as_root(self):
+        self.root = True
+        self.assertTrue(self.deploy({"system": {"/Library/Preferences/com.example": {"k": 1}}}))
+        self.assertEqual(self.activated, [])
+
+    def test_failure_is_a_warning(self):
+        self.fake.run = lambda cmd, env=None, cwd=None: (
+            (1, "", "boom") if cmd[0] == self.ACTIVATE else FakeDefaults.run(self.fake, cmd)
+        )
+        self.assertTrue(self.deploy({"user": {"com.example.a": {"k": 1}}}))
+
+
 if __name__ == "__main__":
     unittest.main()

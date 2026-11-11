@@ -204,6 +204,22 @@ defaults:
       Weather: 2
   system: {} # applied only by `sudo tools deploy --scope defaults`
 
+# Permissions, login items and host settings via settingsctl. See README
+# "settingsctl". Host settings apply only under `sudo tools deploy`.
+settingsctl:
+  loginItems: [Hammerspoon]
+  defaultBrowser: safari
+  hostName: example-mac
+  localHostName: example-mac
+  timeZone: Europe/Uzhgorod
+  sleep: { computer: never, display: 10, disk: never }
+  remoteLogin: true
+
+# Keys inside app-owned plists. See README "plist".
+plist:
+  ~/Library/Application Support/com.nuebling.mac-mouse-fix/config.plist:
+    General:showMenuBarItem: false
+
 # Dock layout. See README "Dock". Undeclared sections are left alone.
 dock:
   apps:

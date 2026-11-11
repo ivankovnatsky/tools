@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tools import config as config_mod
 from tools.config import (
     SECTIONS,
     TOP_LEVEL_KEYS,
@@ -70,6 +71,20 @@ class EmptyDesiredStateTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ConfigError, "machines/"):
                 load_config_dir(d)
+
+
+class PinHostnameTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, config_mod, "_PINNED_HOSTNAME", None)
+
+    def test_pinned_machine_survives_a_hostname_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "machines", "old.json"), '{"npm": {"packages": {}}}')
+            _write(os.path.join(d, "machines", "new.json"), '{"uv": {"packages": {}}}')
+            with mock.patch.object(config_mod.socket, "gethostname", return_value="old.local"):
+                self.assertEqual(config_mod.pin_hostname(), "old")
+            with mock.patch.object(config_mod.socket, "gethostname", return_value="new"):
+                self.assertIn("npm", load_config_dir(d))
 
 
 class IncludeTest(unittest.TestCase):

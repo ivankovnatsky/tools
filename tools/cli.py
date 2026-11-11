@@ -7,7 +7,14 @@ import time
 import click
 
 from tools import privilege, selection
-from tools.config import ConfigError, deep_merge, load_config, load_config_dir, resolve_config
+from tools.config import (
+    ConfigError,
+    deep_merge,
+    load_config,
+    load_config_dir,
+    pin_hostname,
+    resolve_config,
+)
 from tools.diff import ALL_SECTIONS, show_diff
 from tools.log import Color, log, set_verbose
 from tools.mgmt import has_work as mgmt_has_work
@@ -58,6 +65,9 @@ from tools.user.mcp import install_mcp_servers
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
 from tools.user.pi import install_pi_packages
+from tools.user.plist import has_work as plist_has_work
+from tools.user.plist import install_plist
+from tools.user.settingsctl import has_root_work as settingsctl_has_root_work
 from tools.user.settingsctl import install_settingsctl
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
@@ -249,6 +259,7 @@ def _read_restarts(fd: int, out: list, daemons: list | None = None) -> None:
 def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple, only=None) -> bool:
     """Both diffs under sudo: system sections as root, the rest in a child dropped to the
     user. True when there are changes; exits when the user diff fails."""
+    pin_hostname()
     changes = False
     system = _system_scope(scope)
     if system:
@@ -277,6 +288,7 @@ def _sudo_deploy(
     """System sections as root, then every user section in a child dropped to the user.
     One prompt covers both; a failed system phase stops before the user phase. Process
     restarts from both phases run once, at the end."""
+    pin_hostname()
     if only:
         # Both phases' --only checks before either runs anything.
         _check_only(_load_merged_config(config_paths), config_paths, only, root=True)
@@ -482,12 +494,14 @@ def _run_root_sections(
     persist=lambda: None,
     deferred: list | None = None,
 ) -> bool:
-    """Under sudo: system files, launchd daemons and system-scope defaults; nothing in
-    user space."""
+    """Under sudo: system files, launchd daemons, system-scope defaults and settingsctl host
+    settings; nothing in user space."""
     success = True
     # Before daemons, whose restartOn may name these files.
     if "files" in active and files_has_system_work(config.get("files"), state):
         success &= install_files(config.get("files") or [], config_dir, state, system=True)
+    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
+        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         success &= install_launchd(
             config.get("launchd"),
@@ -701,7 +715,11 @@ def _run_sections(
 
     # After uv (installs settingsctl) and brew (installs the apps it grants).
     if "settingsctl" in active and config.get("settingsctl") is not None:
-        success &= install_settingsctl(config.get("settingsctl"))
+        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
+
+    # After brew, which installs the apps whose files these are.
+    if "plist" in active and plist_has_work(config.get("plist")):
+        success &= install_plist(config.get("plist"))
 
     # After files, so restartOn hashes see files written in this run.
     units = secrets_flow.pending_restarts(state)
@@ -788,8 +806,8 @@ def main(verbose):
 def deploy(config, scope, only, approve, update):
     """Apply config to bring system to desired state.
 
-    Under `sudo`, system work (system files, launchd daemons, system defaults) runs as
-    root first, then everything else as the invoking user.
+    Under `sudo`, system work (system files, launchd daemons, system defaults, settingsctl
+    host settings) runs as root first, then everything else as the invoking user.
     """
     inv = _invoker()
     scope, only = _selection(scope, only)

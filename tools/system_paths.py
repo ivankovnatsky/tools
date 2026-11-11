@@ -31,6 +31,10 @@ _DARWIN = {
     "mas": "/opt/homebrew/bin/mas",
     "defaults": "/usr/bin/defaults",
     "killall": "/usr/bin/killall",
+    "activateSettings": (
+        "/System/Library/PrivateFrameworks/SystemAdministration.framework"
+        "/Resources/activateSettings"
+    ),
 }
 
 # Generic Linux (Debian, Arch, Ubuntu, Fedora, ...).

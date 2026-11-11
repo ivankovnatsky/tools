@@ -99,8 +99,8 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - tools refuses to run as root unless sudo started it for a normal user:
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
-- First, as root: `files` entries the user cannot write, `launchd` daemons and
-  `defaults` `system:` keys, with root's own state in
+- First, as root: `files` entries the user cannot write, `launchd` daemons,
+  `defaults` `system:` keys and `settingsctl` host settings, with root's own state in
   `/var/db/tools/state.json`. Root never reads or writes the
   user's state file, the `mgmt` key, or anything under the user's home: a
   daemon whose plist, log dir, log files or `workingDirectory` falls under it
@@ -118,8 +118,8 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - Both diffs are shown first (root's, then the user's from a short-lived
   dropped child) and one prompt covers both. A failed system phase stops the
   run before the user phase; a failure in either exits non-zero.
-- `--scope` restricts both phases; a scope without `files`, `launchd` or
-  `defaults` skips the root phase. `sudo tools diff` shows both diffs the same way.
+- `--scope` restricts both phases; a scope without `files`, `launchd`,
+  `defaults` or `settingsctl` skips the root phase. `sudo tools diff` shows both diffs the same way.
   `watch` and `reconcile` refuse root.
 - Without sudo, `deploy` runs only the user part and prints one note per
   section pointing at `sudo tools deploy --scope ...` for the system part.
@@ -847,6 +847,8 @@ defaults:
   that domain changed.
 - Any config error holds the whole section: no writes, restores or restarts.
 - `persistent-apps`/`persistent-others` belong to `dock:`.
+- After a run that changed `user` or `currentHost` keys, `activateSettings -u`
+  runs once so running apps pick up the new values (`diff` lists it).
 
 ## Dock
 
@@ -907,16 +909,62 @@ written, restored or deleted, and Dock tiles added, changed or removed
 
 ## settingsctl
 
-`settingsctl:` runs settingsctl (`settings` on `PATH`) on every deploy, as the
-user and on macOS only. Each declared list is passed as is; settingsctl decides
-what to change. `diff` shows the commands deploy would run.
+`settingsctl:` drives settingsctl (`settings`, from `packages/settingsctl`) on
+macOS only. Each declared list is passed as is on every deploy; settingsctl
+decides what to change. Every other key is read first and set only when it
+differs; `diff` shows the commands deploy would run and the current values.
 
 ```yaml
 settingsctl:
+  path: /usr/local/bin/settings               # optional, see below
   fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess --enable
   accessibility: [Hammerspoon, kitty]         # settings accessibility set
   loginItems: [Hammerspoon, LosslessSwitcher] # settings login set
+  appearanceInit: true    # settings appearance --init, while its state file is missing
+  defaultBrowser: firefox # settings defaultbrowser set; macOS asks to confirm
+  # root only: sudo tools deploy
+  hostName: my-mac        # settings hostname set --host-name
+  localHostName: my-mac   # ... --local-host-name (Bonjour)
+  computerName: My Mac    # ... --computer-name
+  timeZone: Europe/Uzhgorod   # settings timezone set
+  sleep: { computer: never, display: 10, disk: never } # settings sleep set (pmset -a)
+  remoteLogin: true       # settings remotelogin set on|off
 ```
+
+- Reads use `settings <cmd> get --json`. A time zone linked to the declared
+  one in tzdata (e.g. Europe/Uzhgorod and Europe/Zaporozhye) is not drift, since automatic
+  time zone may pick either. Remote Login is on when `com.openssh.sshd` is
+  enabled and loaded, off when it is neither.
+- Host settings run in the sudo phase; root never runs the other keys. Without
+  sudo, `deploy` and `diff` read them and print a note pointing at
+  `sudo tools deploy --scope settingsctl`.
+- Finding `settings`: `path` when set. Otherwise the user looks on `PATH`, then
+  in `paths.uvBin`; root never uses its own `PATH` and looks in `paths.uvBin`,
+  `~/.local/bin`, `/opt/homebrew/bin`, `/opt/homebrew/sbin` and `/usr/local/bin`
+  of the invoking user, failing when none has it. On a fresh machine run
+  `tools deploy` once without sudo so `uv` installs it. Root then runs a
+  binary the user can replace, as with any other command in this config.
+- `appearanceInit` switches to dark mode once; settingsctl then writes
+  `~/.local/state/settings/appearance/last-run` and later toggles are yours.
+- A key that leaves config is left as is. Any config error holds the section.
+
+## plist
+
+`plist:` sets single keys in plist files an app owns, such as a
+`config.plist` under `~/Library/Application Support`. Use `defaults:` for
+preference domains.
+
+```yaml
+plist:
+  ~/Library/Application Support/com.nuebling.mac-mouse-fix/config.plist:
+    General:showMenuBarItem: false # `:` separates nested dict keys
+```
+
+- Only declared keys change; the rest of the file, its format (XML or binary)
+  and mode are kept. Values compare type-strictly, as in `defaults`.
+- A file that does not exist yet is skipped (`diff` shows `= skip`): the app
+  creates it on first launch and a later deploy sets the keys.
+- A key that leaves config is left as is. Runs as the user.
 
 ## mgmt
 
@@ -1070,7 +1118,7 @@ not part of the `tools` CLI. See [packages/README.md](packages/README.md).
 ```console
 nix develop        # dev shell (see `just` targets inside)
 just lint          # ruff check + format check
-nix flake check    # build + full unit test suite
+nix flake check    # build + full unit test suite, plus settingsctl's tests
 just release       # bump patch version, tag, GitHub release
 ```
 

@@ -26,6 +26,7 @@ SECTIONS = (
     "ollamaModels",
     "flatpak",
     "settingsctl",
+    "plist",
     "launchd",
     "defaults",
     "dock",
@@ -163,8 +164,22 @@ def load_config(
     return deep_merge(merged, data)
 
 
+_PINNED_HOSTNAME: Optional[str] = None
+
+
+def pin_hostname() -> str:
+    """Keep the machine chosen now for the rest of this process and its forks, so a
+    hostname set mid-run (settingsctl hostName under sudo) cannot switch configs."""
+    global _PINNED_HOSTNAME
+    _PINNED_HOSTNAME = None
+    _PINNED_HOSTNAME = _get_hostname()
+    return _PINNED_HOSTNAME
+
+
 def _get_hostname() -> str:
     """Get the short hostname (strip .local suffix on macOS)."""
+    if _PINNED_HOSTNAME is not None:
+        return _PINNED_HOSTNAME
     hostname = socket.gethostname()
     # macOS commonly appends .local
     if hostname.endswith(".local"):

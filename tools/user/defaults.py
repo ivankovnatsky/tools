@@ -554,6 +554,7 @@ class DefaultsCLI:
 
     defaults: str
     killall: Optional[str] = None
+    activate_settings: Optional[str] = None  # makes running apps pick up user writes
     run: Callable = run_command
     is_root: bool = False
     home: Optional[str] = None  # the invoking user's home; root never writes under it
@@ -577,6 +578,7 @@ class DefaultsCLI:
         return cls(
             defaults=defaults,
             killall=system_bin_optional("killall"),
+            activate_settings=system_bin_optional("activateSettings"),
             is_root=is_root,
             home=home,
             login=login,
@@ -657,6 +659,16 @@ class DefaultsCLI:
         what = f"delete {domain} {key}"
         self._writable(scope, domain, what)
         self._check(self._prefix(scope) + ["delete", domain, key], what)
+
+    def activate(self) -> Optional[str]:
+        """`activateSettings -u` as the user, after their preferences changed. Returns a
+        warning or None."""
+        if not self.activate_settings or self.is_root:
+            return None
+        rc, stdout, stderr = self.run([self.activate_settings, "-u"])
+        if rc != 0:
+            return (stderr or stdout or "").strip() or f"exit {rc}"
+        return None
 
     def restart(self, process: str) -> Optional[str]:
         """Kill process so it relaunches with new prefs. Returns a warning or None."""
@@ -992,6 +1004,10 @@ def _apply_defaults(
 
     if not changed_plists:
         debug("All defaults up to date", Color.BLUE)
+    elif any(scope in USER_SCOPES for scope, _ in changed_plists):
+        warning = cli.activate()
+        if warning:
+            log(f"defaults: activateSettings -u: {warning}", Color.YELLOW)
     return success
 
 
@@ -1038,6 +1054,11 @@ def preview_defaults(
         for _, w, reason in p["forget"]
         if reason != "already gone"
     ]
+    user_changes = [res for res, _ in p["set"] if res.scope in USER_SCOPES]
+    user_changes += [s for s, _, _ in p["restore"] if s[0] in USER_SCOPES]
+    user_changes += [s for s, _ in p["delete"] if s[0] in USER_SCOPES]
+    if user_changes and cli.activate_settings and not cli.is_root:
+        changes.append("  ~ run activateSettings -u")
     if restarts is None:
         changes += [f"  ~ restart {proc}" for proc in p["restart"]]
     else:

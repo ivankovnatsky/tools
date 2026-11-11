@@ -31,7 +31,10 @@ from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
 from tools.user.ollama_models import diff_ollama_models
+from tools.user.plist import diff_plist
+from tools.user.plist import has_work as plist_has_work
 from tools.user.settingsctl import diff_settingsctl
+from tools.user.settingsctl import has_root_work as settingsctl_has_root_work
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
 from tools.util import (
@@ -637,9 +640,14 @@ def show_diff(
             sections.append(("flatpak", changes))
 
     if "settingsctl" in active and config.get("settingsctl") is not None:
-        changes = diff_settingsctl(config.get("settingsctl"))
+        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"))
         if changes:
             sections.append(("settingsctl", changes))
+
+    if "plist" in active and plist_has_work(config.get("plist")):
+        changes = diff_plist(config.get("plist"))
+        if changes:
+            sections.append(("plist", changes))
 
     units = secrets_flow.pending_restarts(state)
     if "launchd" in active and (launchd_has_work(config.get("launchd"), state) or units):
@@ -694,14 +702,18 @@ def _hide(view, state: dict) -> bool:
 
 
 def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
-    """Under sudo: system files, launchd daemons and system-scope defaults; nothing in
-    user space."""
+    """Under sudo: system files, launchd daemons, system-scope defaults and settingsctl host
+    settings; nothing in user space."""
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
     if "files" in active and files_has_system_work(config.get("files"), state):
         changes = _diff_files(config.get("files") or [], config_dir, state, system=True)
         if changes:
             sections.append(("files", changes))
+    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
+        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"))
+        if changes:
+            sections.append(("settingsctl", changes))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         changes = diff_launchd(
             config.get("launchd"),
