@@ -208,6 +208,56 @@ class RenderTest(TemplatesTestBase):
         self.deploy(raw)
         self.assertEqual(self.report.notify, [])
 
+    def test_launchd_units_stay_pending_until_settled(self):
+        raw = self.tpl({"a": 1}, restartUnits=["launchd:org.example.app", "other:x"])
+        self.deploy(raw)
+        self.assertEqual(
+            secrets_flow.pending_restarts(self.state), {"org.example.app": ["templates/app"]}
+        )
+        self.assertEqual(
+            secrets_flow.format_notify(self.report),
+            ["notify other:x (changed: templates/app); no handler yet"],
+        )
+        self.deploy(self.tpl({"a": 2}, restartUnits=["launchd:org.example.app"]))
+        self.assertEqual(
+            secrets_flow.pending_restarts(self.state), {"org.example.app": ["templates/app"]}
+        )
+        secrets_flow.settle_restarts(self.state, {"org.example.app"})
+        self.assertNotIn(secrets_flow.RESTARTS_KEY, self.state)
+
+    def test_settle_by_seq_keeps_a_restart_owed_again_since(self):
+        secrets_flow.add_pending_restarts(self.state, [("launchd:a", "templates/a")])
+        seq = secrets_flow.pending_seqs(self.state)["a"]
+        secrets_flow.add_pending_restarts(self.state, [("launchd:a", "templates/a")])
+        secrets_flow.settle_restarts(self.state, {"a": seq})
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {"a": ["templates/a"]})
+        secrets_flow.settle_restarts(self.state, secrets_flow.pending_seqs(self.state))
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {})
+
+    def test_chmod_alone_owes_no_restart(self):
+        raw = self.tpl({"a": 1}, mode="0640", restartUnits=["launchd:org.example.app"])
+        self.deploy(raw)
+        secrets_flow.settle_restarts(self.state, {"org.example.app"})
+        os.chmod(self.target, 0o600)
+        self.report = secrets_flow.RunReport()
+        self.deploy(raw)
+        self.assertEqual(self.mode(), 0o640)
+        self.assertEqual(self.report.notify, [])
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {})
+
+    def test_malformed_pending_state_is_ignored(self):
+        self.state[secrets_flow.RESTARTS_KEY] = {
+            "launchd:a": ["x"],
+            3: {"sources": [], "seq": 1},
+            "launchd:b": {"sources": ["s", 1], "seq": 1},
+            "launchd:c": {"sources": [], "seq": "1"},
+        }
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {"b": ["s"]})
+        self.state[secrets_flow.RESTARTS_KEY] = []
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {})
+        secrets_flow.add_pending_restarts(self.state, [("launchd:a", "templates/a")])
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {"a": ["templates/a"]})
+
     def conflicts(self, raw, files_entries=None):
         return secrets_flow.ownership_conflicts(
             files_entries=files_entries,

@@ -634,6 +634,7 @@ def record_secret(record) -> bool:
 class Result:
     success: bool
     changed: List[Secret] = field(default_factory=list)
+    rewritten: List[Secret] = field(default_factory=list)  # content written, not chmod
     failed: List[str] = field(default_factory=list)  # names
 
 
@@ -704,6 +705,8 @@ def apply(
             continue
         installed[s.path] = _record(s)
         res.changed.append(s)
+        if ch.action != "chmod":
+            res.rewritten.append(s)
         verb = {
             "create": "Decrypted",
             "update": "Updated",
@@ -758,7 +761,8 @@ def describe(p: Plan) -> List[str]:
             else:
                 suffix = f" -> {oct(s.mode)}" if ch.action == "chmod" else " (secret)"
             rows.append(f"  {labels[ch.action]} {s.path}{suffix}")
-            rows += [f"    notify: {n}" for n in s.notify]
+            if ch.action != "chmod":
+                rows += [f"    notify: {n}" for n in s.notify]
     rows += [f"  ~ keep {path} (is {reason}; not removed)" for path, reason in p.keep]
     return rows + fsutil.describe_removals(p.errors, p.remove, p.forget)
 

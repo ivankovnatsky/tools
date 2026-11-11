@@ -616,11 +616,13 @@ def show_diff(
         if changes:
             sections.append(("settingsctl", changes))
 
-    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+    units = secrets_flow.pending_restarts(state)
+    if "launchd" in active and (launchd_has_work(config.get("launchd"), state) or units):
         changes = diff_launchd(
             config.get("launchd"),
             state,
             **sops_section.secrets_dir_kwargs(config.get("sops")),
+            units=units,
         )
         if changes:
             sections.append(("launchd", changes))

@@ -346,6 +346,7 @@ def plan(
 class Result:
     success: bool
     changed: List[Template] = field(default_factory=list)
+    rewritten: List[Template] = field(default_factory=list)  # content written, not chmod
 
 
 def _record(ch: Change) -> Dict:
@@ -420,6 +421,8 @@ def apply(
             continue
         installed[t.target] = _record(ch)
         res.changed.append(t)
+        if ch.action != "chmod":
+            res.rewritten.append(t)
         verb = {"create": "Rendered", "update": "Updated", "replace": "Replaced", "chmod": "Chmod"}
         verb = verb[ch.action]
         log(f"{verb}: {t.target}{' (secret)' if ch.secret else ''}", Color.GREEN)
@@ -476,7 +479,8 @@ def describe(p: Plan) -> List[str]:
             rows.append(f"  ~ chmod {t.target} -> {oct(ch.mode)}")
         else:
             continue
-        rows += [f"    notify: {n}" for n in t.notify]
+        if ch.action != "chmod":
+            rows += [f"    notify: {n}" for n in t.notify]
         if t.on_change and ch.action != "pending":
             rows.append(f"    run onChange: {t.on_change}")
     rows += [f"  ~ keep {target} (is {reason}; not removed)" for target, reason in p.keep]

@@ -796,6 +796,171 @@ class RestartOnTest(LaunchdTestBase):
                          {watched: None})  # fmt: skip
 
 
+class RestartUnitsTest(LaunchdTestBase):
+    """restartUnits: templates/sops changes owed to a job, as pending units."""
+
+    def run_units(self, raw, units, daemons=None):
+        done = set()
+        ok = launchd.install_launchd(raw, self.state, self.env, units=units, done=done,
+                                     daemons=daemons)  # fmt: skip
+        return ok, done
+
+    def test_loaded_agent_is_kickstarted_once(self):
+        raw = self.cfg({"web": {"command": "srv"}})
+        self.deploy(raw)
+        units = {"org.example.web": ["templates/web"]}
+        self.assertEqual(
+            launchd.diff_launchd(raw, self.state, self.env, units=units),
+            ["  ~ restart user/org.example.web (templates/web changed)"],
+        )
+        self.fake.calls.clear()
+        ok, done = self.run_units(raw, units)
+        self.assertTrue(ok)
+        self.assertEqual(done, {"org.example.web"})
+        self.assertEqual(
+            self.fake.verbs("kickstart"),
+            [["/bin/launchctl", "kickstart", "-k", f"gui/{UID}/org.example.web"]],
+        )
+
+    def test_job_started_this_run_is_not_kickstarted(self):
+        raw = self.cfg({"web": {"command": "srv"}})
+        ok, done = self.run_units(raw, {"org.example.web": ["templates/web"]})
+        self.assertTrue(ok)
+        self.assertEqual(done, {"org.example.web"})
+        self.assertEqual(self.fake.verbs("kickstart"), [])
+        self.assertIn("org.example.web", self.fake.loaded)
+
+    def test_failed_kickstart_stays_pending(self):
+        raw = self.cfg({"web": {"command": "srv"}})
+        self.deploy(raw)
+        self.fake.script[("kickstart", "org.example.web")] = [1]
+        ok, done = self.run_units(raw, {"org.example.web": ["templates/web"]})
+        self.assertFalse(ok)
+        self.assertEqual(done, set())
+
+    def test_restart_on_change_false_still_kickstarts_for_units(self):
+        raw = self.cfg({"web": {"command": "srv", "restartOnChange": False}})
+        self.deploy(raw)
+        raw = self.cfg({"web": {"command": "srv2", "restartOnChange": False}})
+        self.fake.calls.clear()
+        ok, done = self.run_units(raw, {"org.example.web": ["templates/web"]})
+        self.assertTrue(ok)
+        self.assertEqual(done, {"org.example.web"})
+        self.assertEqual(len(self.fake.verbs("kickstart")), 1)
+        self.assertEqual(self.fake.verbs("bootout"), [])
+
+    def test_disabled_agent_has_nothing_to_restart(self):
+        raw = self.cfg({"web": {"command": "srv", "disabled": True}})
+        self.deploy(raw)
+        ok, done = self.run_units(raw, {"org.example.web": ["templates/web"]})
+        self.assertTrue(ok)
+        self.assertEqual(done, {"org.example.web"})
+        self.assertEqual(self.fake.verbs("kickstart"), [])
+
+    def test_daemon_as_user_waits_for_sudo(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}}, root=False)
+        units = {"org.example.dns": ["templates/dnsmasq.conf"]}
+        self.assertEqual(
+            launchd.diff_launchd(raw, self.state, self.env, units=units),
+            [
+                "  ~ restart system/org.example.dns (templates/dnsmasq.conf changed; "
+                "under sudo tools deploy)"
+            ],
+        )
+        with mock.patch.object(launchd, "log") as log:
+            ok, done = self.run_units(raw, units)
+        self.assertTrue(ok)
+        self.assertEqual(done, set())
+        self.assertTrue(any("waits for sudo" in c.args[0] for c in log.call_args_list))
+        self.assertEqual(self.fake.system_calls, [])
+
+    def test_disabled_daemon_as_user_is_not_owed(self):
+        raw = self.cfg(daemons={"dns": {"command": "x", "disabled": True}}, root=False)
+        units = {"org.example.dns": ["templates/x"]}
+        self.assertEqual(launchd.diff_launchd(raw, self.state, self.env, units=units), [])
+        queue = []
+        ok, done = self.run_units(raw, units, daemons=queue)
+        self.assertEqual((ok, done, queue), (True, {"org.example.dns"}, []))
+
+    def test_adopted_job_restart_sets_up_its_logs(self):
+        raw = self.cfg({"web": {"command": "srv"}})
+        self.deploy(raw)
+        self.state = {}
+        with mock.patch.object(launchd, "_ensure_logs", return_value=True) as logs:
+            ok, done = self.run_units(raw, {"org.example.web": ["templates/web"]})
+        self.assertTrue(ok)
+        self.assertEqual(done, {"org.example.web"})
+        logs.assert_called()
+        self.assertEqual(len(self.fake.verbs("kickstart")), 1)
+
+    def test_daemon_as_sudo_child_is_queued_for_root(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}}, root=False)
+        queue = []
+        ok, done = self.run_units(raw, {"org.example.dns": ["templates/x"]}, daemons=queue)
+        self.assertTrue(ok)
+        # Owed until the root parent has restarted it.
+        self.assertEqual((queue, done), (["org.example.dns"], set()))
+        self.assertEqual(self.fake.system_calls, [])
+
+    def test_restart_daemons_as_root(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}, "off": {"command": "x"}})
+        self.assertTrue(self.deploy(raw))
+        self.fake.calls.clear()
+        labels = ["org.example.dns", "org.example.dns", "org.example.nope"]
+        done = set()
+        self.assertTrue(launchd.restart_daemons(raw, labels, self.state, self.env, done=done))
+        self.assertEqual(done, {"org.example.dns", "org.example.nope"})
+        self.assertEqual(
+            self.fake.verbs("kickstart"),
+            [["/bin/launchctl", "kickstart", "-k", "system/org.example.dns"]],
+        )
+
+    def test_failed_daemon_kickstart_stays_owed(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}})
+        self.deploy(raw)
+        self.fake.script[("kickstart", "org.example.dns")] = [1]
+        done = set()
+        with mock.patch.object(launchd, "log"):
+            ok = launchd.restart_daemons(raw, ["org.example.dns"], self.state, self.env, done=done)
+        self.assertFalse(ok)
+        self.assertEqual(done, set())
+
+    def test_restart_daemons_holds_labels_while_config_has_errors(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}})
+        self.deploy(raw)
+        broken = self.cfg(daemons={"dns": {"command": "dnsmasq -k", "bogus": 1}})
+        done = set()
+        with mock.patch.object(launchd, "log"):
+            launchd.restart_daemons(broken, ["org.example.dns"], self.state, self.env, done=done)
+        self.assertEqual(done, set())
+        self.assertEqual(self.fake.verbs("kickstart"), [])
+
+    def test_restart_daemons_skips_untracked_unloaded_and_disabled(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}})
+        self.assertTrue(launchd.restart_daemons(raw, ["org.example.dns"], {}, self.env))
+        self.deploy(raw)
+        del self.fake.loaded["org.example.dns"]
+        self.assertTrue(launchd.restart_daemons(raw, ["org.example.dns"], self.state, self.env))
+        off = self.cfg(daemons={"dns": {"command": "dnsmasq -k", "disabled": True}})
+        self.assertTrue(launchd.restart_daemons(off, ["org.example.dns"], self.state, self.env))
+        self.assertEqual(self.fake.verbs("kickstart"), [])
+
+    def test_restart_daemons_does_nothing_as_user(self):
+        raw = self.cfg(daemons={"dns": {"command": "dnsmasq -k"}}, root=False)
+        self.assertTrue(launchd.restart_daemons(raw, ["org.example.dns"], {}, self.env))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_stale_units(self):
+        raw = self.cfg({"web": {"command": "srv"}})
+        units = {"org.example.web": ["a"], "org.example.gone": ["b"]}
+        with mock.patch.object(launchd, "log"):
+            self.assertEqual(launchd.stale_units(raw, units, self.env), {"org.example.gone"})
+        broken = self.cfg({"web": {"command": "srv"}, "bad": {}})
+        self.assertEqual(launchd.stale_units(broken, units, self.env), set())
+        self.env.is_darwin = False
+        self.assertEqual(launchd.stale_units(raw, units, self.env), set(units))
+
+
 class SystemDomainTest(LaunchdTestBase):
     def daemon(self, root=None, **extra):
         return self.cfg(daemons={"dns": {"command": "dnsmasq -k", **extra}}, root=root)

@@ -330,7 +330,7 @@ sops:
 - One secret's path may not contain another's (`a` vs `a/b`).
 - A whole-file secret (`key: ""`) is decrypted with input and output type set to its `format`, as sops-nix does.
 - An `sshKeyPaths` key that can't be read or converted is skipped with a warning, as in sops-nix. Conversion is done in Python with the same result as `ssh-to-age -private-key` (no external binary); only unencrypted OpenSSH ed25519 keys convert. The converted key is never written to disk.
-- `restartUnits` only prints `notify <unit> (changed: ...)` for now; there's no handler yet.
+- `restartUnits: [launchd:<label>]` restarts that launchd job when the secret's content is rewritten (create, update or replace; a chmod alone does not). See "restartUnits" under launchd. Other unit kinds only print `notify <unit> (changed: ...)`.
 
 ## Templates
 
@@ -360,6 +360,7 @@ templates:
 - An existing file with different content is replaced; one tools did not write, or that changed since, is moved aside first (see Ownership).
 - With an invalid `sops:` section, templates without `path` are errors; there's no fallback to the default directory.
 - Content is masked in diff/deploy output when it uses `${sops:}`, has `secrets: true`, was secret before, or looks like a key.
+- `restartUnits` works as in sops: a rewritten file restarts each `launchd:<label>` job.
 
 ## Ownership (files, sops, templates)
 
@@ -393,7 +394,7 @@ templates:
 | `path` | symlink into the secrets dir | regular file written at `path` | no generation dirs to link into |
 | `sops.placeholder.NAME` | Nix placeholder string | `${sops:NAME}` | no Nix evaluation |
 | Template `content` | text only | text, or YAML data via `format` | services get their native format |
-| `restartUnits` | restarts systemd units | prints a notice (no handler yet) | launchd handler comes later |
+| `restartUnits` | restarts systemd units | `launchd:<label>` restarts that launchd job; other kinds print a notice | launchd instead of systemd |
 | `age.sshKeyPaths` | converted in-process | first readable key passed to `sops` (`SOPS_AGE_SSH_PRIVATE_KEY_FILE`, for `ssh-ed25519` recipients); every unencrypted ed25519 key also converted in-process (as `ssh-to-age`) into `SOPS_AGE_KEY` | `sops` only reads one SSH key, and only for `ssh-ed25519` recipients |
 | Removal | old generations pruned | only tracked, unmodified files | never delete what tools didn't write |
 | Ownership | none | one owner per path; no writes through symlinks | safety |
@@ -683,7 +684,7 @@ launchd:
 | `logDir` | `/tmp/agents/log/launchd` (agents), `/var/log/tools/launchd` (daemons) | logs `<name>.log`, `<name>.error.log`; `stdoutPath`/`stderrPath` override; also settable for the whole section (`launchd.logDir`), a service's own `logDir` wins |
 | `user` / `group` | — | daemons only; or `extraServiceConfig.UserName/GroupName`, not both |
 | `bash` (section) | `/bin/bash` | shell that runs the wrapper; for daemons every path component (symlinks too) and the target must be root-owned, not group/world-writable; the plist gets the resolved target |
-| `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; an unreadable file is logged and not tracked |
+| `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; an unreadable file is logged and not tracked; for sops/templates files use their `restartUnits` (see below) |
 | `restartOnChange` | true | false: write a changed plist but leave the running job |
 | `disabled` | false | keep the plist, `launchctl disable` and boot out |
 | `secrets` | false | plist `0600`, diff suppressed |
@@ -714,6 +715,24 @@ Behaviour:
 - As root every daemon change is a fixed command run directly (`install`, `launchctl`, `rm`, log `mkdir`/`touch`/`chown`) on paths derived from the label or the checked logDir; tools never calls sudo.
 - Unlike nix-config's `/tmp/log`, daemon logs never live under a world- or group-writable directory, so a local user can't redirect root's `mkdir`/`touch`/`chown` or launchd's log opens.
 - A missing daemon `workingDirectory` is created the same root-only way.
+
+### restartUnits
+
+`sops`/`templates` entries name the jobs that read them, as sops-nix's `restartUnits`:
+
+```yaml
+templates:
+  forgejo-app-ini:
+    path: ~/.local/state/tools/secrets/rendered/forgejo-app.ini
+    content: { ... }
+    restartUnits: [launchd:com.example.forgejo]
+```
+
+- A create, update or replace of the file (not a chmod) records the label as owed in the user's state; the launchd section then pays it. Content is compared in memory, so no hash of a secret is stored.
+- Agents: a loaded job is restarted with `kickstart -k`; one this run created, updated, loaded or re-enabled already started with the new file; a disabled one has nothing to restart. A failed kickstart, or a job held by an error, stays owed for the next deploy.
+- Daemons: sops and templates are user-scope, so they change during the user phase of `sudo tools deploy`, after root has handled daemons. The user phase hands the labels to root, which kickstarts each one after it, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
+- A label no configured job has is dropped with a warning (not while the launchd section has errors, or under `--only`).
+- Prefer this to `restartOn` for files sops/templates write: a daemon's `restartOn` hash is read in the root phase, before the user phase rewrites them, so it sees the change one deploy late, and it keeps a hash of secret content in state.
 
 ### Differences from nix-config
 

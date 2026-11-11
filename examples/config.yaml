@@ -99,7 +99,7 @@ sops:
   secrets:
     externalDomain: {} # key defaults to the name
     app/password:
-      restartUnits: [launchd:org.example.app]
+      restartUnits: [launchd:com.example.web] # kickstarted when rewritten
     example-jwt:
       generate: { length: 64, charset: alnum }
 
@@ -113,7 +113,7 @@ templates:
       domain: app.${sops:externalDomain}
       password: ${sops:app/password}
       jwtFile: ${sopsPath:example-jwt}
-    restartUnits: [launchd:org.example.app]
+    restartUnits: [launchd:com.example.web] # kickstarted when rewritten
   example-app-env:
     path: ${appDir}/app.env
     format: env

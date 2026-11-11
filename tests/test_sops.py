@@ -523,6 +523,7 @@ class DecryptTest(SopsTestBase):
         self.assertIn(f"Updated: {path} (secret)", out)
         self.assertEqual(self.read(path), SECRET_VALUE + "-rotated")
         self.assertEqual(self.report.notify, [("launchd:org.example.app", "sops/t")])
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {"org.example.app": ["sops/t"]})
 
     def test_mode_drift_is_chmod(self):
         raw = self.config({"t": {"key": "token"}})

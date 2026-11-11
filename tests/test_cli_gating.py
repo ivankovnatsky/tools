@@ -186,6 +186,104 @@ class DeployGatingTest(unittest.TestCase):
             self.assertFalse(self._deploy({}, state))
 
 
+class RestartUnitsWiringTest(unittest.TestCase):
+    def _deploy(self, config, state, daemons=None):
+        with (
+            mock.patch.object(cli, "env_export_process"),
+            mock.patch.object(cli, "load_json", return_value=state),
+            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
+        ):
+            return cli._deploy(config, "/tmp", ("launchd",), daemons=daemons)
+
+    def test_done_and_stale_units_are_settled(self):
+        state = {"restartUnits": {}}
+        for target, source in (("a", "templates/a"), ("b", "sops/b"), ("gone", "templates/g")):
+            state["restartUnits"]["launchd:" + target] = {"sources": [source], "seq": 1}
+        queue = []
+
+        def fake_install(raw, st, **kw):
+            self.assertEqual(kw["units"], {"a": ["templates/a"], "b": ["sops/b"],
+                                           "gone": ["templates/g"]})  # fmt: skip
+            kw["daemons"].append("b")
+            kw["done"].add("a")
+            return True
+
+        with (
+            mock.patch.object(cli, "install_launchd", side_effect=fake_install),
+            mock.patch.object(cli, "stale_units", return_value={"gone"}) as stale,
+        ):
+            self.assertTrue(self._deploy({}, state, queue))
+        self.assertEqual(stale.call_args.args[1], {"b": ["sops/b"], "gone": ["templates/g"]})
+        self.assertEqual(state["restartUnits"], {"launchd:b": {"sources": ["sops/b"], "seq": 1}})
+        self.assertEqual(queue, [["b", 1]])
+
+    def test_no_launchd_work_and_no_units_skips_launchd(self):
+        with mock.patch.object(cli, "install_launchd") as inst:
+            self.assertTrue(self._deploy({}, {}))
+        inst.assert_not_called()
+
+    def test_root_settles_only_restarted_daemons_in_user_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = os.path.join(tmp, "state.json")
+            entry = {"sources": ["t"], "seq": 2}
+            save_json(state_file, {"restartUnits": {"launchd:a": entry, "launchd:b": entry,
+                                                    "launchd:c": entry}})  # fmt: skip
+            inv = SimpleNamespace(login="me")
+            config = {"stateFile": state_file}
+
+            def restart(raw, labels, state, **kw):
+                self.assertEqual(labels, ["a", "b", "c"])
+                kw["done"].update({"a", "c"})
+                return False
+
+            with (
+                mock.patch.object(cli, "_load_merged_config", return_value=config),
+                mock.patch.object(cli.privilege, "ROOT_STATE_FILE", os.path.join(tmp, "root.json")),
+                mock.patch.object(cli, "restart_daemons", side_effect=restart),
+                mock.patch.object(cli.privilege, "run_as_user", side_effect=lambda _inv, fn: fn()),
+            ):
+                # c was owed again (seq 2) after it was queued at seq 1.
+                queued = [["a", 2], ["b", 2], ["c", 1]]
+                self.assertFalse(cli._restart_daemons(inv, ["."], queued))
+            self.assertEqual(
+                cli.load_json(state_file)["restartUnits"],
+                {"launchd:b": entry, "launchd:c": entry},
+            )
+
+    def read(self, payload: bytes):
+        r, w = os.pipe()
+        os.write(w, payload)
+        os.close(w)
+        out, daemons = [], []
+        try:
+            with mock.patch.object(cli, "log"):
+                cli._read_restarts(r, out, daemons)
+        finally:
+            os.close(r)
+        return out, daemons
+
+    def test_restart_payload_carries_processes_and_daemons(self):
+        self.assertEqual(
+            self.read(b'{"processes": ["Dock"], "daemons": [["org.example.dns", 3]]}'),
+            (["Dock"], [["org.example.dns", 3]]),
+        )
+        self.assertEqual(self.read(b""), ([], []))
+
+    def test_restart_payload_with_bad_label_or_shape_is_dropped(self):
+        for bad in (
+            b'{"processes": [], "daemons": [["../x", 1]]}',
+            b'{"processes": [], "daemons": [["org.example.dns", "1"]]}',
+            b'{"processes": [], "daemons": ["org.example.dns"]}',
+            b'{"processes": [], "daemons": "org.example.dns"}',
+            b'{"processes": ["-x"], "daemons": []}',
+            b'["Dock"]',
+            b"nope",
+        ):
+            self.assertEqual(self.read(bad), ([], []), bad)
+
+
 class SkillsGatingTest(unittest.TestCase):
     def _deploy(self, config, state):
         with (

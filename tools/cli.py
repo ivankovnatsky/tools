@@ -43,7 +43,13 @@ from tools.user.flatpak import install_flatpak_packages
 from tools.user.git_repos import install_git_repos
 from tools.user.go import install_go_packages
 from tools.user.launchd import has_work as launchd_has_work
-from tools.user.launchd import install_launchd, status_rows
+from tools.user.launchd import (
+    install_launchd,
+    restart_daemons,
+    stale_units,
+    status_rows,
+    valid_label,
+)
 from tools.user.links import has_work as links_has_work
 from tools.user.links import install_links
 from tools.user.links import resolve as links_resolve
@@ -175,18 +181,25 @@ def _user_diff(config_paths: list[str], scope: tuple[str, ...], only=None) -> in
 def _user_deploy(
     config_paths: list[str], scope: tuple[str, ...], update: bool, restarts_fd: int, only=None
 ) -> int:
-    """`tools deploy --approve` as the user; its process restarts go to restarts_fd as
-    JSON for the root parent to run instead."""
+    """`tools deploy --approve` as the user; its process restarts and the daemons its
+    restartUnits owe go to restarts_fd as JSON for the root parent to run instead."""
     restarts: list = []
+    daemons: list = []
     try:
         merged = _load_merged_config(config_paths)
         _check_only(merged, config_paths, only)
         ok = _deploy(
-            merged, _resolve_config_dir(config_paths), scope, update, restarts=restarts, only=only
+            merged,
+            _resolve_config_dir(config_paths),
+            scope,
+            update,
+            restarts=restarts,
+            only=only,
+            daemons=daemons,
         )
         return 0 if ok else 1
     finally:
-        data = json.dumps(restarts).encode()
+        data = json.dumps({"processes": restarts, "daemons": daemons}).encode()
         while data:
             data = data[os.write(restarts_fd, data) :]
 
@@ -194,10 +207,11 @@ def _user_deploy(
 MAX_RESTARTS_PAYLOAD = 64 * 1024
 
 
-def _read_restarts(fd: int, out: list) -> None:
-    """The user child's restart queue from fd into out. Drains to EOF so the child never
-    blocks on a full pipe; an oversized or malformed payload, or a name killall must not
-    see, yields nothing from the child."""
+def _read_restarts(fd: int, out: list, daemons: list | None = None) -> None:
+    """The user child's restart queues from fd: processes into out, launchd daemon labels
+    into daemons. Drains to EOF so the child never blocks on a full pipe; an oversized or
+    malformed payload, a name killall must not see, or an invalid label yields nothing
+    from the child."""
     data = bytearray()
     oversized = False
     while chunk := os.read(fd, 65536):
@@ -208,14 +222,27 @@ def _read_restarts(fd: int, out: list) -> None:
         log("User restart queue too large; ignoring it", Color.YELLOW)
         return
     try:
-        restarts = json.loads(bytes(data) or b"[]")
+        payload = json.loads(bytes(data) or b"{}")
     except ValueError:
         log("User restart queue is malformed; ignoring it", Color.YELLOW)
         return
+    if not isinstance(payload, dict):
+        log("User restart queue is malformed; ignoring it", Color.YELLOW)
+        return
+    restarts = payload.get("processes", [])
+    labels = payload.get("daemons", [])
     if not isinstance(restarts, list) or any(process_name_error(p) for p in restarts):
         log("User restart queue has invalid process names; ignoring it", Color.YELLOW)
         return
+    if not isinstance(labels, list) or not all(
+        isinstance(item, list) and len(item) == 2 and valid_label(item[0]) and type(item[1]) is int
+        for item in labels
+    ):
+        log("User restart queue has invalid launchd labels; ignoring it", Color.YELLOW)
+        return
     out += restarts
+    if daemons is not None:
+        daemons += labels
 
 
 def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple, only=None) -> bool:
@@ -259,6 +286,7 @@ def _sudo_deploy(
         _confirm()
     system = _system_scope(scope)
     restarts: list = []
+    daemons: list = []
     try:
         if system:
             merged = _load_merged_config(config_paths)
@@ -269,7 +297,9 @@ def _sudo_deploy(
                 sys.exit(1)
         r, w = os.pipe()
         child_restarts: list = []
-        reader = threading.Thread(target=_read_restarts, args=(r, child_restarts), daemon=True)
+        reader = threading.Thread(
+            target=_read_restarts, args=(r, child_restarts, daemons), daemon=True
+        )
         reader.start()
         try:
             rc = privilege.run_as_user(
@@ -284,6 +314,42 @@ def _sudo_deploy(
             sys.exit(1)
     finally:
         run_restarts(list(dict.fromkeys(restarts)))
+        if daemons and not _restart_daemons(inv, config_paths, daemons):
+            sys.exit(1)
+
+
+def _restart_daemons(inv: privilege.Invoker, config_paths: list[str], queued: list) -> bool:
+    """Kickstart, as root, the daemons whose restartUnits sources the user phase rewrote
+    (`queued`: [label, seq] pairs), then clear those it handled from the user's state,
+    unless re-owed since (seq changed); the rest stay owed."""
+    seqs = {label: seq for label, seq in queued}
+    merged = _load_merged_config(config_paths)
+    with state_lock(privilege.ROOT_STATE_FILE):
+        state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+    done: set = set()
+    ok = restart_daemons(
+        merged.get("launchd"),
+        list(seqs),
+        state,
+        **sops_section.secrets_dir_kwargs(merged.get("sops")),
+        done=done,
+    )
+    settled = {label: seqs[label] for label in done}
+    if settled and privilege.run_as_user(inv, lambda: _settle_restarts(config_paths, settled)) != 0:
+        log(f"Could not record daemon restarts in {inv.login}'s state", Color.RED)
+        ok = False
+    return ok
+
+
+def _settle_restarts(config_paths: list[str], done: dict) -> int:
+    """As the user: drop restartUnits the root parent carried out from the user's state."""
+    merged = _load_merged_config(config_paths)
+    state_file = os.path.expanduser(merged.get("stateFile") or "~/.local/state/tools/state.json")
+    with state_lock(state_file):
+        state = migrate_state_schema(load_json(state_file))
+        secrets_flow.settle_restarts(state, done)
+        save_json(state_file, state)
+    return 0
 
 
 def _confirm() -> None:
@@ -307,12 +373,15 @@ def _deploy(
     root: bool = False,
     restarts: list | None = None,
     only: selection.Only | None = None,
+    daemons: list | None = None,
 ) -> bool:
     """Apply config to bring system to desired state. Returns True on success.
 
     Already-installed items are only upgraded (pulled, refetched) with ``update``.
     As root (``root``) only system sections run, against the root-owned state file.
     With ``restarts``, queued process restarts are added there instead of run.
+    With ``daemons``, launchd daemons owed a restartUnits restart are added there for the
+    root parent; without it they stay pending.
     """
     if root:
         state_file = privilege.ROOT_STATE_FILE
@@ -325,7 +394,9 @@ def _deploy(
     # Overlapping runs (watch, scheduled and manual deploys) would otherwise
     # each save their own copy and drop the other's records.
     with state_lock(state_file):
-        return _deploy_locked(config, config_dir, state_file, scope, update, root, restarts, only)
+        return _deploy_locked(
+            config, config_dir, state_file, scope, update, root, restarts, only, daemons
+        )
 
 
 def _deploy_locked(
@@ -337,6 +408,7 @@ def _deploy_locked(
     root: bool,
     restarts: list | None = None,
     only: selection.Only | None = None,
+    daemons: list | None = None,
 ) -> bool:
     if not root:
         migrate_state_file(state_file)
@@ -384,6 +456,7 @@ def _deploy_locked(
                     restarts,
                     full_config=config,
                     view=view,
+                    daemons=daemons,
                 )
         finally:
             if view:
@@ -443,6 +516,7 @@ def _run_sections(
     deferred: list | None = None,
     full_config: dict | None = None,
     view: selection.View | None = None,
+    daemons: list | None = None,
 ) -> bool:
     """With --only, ``config`` is the narrowed config and ``view`` holds the state records
     set aside; ownership is still judged on ``full_config`` and the whole state."""
@@ -623,12 +697,28 @@ def _run_sections(
         success &= install_settingsctl(config.get("settingsctl"))
 
     # After files, so restartOn hashes see files written in this run.
-    if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+    units = secrets_flow.pending_restarts(state)
+    if "launchd" in active and (launchd_has_work(config.get("launchd"), state) or units):
+        done: set = set()
+        queued: list = []
         success &= install_launchd(
             config.get("launchd"),
             state,
             **sops_section.secrets_dir_kwargs(config.get("sops")),
+            units=units,
+            done=done,
+            daemons=None if daemons is None else queued,
         )
+        seqs = secrets_flow.pending_seqs(state)
+        if daemons is not None:
+            daemons += [[label, seqs[label]] for label in queued if label in seqs]
+        if not view:
+            done |= stale_units(
+                config.get("launchd"),
+                {k: v for k, v in units.items() if k not in done},
+                **sops_section.secrets_dir_kwargs(config.get("sops")),
+            )
+        secrets_flow.settle_restarts(state, done)
 
     # Talks to service APIs; gated so an absent section makes no network calls.
     if "mgmt" in active and mgmt_has_work(config.get("mgmt")):

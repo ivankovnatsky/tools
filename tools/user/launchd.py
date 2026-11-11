@@ -1443,6 +1443,7 @@ class Item:
     tracked: Optional[Dict] = None
     loaded: Optional[bool] = None
     changed_files: List[str] = field(default_factory=list)
+    units: List[str] = field(default_factory=list)  # restartUnits sources that changed
     fix_perms: bool = False  # chmod/chown the plist in place (adopted, or mode drifted)
     owned_logs: Optional[List[str]] = None  # log files tools may re-own; see _ensure_logs
     mode_wrong: bool = False
@@ -1469,6 +1470,8 @@ class Plan:
     blocked: List[Tuple[str, str]] = field(default_factory=list)  # (label, reason)
     remove: List[Tuple[str, Dict]] = field(default_factory=list)
     forget: List[Tuple[str, Dict, str]] = field(default_factory=list)
+    # restartUnits labels apply restarted, or found nothing to restart (disabled, fresh start)
+    units_done: set = field(default_factory=set)
 
 
 def _plist_mode(svc: Service) -> int:
@@ -1548,7 +1551,17 @@ def _shared_logs(services: List[Service], settings: Settings, env: Env) -> Dict[
     return clash
 
 
-def plan(settings: Settings, services: List[Service], state: Dict, env: Env, errors=()) -> Plan:
+def plan(
+    settings: Settings,
+    services: List[Service],
+    state: Dict,
+    env: Env,
+    errors=(),
+    units: Optional[Dict[str, List[str]]] = None,
+) -> Plan:
+    """`units`: label -> restartUnits sources (templates/sops) that changed since the
+    job last started; such a job is restarted like a restartOn change."""
+    units = units or {}
     p = Plan(errors=list(errors))
     if settings.errors:
         # A broken section (e.g. a `logDir` typo) could change every job: hold them all.
@@ -1608,6 +1621,7 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             hash=hashlib.sha256(data).hexdigest(),
             restart_hashes=_file_hashes(svc.restart_on, svc.domain, env),
             tracked=tracked.get(svc.label),
+            units=list(units.get(svc.label) or []),
         )
         exists, current, readable = read_current(path, svc.domain, env)
         if not readable:
@@ -1679,7 +1693,7 @@ def plan(settings: Settings, services: List[Service], state: Dict, env: Env, err
             target = p.unload
         elif not svc.disabled and not item.loaded:
             target = p.load
-        elif not svc.disabled and item.changed_files:
+        elif not svc.disabled and (item.changed_files or item.units):
             target = p.restart
         if target is None:
             (p.adopt if adopting else p.ok).append(item)
@@ -1866,8 +1880,8 @@ def _activate(item: Item, env: Env, new: bool) -> Tuple[Optional[str], bool]:
         and not svc.restart_on_change
         and status(svc.label, svc.domain, env).loaded
     ):
-        if item.changed_files:
-            # restartOn is its own trigger; restartOnChange only covers plist edits.
+        if item.changed_files or item.units:
+            # restartOn/restartUnits trigger on their own; restartOnChange covers plist edits.
             return (None if kickstart(svc.label, svc.domain, env) else "kickstart"), False
         log(f"launchd: {svc.label} plist updated; running job left as is", Color.YELLOW)
         return None, False
@@ -2044,6 +2058,8 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
     for items, write, new, verb in steps:
         for item in items:
             result = _converge(item, settings, env, services, write, new)
+            if result:
+                p.units_done.add(item.svc.label)
             if result == _STOPPED:
                 log(f"Stopped launchd job: {item.svc.label} (log dir not root-only)", Color.YELLOW)
             elif result:
@@ -2053,6 +2069,7 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
 
     for item in p.stop:
         if _stop(item, env, services):
+            p.units_done.add(item.svc.label)
             log(f"Disabled launchd job: {item.svc.label} (nothing written)", Color.YELLOW)
         else:
             success = False
@@ -2060,22 +2077,28 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
     for item in p.adopt:
         if _ensure_logs(item, settings, env) and _fix_perms(item, env):
             _record(services, item)
+            if item.svc.disabled:
+                p.units_done.add(item.svc.label)
         else:
             success = False
 
     for item in p.restart:
-        ok = (not item.fix_perms or _fix_perms(item, env)) and kickstart(
-            item.svc.label, item.svc.domain, env
+        # An adopted job (restartUnits only) gets its logs set up as in p.adopt.
+        adopting = (item.tracked or {}).get("hash") is None
+        ok = (
+            (not adopting or _ensure_logs(item, settings, env))
+            and (not item.fix_perms or _fix_perms(item, env))
+            and kickstart(item.svc.label, item.svc.domain, env)
         )
         success &= ok
         if ok:
             _record(services, item)
-            log(
-                f"Restarted {item.svc.label}: {', '.join(item.changed_files)} changed",
-                Color.GREEN,
-            )
+            p.units_done.add(item.svc.label)
+            log(f"Restarted {item.svc.label}: {_why(item)} changed", Color.GREEN)
 
     for item in p.ok:
+        if item.svc.disabled:
+            p.units_done.add(item.svc.label)
         # Logs again: a volume may have mounted since the last run.
         if not _ensure_logs(item, settings, env):
             success = False
@@ -2086,6 +2109,10 @@ def _apply(settings: Settings, p: Plan, env: Env, services: Dict) -> bool:
         # Refresh restartOn hashes (e.g. a newly listed file) without restarting.
         _record(services, item)
     return success
+
+
+def _why(item: Item) -> str:
+    return ", ".join(item.changed_files + item.units)
 
 
 # --------------------------------------------------------------------------
@@ -2108,14 +2135,45 @@ def _note_unmanaged(services: List[Service], env: Env) -> None:
         )
 
 
+def _other_domain_units(
+    services: List[Service], units: Dict[str, List[str]], env: Env, daemons: Optional[List[str]]
+) -> set:
+    """restartUnits for daemons, seen as the user: queued in `daemons` for the root parent
+    under sudo, otherwise left with a note for a `sudo tools deploy`. Either way they stay
+    pending; the parent settles the ones it restarted. Returns disabled ones: nothing to
+    restart."""
+    disabled = set()
+    for svc in services:
+        if can_change(svc.domain, env) or svc.label not in units:
+            continue
+        if svc.disabled:
+            disabled.add(svc.label)
+        elif daemons is not None:
+            daemons.append(svc.label)
+        else:
+            log(
+                f"launchd: restart {svc.domain}/{svc.label} "
+                f"({', '.join(units[svc.label])} changed) waits for sudo tools deploy",
+                Color.YELLOW,
+            )
+    return disabled
+
+
 def install_launchd(
     raw,
     state: Dict,
     env: Optional[Env] = None,
     secrets_dir: Optional[str] = None,
     secrets_dir_error: Optional[str] = None,
+    units: Optional[Dict[str, List[str]]] = None,
+    done: Optional[set] = None,
+    daemons: Optional[List[str]] = None,
 ) -> bool:
+    """`units`: pending restartUnits (label -> changed sources). Labels restarted, or with
+    nothing to restart, are added to `done`. As the user, daemon labels also go to
+    `daemons` when given, for the sudo parent to restart."""
     env = env or Env()
+    units = units or {}
     if not env.is_darwin:
         log("launchd: skipping, not macOS", Color.YELLOW)
         return True
@@ -2131,8 +2189,11 @@ def install_launchd(
         raw, env.home, env.login, secrets_dir, secrets_dir_error
     )
     _note_unmanaged(services, env)
-    p = plan(settings, services, state, env, errors)
+    p = plan(settings, services, state, env, errors, units)
     ok = apply(settings, p, state, env)
+    disabled = _other_domain_units(services, units, env, daemons) if not env.root else set()
+    if done is not None:
+        done |= (p.units_done & set(units)) | disabled
     work = (
         p.create,
         p.update,
@@ -2147,6 +2208,78 @@ def install_launchd(
     )
     if not any(work):
         debug("All launchd jobs up to date", Color.BLUE)
+    return ok
+
+
+def stale_units(
+    raw,
+    units: Dict[str, List[str]],
+    env: Optional[Env] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
+) -> set:
+    """Pending restartUnits labels no configured job has, to drop; none while the section
+    has errors (a broken job only looks unconfigured). Off macOS, all of them."""
+    env = env or Env()
+    if not units:
+        return set()
+    if not env.is_darwin:
+        return set(units)
+    _settings, services, errors = parse_launchd(
+        raw, env.home, env.login, secrets_dir, secrets_dir_error
+    )
+    if errors:
+        return set()
+    stale = set(units) - {s.label for s in services}
+    for label in sorted(stale):
+        log(f"launchd: restartUnits: no job {label} configured; dropped", Color.YELLOW)
+    return stale
+
+
+def restart_daemons(
+    raw,
+    labels: List[str],
+    state: Dict,
+    env: Optional[Env] = None,
+    secrets_dir: Optional[str] = None,
+    secrets_dir_error: Optional[str] = None,
+    done: Optional[set] = None,
+) -> bool:
+    """As root, after the user phase of `sudo tools deploy`: kickstart the daemons whose
+    restartUnits sources the user phase rewrote. Only configured, enabled daemons whose
+    plist tools wrote and activated; a job that is not loaded starts with the new files.
+    Labels restarted, or with nothing to restart, are added to `done`."""
+    env = env or Env()
+    done = set() if done is None else done
+    if not labels or not env.is_darwin or not env.root:
+        return True
+    _settings, services, errors = parse_launchd(
+        raw, env.home, env.login, secrets_dir, secrets_dir_error
+    )
+    daemons = {s.label: s for s in services if s.domain == "system"}
+    tracked = _tracked(state)
+    ok = True
+    for label in dict.fromkeys(labels):
+        svc = daemons.get(label)
+        entry = tracked.get(label) or {}
+        if svc is None and errors:
+            log(f"launchd: restartUnits: {label} held: launchd config has errors", Color.YELLOW)
+            continue
+        if svc is None or svc.disabled:
+            debug(f"launchd: restartUnits: {label} is not an enabled daemon; skipped")
+            done.add(label)
+            continue
+        if entry.get("hash") is None or entry.get("pending"):
+            log(f"launchd: restartUnits: {label} is not activated by tools; skipped", Color.YELLOW)
+            continue
+        if not status(label, "system", env).loaded:
+            done.add(label)
+            continue
+        if kickstart(label, "system", env):
+            done.add(label)
+            log(f"Restarted {label}: restartUnits changed", Color.GREEN)
+        else:
+            ok = False
     return ok
 
 
@@ -2165,8 +2298,10 @@ def diff_launchd(
     env: Optional[Env] = None,
     secrets_dir: Optional[str] = None,
     secrets_dir_error: Optional[str] = None,
+    units: Optional[Dict[str, List[str]]] = None,
 ) -> List[str]:
     env = env or Env()
+    units = units or {}
     if not env.is_darwin:
         return []
     refusal = mode_error(env) or state_error(state)
@@ -2176,7 +2311,7 @@ def diff_launchd(
         raw, env.home, env.login, secrets_dir, secrets_dir_error
     )
     _note_unmanaged(services, env)
-    p = plan(settings, services, state, env, errors)
+    p = plan(settings, services, state, env, errors, units)
 
     def name(item_or_label, domain=None) -> str:
         if isinstance(item_or_label, Item):
@@ -2205,8 +2340,8 @@ def diff_launchd(
         note = ""
         if not item.svc.restart_on_change and not item.svc.disabled:
             note = " (running job not restarted: restartOnChange is false)"
-            if item.changed_files:
-                note = f" (kickstart: {', '.join(item.changed_files)} changed)"
+            if item.changed_files or item.units:
+                note = f" (kickstart: {_why(item)} changed)"
         changes.append(f"  ~ update {name(item)}{note}")
         changes += _plist_diff(item)
     changes += [f"  ~ disable {name(i)}" for i in p.disable]
@@ -2214,8 +2349,15 @@ def diff_launchd(
     changes += [f"  ~ disable {name(i)} (bootout only; nothing written)" for i in p.stop]
     changes += [f"  ~ enable {name(i)}" for i in p.enable]
     changes += [f"  ~ load {name(i)} (not loaded)" for i in p.load]
-    changes += [f"  ~ restart {name(i)} ({', '.join(i.changed_files)} changed)" for i in p.restart]
+    changes += [f"  ~ restart {name(i)} ({_why(i)} changed)" for i in p.restart]
     changes += [f"  ~ retry {name(i)} (last activation failed)" for i in p.retry]
+    if not env.root:
+        changes += [
+            f"  ~ restart {name(s.label, s.domain)} ({', '.join(units[s.label])} changed; "
+            "under sudo tools deploy)"
+            for s in services
+            if not can_change(s.domain, env) and s.label in units and not s.disabled
+        ]
     changes += [
         f"  ~ chmod {name(i)} -> {_plist_mode(i.svc):04o}"
         for lst in (p.ok, p.adopt, p.load, p.unload, p.enable, p.disable, p.restart, p.retry)

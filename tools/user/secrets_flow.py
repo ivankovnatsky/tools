@@ -476,7 +476,9 @@ def deploy_sops(
     _merge(report, "sops", [s.name for s in res.changed], phase)
     failed = tuple(res.failed)
     report.failed_secrets = report.failed_secrets + failed if phase == LATE else failed
-    report.notify += [(n, f"sops/{s.name}") for s in res.changed for n in s.notify]
+    notify = [(n, f"sops/{s.name}") for s in res.rewritten for n in s.notify]
+    report.notify += notify
+    add_pending_restarts(state, notify)
     return res.success
 
 
@@ -512,7 +514,10 @@ def deploy_templates(
     res = templates.apply(p, installed, parsed_sops.secrets_dir()[0], _private_dirs(state))
     state.setdefault("templates", {})["installed"] = installed
     _merge(report, "templates", [t.name for t in res.changed], phase)
-    report.notify += [(n, f"templates/{t.name}") for t in res.changed for n in t.notify]
+    notify = [(n, f"templates/{t.name}") for t in res.rewritten for n in t.notify]
+    report.notify += notify
+    # In state at once, so a later failure or an interrupt still restarts them next run.
+    add_pending_restarts(state, notify)
     # In state at once, so a later phase failing or an interrupt still retries them.
     util.add_pending_hooks(
         state, "templates", {t.on_change: [t.target] for t in res.changed if t.on_change}
@@ -627,7 +632,78 @@ def files_targets(entries, config_dir: str) -> List[str]:
     return [e.target for e in resolved]
 
 
+LAUNCHD_UNIT = "launchd:"
+RESTARTS_KEY = "restartUnits"
+
+
+def add_pending_restarts(state: Dict, notify: List[Tuple[str, str]]) -> None:
+    """Record `launchd:` restartUnits targets as owed until the launchd section restarts them.
+    Each record bumps the target's `seq`, so a settle for an older request leaves it owed."""
+    for target, source in notify:
+        if not target.startswith(LAUNCHD_UNIT):
+            continue
+        pending = state.get(RESTARTS_KEY)
+        if not isinstance(pending, dict):
+            pending = state[RESTARTS_KEY] = {}
+        entry = pending.get(target)
+        if not _valid_entry(entry):
+            entry = pending[target] = {"sources": [], "seq": 0}
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+        entry["seq"] += 1
+
+
+def _valid_entry(entry) -> bool:
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("sources"), list)
+        and type(entry.get("seq")) is int
+    )
+
+
+def _pending_entries(state: Dict) -> Dict[str, Dict]:
+    pending = state.get(RESTARTS_KEY)
+    if not isinstance(pending, dict):
+        return {}
+    return {
+        target[len(LAUNCHD_UNIT) :]: entry
+        for target, entry in pending.items()
+        if isinstance(target, str) and target.startswith(LAUNCHD_UNIT) and _valid_entry(entry)
+    }
+
+
+def pending_restarts(state: Dict) -> Dict[str, List[str]]:
+    """Owed launchd restarts: label -> sources whose change triggered them."""
+    return {
+        label: [s for s in entry["sources"] if isinstance(s, str)]
+        for label, entry in _pending_entries(state).items()
+    }
+
+
+def pending_seqs(state: Dict) -> Dict[str, int]:
+    """label -> seq of its owed restart, to settle exactly that request later."""
+    return {label: entry["seq"] for label, entry in _pending_entries(state).items()}
+
+
+def settle_restarts(state: Dict, done) -> None:
+    """Drop restarts carried out (or with nothing to restart). `done` is a set of labels,
+    or a mapping label -> seq that drops a label only while its seq is unchanged."""
+    pending = state.get(RESTARTS_KEY)
+    if not isinstance(pending, dict):
+        state.pop(RESTARTS_KEY, None)
+        return
+    seqs = pending_seqs(state)
+    for label in done:
+        if isinstance(done, dict) and seqs.get(label) != done[label]:
+            continue
+        pending.pop(LAUNCHD_UNIT + label, None)
+    if not pending:
+        state.pop(RESTARTS_KEY, None)
+
+
 def format_notify(report: RunReport) -> List[str]:
     return [
-        f"notify {target} (changed: {source}); no handler yet" for target, source in report.notify
+        f"notify {target} (changed: {source}); no handler yet"
+        for target, source in report.notify
+        if not target.startswith(LAUNCHD_UNIT)
     ]
