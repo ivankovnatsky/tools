@@ -102,6 +102,20 @@
           '';
         });
 
+        checks.settingsctl =
+          pkgs.runCommand "settingsctl-tests"
+            {
+              nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.click ])) ];
+              src = (import ./packages/cleanPythonSource.nix { inherit lib; }) ./packages/settingsctl;
+            }
+            ''
+              cp -r "$src" settingsctl
+              chmod -R u+w settingsctl
+              cd settingsctl
+              python -m unittest discover -s tests -v
+              touch "$out"
+            '';
+
         devShells.default = pkgs.mkShell {
           buildInputs = [
             (pkgs.python3.withPackages pythonPackages)

@@ -133,3 +133,25 @@ def _get_state_dir() -> Path:
     d = home / ".local" / "state" / "settings"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+    """Run cmd; (exit code, stdout, stderr). A missing binary is exit 127."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    return result.returncode, result.stdout, result.stderr
+
+
+def is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def require_root(what: str) -> None:
+    """Exit 1 with a clear message unless running as root."""
+    if not is_root():
+        import sys
+
+        print(f"Error: {what} needs root; run with sudo", file=sys.stderr)
+        raise SystemExit(1)

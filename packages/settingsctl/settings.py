@@ -19,6 +19,11 @@ Subcommands:
   cpufreq     Get or cap CPU max frequency (Linux only)
   autovolume  Probe audio activity (macOS + Linux)
   daemon      Long-running settings agent (macOS + Linux)
+  hostname    Get or set HostName/LocalHostName/ComputerName (macOS only)
+  timezone    Get or set the time zone (macOS only)
+  sleep       Get or set computer/display/disk sleep timers (macOS only)
+  remotelogin Get or set Remote Login (SSH server) (macOS only)
+  defaultbrowser Get or set the default browser (macOS only)
 """
 
 import click
@@ -33,15 +38,20 @@ import awake
 import battery
 import cpufreq
 import daemon
+import defaultbrowser
 import dock
 import fulldiskaccess
+import hostname
 import location
 import login
 import menubar
+import remotelogin
 import turnoff
 import scaling
 import scrolling
+import sleep
 import spaces
+import timezone
 import volume
 import windows
 
@@ -63,15 +73,20 @@ awake.register(cli)
 battery.register(cli)
 cpufreq.register(cli)
 daemon.register(cli)
+defaultbrowser.register(cli)
 dock.register(cli)
 fulldiskaccess.register(cli)
+hostname.register(cli)
 location.register(cli)
 login.register(cli)
 menubar.register(cli)
+remotelogin.register(cli)
 turnoff.register(cli)
 scaling.register(cli)
 scrolling.register(cli)
+sleep.register(cli)
 spaces.register(cli)
+timezone.register(cli)
 volume.register(cli)
 windows.register(cli)
 
