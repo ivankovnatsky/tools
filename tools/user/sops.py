@@ -4,7 +4,6 @@ Input is plain, already-resolved data (see ``parse_sops``)::
 
     {
       "binary": None,                     # else `sops` from PATH
-      "sshToAgeBinary": None,             # else `ssh-to-age` from PATH
       "age": {"keyFile": "...", "sshKeyPaths": ["..."]},
       "secretsDir": "~/.local/state/tools/secrets",
       "defaultSopsFile": "/abs/secrets.yaml",
@@ -38,6 +37,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 from tools import fsutil
 from tools.log import Color, debug, log
 from tools.placeholders import PlaceholderError
+from tools.user import ssh_age
 
 DEFAULT_SECRETS_DIR = "~/.local/state/tools/secrets"
 DEFAULT_MODE = 0o400
@@ -62,7 +62,6 @@ _SECRET_KEYS = {
 }
 _TOP_KEYS = {
     "binary",
-    "sshToAgeBinary",
     "age",
     "secretsDir",
     "defaultSopsFile",
@@ -103,7 +102,6 @@ class Secret:
 @dataclass(frozen=True)
 class Settings:
     binary: Optional[str] = None
-    ssh_to_age_binary: Optional[str] = None
     age_key_file: Optional[str] = None
     age_ssh_key_files: Tuple[str, ...] = ()
     secrets_dir: str = field(default_factory=lambda: os.path.expanduser(DEFAULT_SECRETS_DIR))
@@ -203,7 +201,6 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
             raise ValueError(f"sops.defaultSopsFormat must be one of {', '.join(FORMATS)}")
         settings = Settings(
             binary=_path_field(raw, "binary", "sops"),
-            ssh_to_age_binary=_path_field(raw, "sshToAgeBinary", "sops"),
             age_key_file=_path_field(age, "keyFile", "sops.age"),
             age_ssh_key_files=ssh_keys,
             secrets_dir=_path_field(raw, "secretsDir", "sops") or _expand(DEFAULT_SECRETS_DIR),
@@ -364,35 +361,23 @@ class Decryptor:
         return binary
 
     def _convert_ssh_keys(self) -> List[str]:
-        """age identities from ``sshKeyPaths`` via ``ssh-to-age``, as sops-nix
-        converts them; kept in memory and handed to sops as SOPS_AGE_KEY.
+        """age identities from ``sshKeyPaths``, converted in-process the way
+        ``ssh-to-age`` does for sops-nix; kept in memory and handed to sops as
+        SOPS_AGE_KEY.
 
         Like sops-nix, a key that cannot be read or converted is skipped.
         """
-        paths = [p for p in self._settings.age_ssh_key_files if self._usable_ssh_key(p)]
-        if not paths:
-            return []
-        tool = self._settings.ssh_to_age_binary or self._which("ssh-to-age")
-        if not tool:
-            log(
-                "sops: ssh-to-age not found on PATH (set sops.sshToAgeBinary); "
-                "sshKeyPaths are not converted to age keys",
-                Color.YELLOW,
-            )
-            return []
         keys = []
-        for path in paths:
+        for path in self._settings.age_ssh_key_files:
+            if not self._usable_ssh_key(path):
+                continue
             try:
-                rc, out, err = self._runner([tool, "-private-key", "-i", path], self._env)
+                with open(path, "rb") as f:
+                    keys.append(ssh_age.private_key_to_age(f.read()))
             except OSError as e:
+                log(f"sops: cannot read ssh key {path}: {e.strerror or e}", Color.YELLOW)
+            except ssh_age.ConvertError as e:
                 log(f"sops: cannot convert ssh key {path}: {e}", Color.YELLOW)
-                continue
-            key = out.decode("utf-8", "replace").strip()
-            if rc != 0 or not key.startswith("AGE-SECRET-KEY-") or "\n" in key:
-                last = (err or "").strip().splitlines()[-1:] or [f"exit {rc}"]
-                log(f"sops: cannot convert ssh key {path}: {last[0][:200]}", Color.YELLOW)
-                continue
-            keys.append(key)
         return keys
 
     def _usable_ssh_key(self, path: str) -> bool:

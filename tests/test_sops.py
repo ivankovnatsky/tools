@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import ssh_keys
+
 from tools import fsutil
 from tools.placeholders import PlaceholderError
 from tools.user import secrets_flow, sops
@@ -38,22 +40,15 @@ def aside(path, reason):
 
 
 class FakeSops:
-    """Stands in for the sops and ssh-to-age binaries: {file: decrypted document}."""
-
-    AGE_KEY = "AGE-SECRET-KEY-1FAKEFAKEFAKE"
+    """Stands in for the sops binary: {file: decrypted document}."""
 
     def __init__(self, docs, fail=()):
         self.docs = docs
         self.fail = set(fail)
         self.calls = []
-        self.ssh_fail = False
 
     def __call__(self, cmd, env):
         self.calls.append((list(cmd), dict(env)))
-        if cmd[0].endswith("ssh-to-age"):
-            if self.ssh_fail:
-                return 1, b"", "failed to convert: unsupported key type\n"
-            return 0, (self.AGE_KEY + "\n").encode(), ""
         path = cmd[-1]
         if path in self.fail:
             return 128, b"", "Failed to get the data key required to decrypt the SOPS file.\n"
@@ -945,25 +940,26 @@ class FixesTest(SopsTestBase):
             cmd[1:6], ["--decrypt", "--input-type", "binary", "--output-type", "binary"]
         )
 
-    def test_ssh_key_converted_with_ssh_to_age(self):
-        key = os.path.join(self.tmp, "id_ed25519")
-        with open(key, "w") as f:
-            f.write("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n")
+    def write_ssh_key(self, name="id_ed25519", data=None):
+        key = os.path.join(self.tmp, name)
+        with open(key, "wb") as f:
+            f.write(ssh_keys.openssh_key() if data is None else data)
+        return key
+
+    def test_ssh_key_converted_in_process(self):
+        key = self.write_ssh_key()
         raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
         ok, out = self.deploy(raw)
         self.assertTrue(ok, out)
-        conv = [c for c, _e in self.fake.calls if c[0].endswith("ssh-to-age")]
-        self.assertEqual(conv, [["/fake/bin/ssh-to-age", "-private-key", "-i", key]])
-        sops_env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual([c[0] for c, _e in self.fake.calls], ["/fake/sops"])
+        sops_env = self.fake.calls[0][1]
         self.assertEqual(sops_env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], key)
-        self.assertEqual(sops_env["SOPS_AGE_KEY"], FakeSops.AGE_KEY)
-        self.assertNotIn(FakeSops.AGE_KEY, out)
+        self.assertEqual(sops_env["SOPS_AGE_KEY"], ssh_keys.AGE_KEY)
+        self.assertNotIn(ssh_keys.AGE_KEY, out)
         self.assertEqual(os.listdir(self.tmp).count("age.txt"), 0)
 
     def test_ssh_key_conversion_keeps_env_key_and_key_file(self):
-        key = os.path.join(self.tmp, "id_ed25519")
-        with open(key, "w") as f:
-            f.write("k")
+        key = self.write_ssh_key()
         raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key], "keyFile": "/k/age"})
         d = sops.Decryptor(
             sops.parse_sops(raw).settings,
@@ -973,41 +969,37 @@ class FixesTest(SopsTestBase):
         )
         d.value(sops.parse_sops(raw).secrets[0])
         env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
-        self.assertEqual(env["SOPS_AGE_KEY"], "AGE-SECRET-KEY-1EXISTING\n" + FakeSops.AGE_KEY)
+        self.assertEqual(env["SOPS_AGE_KEY"], "AGE-SECRET-KEY-1EXISTING\n" + ssh_keys.AGE_KEY)
         self.assertEqual(env["SOPS_AGE_KEY_FILE"], "/k/age")
 
-    def test_ssh_to_age_missing_skips_conversion_with_warning(self):
-        key = os.path.join(self.tmp, "id_ed25519")
-        with open(key, "w") as f:
-            f.write("k")
-        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
-        d = sops.Decryptor(
-            sops.parse_sops(raw).settings, runner=self.fake, which=lambda _n: None, env={}
+    def test_unconvertible_ssh_key_skipped_with_warning(self):
+        bad = self.write_ssh_key(
+            "id_locked", ssh_keys.openssh_key(cipher=b"aes256-ctr", kdf=b"bcrypt")
         )
+        good = self.write_ssh_key()
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [bad, good]})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rows = secrets_flow.diff_sops(raw, self.state, d)
+            rows = secrets_flow.diff_sops(raw, self.state, self.decryptor(raw))
         self.assertEqual(rows, [f"  + decrypt {os.path.join(self.secrets_dir, 't')} (secret)"])
-        self.assertIn("ssh-to-age not found", out.getvalue())
-        self.assertEqual(out.getvalue().count("ssh-to-age not found"), 1)
-        env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
+        self.assertEqual(out.getvalue().count(f"cannot convert ssh key {bad}"), 1)
+        self.assertIn("passphrase-protected", out.getvalue())
+        env = self.fake.calls[0][1]
+        self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], bad)
+        self.assertEqual(env["SOPS_AGE_KEY"], ssh_keys.AGE_KEY)
+
+    def test_no_convertible_ssh_key_leaves_sops_age_key_unset(self):
+        key = self.write_ssh_key(data=b"k")
+        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
+        _ok, out = self.deploy(raw)
+        self.assertIn(f"cannot convert ssh key {key}", out)
+        env = self.fake.calls[0][1]
         self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], key)
         self.assertNotIn("SOPS_AGE_KEY", env)
 
-    def test_ssh_to_age_binary_override(self):
-        key = os.path.join(self.tmp, "id_ed25519")
-        with open(key, "w") as f:
-            f.write("k")
-        raw = self.config(
-            {"t": {"key": "token"}},
-            age={"sshKeyPaths": [key]},
-            sshToAgeBinary="/opt/bin/ssh-to-age",
-        )
-        d = sops.Decryptor(
-            sops.parse_sops(raw).settings, runner=self.fake, which=lambda _n: None, env={}
-        )
-        d.value(sops.parse_sops(raw).secrets[0])
-        self.assertEqual(self.fake.calls[0][0], ["/opt/bin/ssh-to-age", "-private-key", "-i", key])
+    def test_ssh_to_age_binary_is_unknown_key(self):
+        p = sops.parse_sops(self.config({}, sshToAgeBinary="/opt/bin/ssh-to-age"))
+        self.assertIn("sshToAgeBinary", p.errors[0])
 
     def test_first_existing_ssh_key_passed_natively(self):
         key = os.path.join(self.tmp, "id_ed25519")
@@ -1021,11 +1013,8 @@ class FixesTest(SopsTestBase):
 
     @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 file")
     def test_unreadable_ssh_key_skipped_for_next_readable_one(self):
-        bad = os.path.join(self.tmp, "id_unreadable")
-        good = os.path.join(self.tmp, "id_ed25519")
-        for p in (bad, good):
-            with open(p, "w") as f:
-                f.write("k")
+        bad = self.write_ssh_key("id_unreadable")
+        good = self.write_ssh_key()
         os.chmod(bad, 0)
         raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [bad, good]})
         ok, out = self.deploy(raw)
@@ -1033,8 +1022,7 @@ class FixesTest(SopsTestBase):
         self.assertIn(f"skipping ssh key {bad}", out)
         env = [e for c, e in self.fake.calls if c[0] == "/fake/sops"][0]
         self.assertEqual(env["SOPS_AGE_SSH_PRIVATE_KEY_FILE"], good)
-        conv = [c[-1] for c, _e in self.fake.calls if c[0].endswith("ssh-to-age")]
-        self.assertEqual(conv, [good])
+        self.assertEqual(env["SOPS_AGE_KEY"], ssh_keys.AGE_KEY)
 
     def test_null_ssh_key_path_is_config_error(self):
         raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [None]})
@@ -1065,16 +1053,6 @@ class FixesTest(SopsTestBase):
             f.write("hand-written")
         with self.assertRaisesRegex(sops.SecretUnavailable, "not the file tools"):
             lookup("jwt")
-
-    def test_ssh_key_conversion_failure_is_reported_without_output(self):
-        key = os.path.join(self.tmp, "id_rsa")
-        with open(key, "w") as f:
-            f.write("k")
-        self.fake.ssh_fail = True
-        raw = self.config({"t": {"key": "token"}}, age={"sshKeyPaths": [key]})
-        ok, out = self.deploy(raw)
-        self.assertIn(f"cannot convert ssh key {key}", out)
-        self.assertNotIn(FakeSops.AGE_KEY, out)
 
     def test_repointed_parent_symlink_is_untracked(self):
         a = os.path.join(self.tmp, "a")

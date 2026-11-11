@@ -301,8 +301,7 @@ Options follow sops-nix.
 sops:
   age:
     keyFile: ~/.config/sops/age/keys.txt
-    sshKeyPaths: [~/.ssh/id_ed25519] # age1 recipients via ssh-to-age; ssh-ed25519 only for the first readable key
-  sshToAgeBinary: null # default: ssh-to-age from PATH
+    sshKeyPaths: [~/.ssh/id_ed25519] # age1 recipients via in-process conversion; ssh-ed25519 only for the first readable key
   secretsDir: ~/.local/state/tools/secrets # default; must be absolute after ~ expansion
   defaultSopsFile: secrets/default.yaml # relative to the first --config path
   defaultSopsFormat: yaml # default
@@ -330,7 +329,7 @@ sops:
 - An existing file with different content is replaced; one tools did not write, or that changed since, is moved aside first (see Ownership).
 - One secret's path may not contain another's (`a` vs `a/b`).
 - A whole-file secret (`key: ""`) is decrypted with input and output type set to its `format`, as sops-nix does.
-- An `sshKeyPaths` key that can't be read or converted is skipped with a warning, as in sops-nix; a missing `ssh-to-age` only skips conversion. The converted key is never written to disk.
+- An `sshKeyPaths` key that can't be read or converted is skipped with a warning, as in sops-nix. Conversion is done in Python with the same result as `ssh-to-age -private-key` (no external binary); only unencrypted OpenSSH ed25519 keys convert. The converted key is never written to disk.
 - `restartUnits` only prints `notify <unit> (changed: ...)` for now; there's no handler yet.
 
 ## Templates
@@ -395,7 +394,7 @@ templates:
 | `sops.placeholder.NAME` | Nix placeholder string | `${sops:NAME}` | no Nix evaluation |
 | Template `content` | text only | text, or YAML data via `format` | services get their native format |
 | `restartUnits` | restarts systemd units | prints a notice (no handler yet) | launchd handler comes later |
-| `age.sshKeyPaths` | converted in-process | first readable key passed to `sops` (`SOPS_AGE_SSH_PRIVATE_KEY_FILE`, for `ssh-ed25519` recipients); every key also converted by `ssh-to-age` (`sshToAgeBinary` or `PATH`) into `SOPS_AGE_KEY`; without `ssh-to-age`, a warning and no conversion | `sops` only reads one SSH key, and only for `ssh-ed25519` recipients |
+| `age.sshKeyPaths` | converted in-process | first readable key passed to `sops` (`SOPS_AGE_SSH_PRIVATE_KEY_FILE`, for `ssh-ed25519` recipients); every unencrypted ed25519 key also converted in-process (as `ssh-to-age`) into `SOPS_AGE_KEY` | `sops` only reads one SSH key, and only for `ssh-ed25519` recipients |
 | Removal | old generations pruned | only tracked, unmodified files | never delete what tools didn't write |
 | Ownership | none | one owner per path; no writes through symlinks | safety |
 | Diff | n/a | path + action, content masked | no secrets in logs |
