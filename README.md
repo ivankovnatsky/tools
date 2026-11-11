@@ -1,7 +1,7 @@
 # tools
 
 Declarative configuration manager for the user environment: packages (brew, bun,
-npm, uv, go, flatpak), git checkouts, dotfiles, MCP servers, ollama models,
+npm, uv, go, cargo, flatpak), git checkouts, dotfiles, MCP servers, ollama models,
 curl-piped installers, and self-hosted service settings via their HTTP APIs —
 reconciled from a YAML/JSON/TOML config against a local state file.
 
@@ -28,7 +28,7 @@ tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--a
   - `gitRepos`: `git pull --ff-only` in every tracked checkout.
   - `skills`: git sources are fetched and moved to the newest commit of their
     ref.
-  - `npm`, `bun`, `go`: packages without a version or commit pin are reinstalled
+  - `npm`, `bun`, `go`, `cargo`: packages without a version or commit pin are reinstalled
     at the latest release; `uv` runs `uv tool upgrade` on them.
   - `brew`: `brew upgrade` on tracked formulae and casks, `mas upgrade` on
     tracked App Store apps.
@@ -46,7 +46,7 @@ tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--a
   below).
 - `plan` and `apply` are hidden aliases for `diff` and `deploy`.
 
-Sections: `bun`, `npm`, `uv`, `go`, `pi`, `mcp`, `curlShell`, `gitRepos`,
+Sections: `bun`, `npm`, `uv`, `go`, `cargo`, `pi`, `mcp`, `curlShell`, `gitRepos`,
 `sops`, `templates`, `files`, `fetch`, `env`, `skills`, `links`, `brew`,
 `ollamaModels`, `flatpak`, `launchd`, `defaults`, `dock`, `mgmt`.
 
@@ -1003,7 +1003,7 @@ Deploy records what it installs in the state file and only ever removes what it
 recorded — anything installed by hand is never touched (the one opt-in
 exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
 config removes it from the system on the next deploy (where an uninstall exists;
-`go` and `curlShell` only release tracking). Git checkout removal refuses to
+`go`, `cargo` and `curlShell` only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
 
 Every deploy (including each `watch` run) holds an exclusive lock on

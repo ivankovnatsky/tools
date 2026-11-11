@@ -10,6 +10,7 @@ SECTIONS = (
     "npm",
     "uv",
     "go",
+    "cargo",
     "pi",
     "mcp",
     "curlShell",

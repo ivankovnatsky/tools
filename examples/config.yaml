@@ -27,6 +27,8 @@ vars:
 #   uvToolDir uv's tool root                              (uv)
 #   goBin     $GOBIN for `go install`                     (go)
 #   goPath    $GOPATH for `go install`                    (go)
+#   cargoHome $CARGO_HOME for `cargo install`             (cargo)
+#   cargoRoot $CARGO_INSTALL_ROOT for `cargo install`     (cargo)
 #   python    directory containing `python`               (mcp)
 #   claudeCli full path to the `claude` binary            (mcp)
 paths:
@@ -39,6 +41,7 @@ paths:
   uvToolDir: ~/.local/share/uv/tools
   goBin: ~/.go/bin
   goPath: ~/.go
+  cargoHome: ~/.cargo
   python: /usr/bin
   claudeCli: ~/.local/bin/claude
 
@@ -56,6 +59,14 @@ uv:
 # as $GOBIN / $GOPATH so binaries land where we tell them. If both
 # are omitted, tools falls back to `go env GOBIN`/`go env GOPATH/bin`.
 go:
+  packages: {}
+
+# Cargo crates are installed with `cargo install <crate> [--version <v>]`
+# (`--git <source> --rev <commit>` with a commit pin). `paths.cargoHome`/
+# `paths.cargoRoot` above are propagated as $CARGO_HOME /
+# $CARGO_INSTALL_ROOT; binaries land in `<root>/bin`, the root defaulting to
+# cargoHome, then $CARGO_INSTALL_ROOT, $CARGO_HOME, `~/.cargo`.
+cargo:
   packages: {}
 
 # Pi packages are installed with `pi install <source>`.

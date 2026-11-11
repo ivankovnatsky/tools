@@ -138,6 +138,24 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
     return changes
 
 
+def _diff_cargo(packages: Dict, paths: Dict, state: Dict):
+    changes = []
+    desired = set(packages.keys())
+    state_packages = set(state.get("cargo", {}).get("packages", {}).keys())
+
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            source = get_pkg_source(pkg_info) or pkg
+            changes.append(f"  + install {source}")
+        elif version_changed(pkg, pkg_info, state, "cargo"):
+            changes.append(f"  ~ update {pkg}")
+
+    for pkg in sorted(state_packages - desired):
+        changes.append(f"  - drop {pkg} (binary remains in $CARGO_HOME/bin)")
+
+    return changes
+
+
 def _diff_pi(packages: Dict, paths: Dict, state: Dict):
     changes = []
     desired = set(packages.keys())
@@ -471,6 +489,13 @@ def show_diff(
             changes = _diff_go(config.get("go", {}).get("packages", {}), paths, state)
             if changes:
                 sections.append(("go", changes))
+
+    if "cargo" in active:
+        cargo_state = state.get("cargo", {})
+        if config.get("cargo", {}).get("packages") or cargo_state.get("packages"):
+            changes = _diff_cargo(config.get("cargo", {}).get("packages", {}), paths, state)
+            if changes:
+                sections.append(("cargo", changes))
 
     if "pi" in active:
         if config.get("pi", {}).get("packages") or state.get("pi", {}).get("packages"):

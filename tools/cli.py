@@ -26,6 +26,7 @@ from tools.user import sops as sops_section
 from tools.user import templates as templates_section
 from tools.user.brew import install_brew_packages
 from tools.user.bun import install_bun_packages
+from tools.user.cargo import install_cargo_packages
 from tools.user.curl_shell import install_curl_shell_scripts
 from tools.user.defaults import has_work as defaults_has_work
 from tools.user.defaults import install_defaults, process_name_error, run_restarts
@@ -638,6 +639,12 @@ def _run_sections(
         go_state = state.get("go", {})
         if go_packages or go_state.get("packages"):
             success &= install_go_packages(go_packages, paths, state, update)
+
+    if "cargo" in active:
+        cargo_packages = config.get("cargo", {}).get("packages", {})
+        cargo_state = state.get("cargo", {})
+        if cargo_packages or cargo_state.get("packages"):
+            success &= install_cargo_packages(cargo_packages, paths, state, update)
 
     if "pi" in active:
         pi_packages = config.get("pi", {}).get("packages", {})
