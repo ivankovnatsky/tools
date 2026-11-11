@@ -34,7 +34,8 @@ tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--a
     tracked App Store apps.
   - `ollamaModels`: tracked models are pulled again; `flatpak`: tracked apps get
     `flatpak update`.
-  - `fetch`: tracked files without a `sha256` pin are downloaded again.
+  - `fetch`: tracked files without a `sha256` pin are downloaded again (and
+    their `install` script re-run).
   - `files`: every distinct `onUpdate` command runs once (see below).
   - `pi`, `mcp` and `curlShell` have no upgrade step.
 - `--config` accepts a file or a directory and may be repeated; configs are
@@ -480,7 +481,38 @@ fetch:
     url: https://example.com/tool-v1.2
     sha256: 3b0c...   # optional
     mode: "0755"      # quoted octal, default 0644
+    restartUnits: [launchd:com.example.tool] # kickstarted when rewritten
+  /Applications/Tool.app:
+    url: https://example.com/tool-v1.2.zip
+    sha256: 9f2a...   # of the download
+    install: |        # like nix's installPhase
+      ditto -x -k "$src" .
+      mv dist/Tool.app "$out"
+      codesign --force --deep -s - "$out"
 ```
+
+- `install` is a shell script, run with `sh -e` once the download is verified
+  against `sha256`. `$src` is the downloaded file, `$tmp` an empty scratch
+  directory (the working directory) and `$out` a staging path beside the
+  target that the script must create, as a file or a directory. On success
+  `$out` is moved into place (the old target stays until then). A failing
+  script, or one that leaves no `$out`, fails that entry and keeps the old
+  target; other entries still run. Its output is shown only when it fails (or
+  with `--verbose`).
+- Only the inputs are tracked: state records `url`, `sha256`, the script text
+  and the target's type (file or directory). The result is never hashed or
+  read; plan, diff and deploy only `lstat` the target. The script runs again
+  when `url` (unpinned), `sha256` or the script changes, when the target is
+  missing, or on `deploy --update` without `sha256`. Edits inside the result
+  are left alone. `mode` applies only to a file result, and only when given;
+  otherwise the script's mode is kept.
+- A target in state is owned. An untracked one is moved aside on first
+  install (an install result is never adopted), as is a tracked one whose type
+  changed. A dropped entry's target is removed, edited or not, unless its type
+  changed.
+- `restartUnits: [launchd:<label>]` works as in sops and templates: a fetch,
+  update or replace (not a chmod) restarts that job; see "restartUnits" under
+  launchd.
 
 - A missing target is downloaded to a temp file beside it and renamed into
   place; parent directories are created. A file tools wrote and nobody changed
@@ -492,13 +524,14 @@ fetch:
   untracked file that already matches is adopted without downloading.
 - https only, redirects included; 60s network timeout. A failed download fails
   the deploy but not the other entries.
-- Ownership follows `files:`: an untracked existing file, or one modified
-  since tools wrote it, is moved aside and downloaded again (with `sha256`, an
+- Ownership of plain (non-`install`) entries follows `files:`: an untracked
+  existing file, or one modified since tools wrote it, is moved aside and downloaded again (with `sha256`, an
   untracked file that already matches is adopted instead); a modified file is
   not removed, a dropped entry's file is removed, and removals wait while any
   entry is malformed.
-- `tools diff` never touches the network: it shows `+ fetch <target> <- <url>`
-  for missing files, `~ fetch` for url/sha256 changes,
+- `tools diff` never touches the network or runs `install`: it shows
+  `+ fetch <target> <- <url>` for missing files (with ` (install)` for a
+  script), `~ fetch` for url/sha256/install changes,
   `~ replace <target> <- <url> (<reason>; old file moved aside to <target>.tools)`
   for untracked, edited or symlinked targets, and removals.
 
@@ -684,7 +717,7 @@ launchd:
 | `logDir` | `/tmp/agents/log/launchd` (agents), `/var/log/tools/launchd` (daemons) | logs `<name>.log`, `<name>.error.log`; `stdoutPath`/`stderrPath` override; also settable for the whole section (`launchd.logDir`), a service's own `logDir` wins |
 | `user` / `group` | — | daemons only; or `extraServiceConfig.UserName/GroupName`, not both |
 | `bash` (section) | `/bin/bash` | shell that runs the wrapper; for daemons every path component (symlinks too) and the target must be root-owned, not group/world-writable; the plist gets the resolved target |
-| `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; an unreadable file is logged and not tracked; for sops/templates files use their `restartUnits` (see below) |
+| `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; an unreadable file is logged and not tracked; for sops/templates/fetch files use their `restartUnits` (see below) |
 | `restartOnChange` | true | false: write a changed plist but leave the running job |
 | `disabled` | false | keep the plist, `launchctl disable` and boot out |
 | `secrets` | false | plist `0600`, diff suppressed |
@@ -718,7 +751,7 @@ Behaviour:
 
 ### restartUnits
 
-`sops`/`templates` entries name the jobs that read them, as sops-nix's `restartUnits`:
+`sops`/`templates`/`fetch` entries name the jobs that read them, as sops-nix's `restartUnits`:
 
 ```yaml
 templates:
@@ -730,9 +763,9 @@ templates:
 
 - A create, update or replace of the file (not a chmod) records the label as owed in the user's state; the launchd section then pays it. Content is compared in memory, so no hash of a secret is stored.
 - Agents: a loaded job is restarted with `kickstart -k`; one this run created, updated, loaded or re-enabled already started with the new file; a disabled one has nothing to restart. A failed kickstart, or a job held by an error, stays owed for the next deploy.
-- Daemons: sops and templates are user-scope, so they change during the user phase of `sudo tools deploy`, after root has handled daemons. The user phase hands the labels to root, which kickstarts each one after it, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
+- Daemons: sops, templates and fetch are user-scope, so they change during the user phase of `sudo tools deploy`, after root has handled daemons. The user phase hands the labels to root, which kickstarts each one after it, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
 - A label no configured job has is dropped with a warning (not while the launchd section has errors, or under `--only`).
-- Prefer this to `restartOn` for files sops/templates write: a daemon's `restartOn` hash is read in the root phase, before the user phase rewrites them, so it sees the change one deploy late, and it keeps a hash of secret content in state.
+- Prefer this to `restartOn` for files sops/templates/fetch write: a daemon's `restartOn` hash is read in the root phase, before the user phase rewrites them, so it sees the change one deploy late, and it keeps a hash of secret content in state.
 
 ### Differences from nix-config
 

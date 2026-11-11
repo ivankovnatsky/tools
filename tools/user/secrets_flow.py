@@ -188,12 +188,11 @@ def _movable():
 
     Each module defines record_unmodified, record_for and record_secret.
     """
-    from tools.user import files
+    from tools.user import fetch, files
 
     return {
         "files": (lambda st: st.setdefault("files", {}), files),
-        # fetch records are files records plus a url.
-        "fetch": (lambda st: st.setdefault("fetch", {}).setdefault("installed", {}), files),
+        "fetch": (lambda st: st.setdefault("fetch", {}).setdefault("installed", {}), fetch),
         "sops": (lambda st: st.setdefault("sops", {}).setdefault("installed", {}), sops),
         "templates": (
             lambda st: st.setdefault("templates", {}).setdefault("installed", {}),

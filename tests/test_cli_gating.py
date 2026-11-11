@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import unittest
@@ -218,6 +219,39 @@ class RestartUnitsWiringTest(unittest.TestCase):
         self.assertEqual(stale.call_args.args[1], {"b": ["sops/b"], "gone": ["templates/g"]})
         self.assertEqual(state["restartUnits"], {"launchd:b": {"sources": ["sops/b"], "seq": 1}})
         self.assertEqual(queue, [["b", 1]])
+
+    def test_fetch_write_owes_restart_in_same_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "bin", "agent")
+            config = {
+                "fetch": {
+                    target: {
+                        "url": "https://example.com/agent",
+                        "restartUnits": ["launchd:org.example.agent"],
+                    }
+                }
+            }
+            state: dict = {}
+            seen = []
+
+            def fake_install(raw, st, **kw):
+                seen.append(kw["units"])
+                kw["done"].add("org.example.agent")
+                return True
+
+            with (
+                mock.patch.object(cli, "env_export_process"),
+                mock.patch.object(cli, "load_json", return_value=state),
+                mock.patch.object(cli, "migrate_state_file"),
+                mock.patch.object(cli, "save_json"),
+                mock.patch.object(cli, "state_lock"),
+                mock.patch.object(cli, "install_launchd", side_effect=fake_install),
+                mock.patch("tools.user.fetch._open", return_value=io.BytesIO(b"bin")),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertTrue(cli._deploy(config, tmp, ("fetch", "launchd")))
+            self.assertEqual(seen, [{"org.example.agent": [f"fetch/{target}"]}])
+            self.assertNotIn("restartUnits", state)
 
     def test_no_launchd_work_and_no_units_skips_launchd(self):
         with mock.patch.object(cli, "install_launchd") as inst:

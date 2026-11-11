@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import stat
+import tarfile
 import tempfile
 import unittest
 import urllib.error
@@ -470,6 +471,344 @@ class FetchTest(unittest.TestCase):
         )
         self.assertEqual(moved, [f"{self.target} (fetch -> files)"])
         self.assertIn(self.target, self.state["files"])
+
+
+def targz(files) -> bytes:
+    """``files``: name -> (bytes, mode)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, (data, mode) in files.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), mode
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+APP = {
+    "dist/App.app/Contents/MacOS/App": (b"bin", 0o755),
+    "dist/App.app/Contents/Info.plist": (b"plist", 0o644),
+}
+BIN_SCRIPT = 'tar -xzf "$src"\nmv tool "$out"\n'
+APP_SCRIPT = 'tar -xzf "$src"\nmv dist/App.app "$out"\n'
+
+
+class FetchInstallTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.realpath(self._tmp.name)
+        self.bin = os.path.join(self.tmp, "bin", "tool")
+        self.app = os.path.join(self.tmp, "Applications", "App.app")
+        self.state = {}
+        self.opener = FakeOpener(targz({"LICENSE": (b"l", 0o644), "tool": (b"t1", 0o755)}))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def deploy(self, raw, update=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = fetch.install_fetch(raw, self.state, None, update, self.opener)
+        self.output = out.getvalue()
+        return ok
+
+    def diff(self, raw):
+        return fetch.diff_fetch(raw, self.state)
+
+    def app_raw(self, files=APP, script=APP_SCRIPT, **kw):
+        self.opener.body = targz(files)
+        return {self.app: {"url": URL, "sha256": sha(self.opener.body), "install": script, **kw}}
+
+    def read(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def leftovers(self, path):
+        return [n for n in os.listdir(os.path.dirname(path)) if n.startswith(".")]
+
+    def test_file_result_with_mode(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT, "mode": "0700"}}
+        self.assertEqual(self.diff(raw), [f"  + fetch {self.bin} <- {URL} (install)"])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(self.bin), b"t1")
+        self.assertEqual(stat.S_IMODE(os.stat(self.bin).st_mode), 0o700)
+        self.assertEqual(
+            self.state["fetch"]["installed"][self.bin],
+            {"url": URL, "sha256": sha(self.opener.body), "install": BIN_SCRIPT, "type": "file"},
+        )
+        self.assertEqual(self.leftovers(self.bin), [])
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(len(self.opener.calls), 1)
+
+    def test_file_result_keeps_its_mode_without_mode(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(stat.S_IMODE(os.stat(self.bin).st_mode), 0o755)
+        self.assertEqual(self.diff(raw), [])
+
+    def test_script_env_and_cwd(self):
+        script = 'test "$PWD" = "$tmp"\ntest -z "$(ls -A)"\ncp "$src" "$out"\n'
+        raw = {self.bin: {"url": URL, "install": script}}
+        self.assertTrue(self.deploy(raw), self.output)
+        self.assertEqual(self.read(self.bin), self.opener.body)
+
+    def test_directory_result_records_inputs_only(self):
+        raw = self.app_raw()
+        self.assertTrue(self.deploy(raw), self.output)
+        exe = os.path.join(self.app, "Contents", "MacOS", "App")
+        self.assertEqual(self.read(exe), b"bin")
+        self.assertEqual(stat.S_IMODE(os.stat(exe).st_mode), 0o755)
+        self.assertEqual(
+            self.state["fetch"]["installed"][self.app],
+            {"url": URL, "sha256": raw[self.app]["sha256"], "install": APP_SCRIPT, "type": "dir"},
+        )
+        self.assertEqual(self.leftovers(self.app), [])
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw, update=True))
+        self.assertEqual(len(self.opener.calls), 1)
+
+    def test_sha256_pins_the_download(self):
+        raw = self.app_raw()
+        raw[self.app]["sha256"] = sha(b"other")
+        self.assertFalse(self.deploy(raw))
+        self.assertIn("sha256 mismatch", self.output)
+        self.assertFalse(os.path.exists(self.app))
+        self.assertEqual(self.leftovers(self.app), [])
+
+    def test_failure_keeps_old(self):
+        self.assertTrue(self.deploy(self.app_raw()))
+        exe = os.path.join(self.app, "Contents", "MacOS", "App")
+        v2 = dict(APP, **{"dist/App.app/Contents/MacOS/App": (b"bin2", 0o755)})
+        raw = self.app_raw(v2, APP_SCRIPT + "echo boom\nfalse\n")
+        self.assertEqual(self.diff(raw), [f"  ~ fetch {self.app} <- {URL} (install changed)"])
+        raw[self.bin] = {"url": URL, "install": 'cp "$src" "$out"'}
+        self.assertFalse(self.deploy(raw))
+        self.assertIn("install script failed (exit 1)", self.output)
+        self.assertIn("boom", self.output)
+        self.assertEqual(self.read(exe), b"bin")
+        self.assertTrue(os.path.isfile(self.bin))  # the other entry still ran
+        self.assertEqual(self.leftovers(self.app), [])
+        self.assertEqual(self.diff(raw), [f"  ~ fetch {self.app} <- {URL} (install changed)"])
+
+    def test_missing_out_fails_and_keeps_old(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.assertTrue(self.deploy(raw))
+        raw = {self.bin: {"url": URL, "install": 'tar -xzf "$src"\n'}}
+        self.assertFalse(self.deploy(raw))
+        self.assertIn("did not create $out", self.output)
+        self.assertEqual(self.read(self.bin), b"t1")
+        self.assertEqual(self.leftovers(self.bin), [])
+
+    def test_missing_out_on_fresh_target(self):
+        self.assertFalse(self.deploy({self.bin: {"url": URL, "install": "true"}}))
+        self.assertFalse(os.path.exists(self.bin))
+        self.assertEqual(self.leftovers(self.bin), [])
+
+    def test_script_change_reruns(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.assertTrue(self.deploy(raw))
+        script = 'tar -xzf "$src"\nmv LICENSE "$out"\n'
+        raw = {self.bin: {"url": URL, "install": script}}
+        self.assertEqual(self.diff(raw), [f"  ~ fetch {self.bin} <- {URL} (install changed)"])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(self.bin), b"l")
+        self.assertEqual(self.diff(raw), [])
+
+    def test_sha_change_replaces_directory(self):
+        self.deploy(self.app_raw())
+        v2 = {"dist/App.app/Contents/MacOS/App": (b"bin2", 0o755)}
+        raw = self.app_raw(v2)
+        self.assertEqual(self.diff(raw), [f"  ~ fetch {self.app} <- {URL} (sha256 changed)"])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(os.path.join(self.app, "Contents", "MacOS", "App")), b"bin2")
+        self.assertFalse(os.path.exists(os.path.join(self.app, "Contents", "Info.plist")))
+        self.assertFalse(os.path.exists(self.app + ".tools"))
+        self.assertEqual(self.leftovers(self.app), [])
+
+    def test_unpinned_update_reruns(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.deploy(raw)
+        self.opener.body = targz({"tool": (b"t2", 0o755)})
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(self.bin), b"t1")
+        self.assertTrue(self.deploy(raw, update=True))
+        self.assertEqual(self.read(self.bin), b"t2")
+
+    def test_plain_entry_switching_to_install(self):
+        self.opener.body = b"plain"
+        self.deploy({self.bin: URL})
+        self.opener.body = targz({"tool": (b"t2", 0o755)})
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.assertEqual(self.diff(raw), [f"  ~ fetch {self.bin} <- {URL} (install changed)"])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(self.bin), b"t2")
+
+    def test_edited_plain_file_switching_to_install_is_moved_aside(self):
+        self.opener.body = b"plain"
+        self.deploy({self.bin: URL})
+        with open(self.bin, "wb") as f:
+            f.write(b"edited")
+        self.opener.body = targz({"tool": (b"t2", 0o755)})
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT}}
+        self.assertTrue(self.deploy(raw), self.output)
+        self.assertEqual(self.read(self.bin), b"t2")
+        self.assertEqual(self.read(self.bin + ".tools"), b"edited")
+
+    def test_install_file_moves_to_files(self):
+        self.deploy({self.bin: {"url": URL, "install": BIN_SCRIPT}})
+        src = os.path.join(self.tmp, "src")
+        with open(src, "wb") as f:
+            f.write(b"t1")
+        moved = secrets_flow.move_between_sections(
+            self.state,
+            files_entries=[{"source": src, "target": self.bin}],
+            config_dir=self.tmp,
+        )
+        self.assertEqual(moved, [f"{self.bin} (fetch -> files)"])
+        self.assertEqual(self.state["files"][self.bin]["hash"], sha(b"t1"))
+
+    def test_read_only_scratch_cleaned_up(self):
+        script = APP_SCRIPT + "mkdir -p ro/x\nchmod 0500 ro/x ro\n"
+        self.assertTrue(self.deploy(self.app_raw(script=script)), self.output)
+        self.assertEqual(self.leftovers(self.app), [])
+
+    def test_edited_result_left_alone(self):
+        raw = self.app_raw()
+        self.deploy(raw)
+        plist = os.path.join(self.app, "Contents", "Info.plist")
+        with open(plist, "wb") as f:
+            f.write(b"edited")
+        self.assertEqual(self.diff(raw), [])
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(plist), b"edited")
+        self.assertEqual(len(self.opener.calls), 1)
+
+    def test_installed_result_never_read(self):
+        raw = self.app_raw()
+        raw[self.bin] = {"url": URL, "install": 'cp "$src" "$out"', "mode": "0700"}
+        self.assertTrue(self.deploy(raw), self.output)
+        os.chmod(self.bin, 0o644)
+        no_read = mock.patch.object(fetch, "_file_hash", side_effect=AssertionError("read"))
+        with no_read:
+            self.assertEqual(self.diff(raw), [f"  ~ chmod {self.bin} -> 0o700"])
+            self.assertTrue(self.deploy(raw), self.output)
+            self.assertEqual(self.diff(raw), [])
+            self.assertEqual(self.diff({}), [f"  - remove {self.app}", f"  - remove {self.bin}"])
+            self.assertTrue(self.deploy({}), self.output)
+        self.assertFalse(os.path.lexists(self.app))
+        self.assertFalse(os.path.lexists(self.bin))
+
+    def test_missing_result_reinstalled(self):
+        raw = self.app_raw()
+        self.deploy(raw)
+        fetch._force_rmtree(self.app)
+        self.assertEqual(self.diff(raw), [f"  + fetch {self.app} <- {URL} (install)"])
+        self.assertTrue(self.deploy(raw))
+        self.assertTrue(os.path.isdir(self.app))
+
+    def test_type_change_moved_aside(self):
+        raw = self.app_raw()
+        self.deploy(raw)
+        fetch._force_rmtree(self.app)
+        with open(self.app, "wb") as f:
+            f.write(b"x")
+        self.assertEqual(
+            self.diff(raw),
+            [
+                f"  ~ replace {self.app} <- {URL} (no longer the dir tools installed; "
+                f"old file moved aside to {self.app}.tools)"
+            ],
+        )
+        self.assertEqual(
+            self.diff({}), [f"  ~ keep {self.app} (no longer the dir tools installed; not removed)"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertTrue(os.path.isdir(self.app))
+        self.assertEqual(self.read(self.app + ".tools"), b"x")
+
+    def test_untracked_directory_moved_aside(self):
+        os.makedirs(self.app)
+        raw = self.app_raw()
+        self.assertEqual(
+            self.diff(raw),
+            [
+                f"  ~ replace {self.app} <- {URL} (not tracked by tools; "
+                f"old file moved aside to {self.app}.tools)"
+            ],
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertTrue(os.path.isdir(self.app + ".tools"))
+        self.assertTrue(os.path.isfile(os.path.join(self.app, "Contents", "Info.plist")))
+
+    def test_directory_without_install_is_an_error(self):
+        os.makedirs(self.app)
+        self.assertFalse(self.deploy({self.app: URL}))
+
+    def test_removal_when_dropped(self):
+        self.deploy(self.app_raw())
+        self.assertEqual(self.diff({}), [f"  - remove {self.app}"])
+        self.assertTrue(self.deploy({}))
+        self.assertFalse(os.path.exists(self.app))
+        self.assertEqual(self.state["fetch"]["installed"], {})
+
+    def test_read_only_directory_removed(self):
+        self.deploy(self.app_raw(script=APP_SCRIPT + 'chmod 0500 "$out/Contents"\n'))
+        self.assertTrue(self.deploy({}), self.output)
+        self.assertFalse(os.path.exists(self.app))
+
+    def test_special_file_result_fails(self):
+        raw = self.app_raw(script='mkfifo "$out"\n')
+        self.assertFalse(self.deploy(raw))
+        self.assertIn("must be a regular file or a directory", self.output)
+        self.assertFalse(os.path.exists(self.app))
+        self.assertEqual(self.leftovers(self.app), [])
+
+    def test_edited_directory_removed_when_dropped(self):
+        self.deploy(self.app_raw())
+        with open(os.path.join(self.app, "new"), "wb") as f:
+            f.write(b"x")
+        self.assertTrue(self.deploy({}))
+        self.assertFalse(os.path.lexists(self.app))
+        self.assertEqual(self.state["fetch"]["installed"], {})
+
+    def test_diff_never_runs_script_or_downloads(self):
+        marker = os.path.join(self.tmp, "ran")
+        raw = {self.bin: {"url": URL, "install": f'touch "{marker}"\ncp "$src" "$out"\n'}}
+        self.assertEqual(self.diff(raw), [f"  + fetch {self.bin} <- {URL} (install)"])
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.opener.calls, [])
+
+    def test_restart_units_owed_on_write_only(self):
+        raw = {self.bin: {"url": URL, "install": BIN_SCRIPT, "restartUnits": ["launchd:a.b"]}}
+        self.assertEqual(
+            self.diff(raw), [f"  + fetch {self.bin} <- {URL} (install)", "    notify: launchd:a.b"]
+        )
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {"a.b": [f"fetch/{self.bin}"]})
+        secrets_flow.settle_restarts(self.state, {"a.b"})
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {})
+
+    def test_restart_units_not_owed_on_failure(self):
+        raw = {self.bin: {"url": URL, "install": "false", "restartUnits": ["launchd:a.b"]}}
+        self.assertFalse(self.deploy(raw))
+        self.assertEqual(secrets_flow.pending_restarts(self.state), {})
+
+    def test_parse_errors(self):
+        for bad in ("", "  ", 3, ["x"]):
+            _entries, errors = fetch.parse({self.bin: {"url": URL, "install": bad}})
+            self.assertEqual(
+                errors, [f"fetch.{self.bin}: install must be a non-empty shell script"]
+            )
+        for bad in ("launchd:x", [1], {"a": 1}):
+            _entries, errors = fetch.parse({self.bin: {"url": URL, "restartUnits": bad}})
+            self.assertEqual(errors, [f"fetch.{self.bin}: restartUnits must be a list of strings"])
+        _entries, errors = fetch.parse({self.bin: {"url": URL, "extract": "x"}})
+        self.assertEqual(errors, [f"fetch.{self.bin}: unknown keys extract"])
+        entries, _ = fetch.parse({self.bin: {"url": URL, "install": "x"}})
+        self.assertIsNone(entries[0].mode)
+        entries, _ = fetch.parse({self.bin: URL})
+        self.assertEqual(entries[0].mode, fetch.DEFAULT_MODE)
 
 
 class FetchCliTest(unittest.TestCase):

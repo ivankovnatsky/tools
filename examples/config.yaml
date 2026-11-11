@@ -150,6 +150,18 @@ files: []
 #   target: /etc/shells
 #   mode: "0644"
 
+# Downloads from https URLs (README "fetch"). `install` builds the target from
+# the verified download: $src (file), $tmp (empty cwd), $out (create it).
+fetch: {}
+#   ~/.config/nvim/spell/uk.utf-8.spl: https://ftp.nluug.nl/vim/runtime/spell/uk.utf-8.spl
+#   ~/.local/bin/tool:
+#     url: https://example.com/tool_darwin_arm64.tar.gz
+#     sha256: <hex>
+#     install: |
+#       tar -xzf "$src"
+#       mv tool "$out"
+#     restartUnits: [launchd:com.example.tool]
+
 # `packages` may also be a dict of {app_id: {remote: ...}} to pin an
 # app to one remote when several carry the same ID.
 flatpak:
