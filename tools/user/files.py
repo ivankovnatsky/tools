@@ -324,6 +324,17 @@ def _copy_file(
 SYSTEM_HINT = "run sudo tools deploy --scope files"
 SYSTEM_KEYS = {"source", "target", "mode", "secrets"}
 SYSTEM_KEY_ERROR = "`system` is not needed: targets the user cannot write are system files"
+_KEYS = {
+    "dir",
+    "source",
+    "target",
+    "directory",
+    "mode",
+    "secrets",
+    "onChange",
+    "onUpdate",
+    "skip",
+}
 
 
 def _system_entry_error(entry: Dict) -> Optional[str]:
@@ -576,6 +587,10 @@ def _resolve_entries(
             continue
         if "system" in entry:
             errors.append(f"{SYSTEM_KEY_ERROR}: {entry!r}")
+            continue
+        unknown = set(entry) - _KEYS
+        if unknown:
+            errors.append(f"unknown keys {sorted(unknown)} in entry {entry!r}")
             continue
         entry_system = is_system_entry(entry)
         if entry_system:

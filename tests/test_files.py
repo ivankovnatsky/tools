@@ -954,6 +954,16 @@ class MoveAsideTest(unittest.TestCase):
         self.assertIn("tools now always moves the old file aside", log)
         self.assertFalse(os.path.exists(self.target))
 
+    def test_unknown_key_is_an_error(self):
+        ok, log = self.deploy(self.entries(skp=True))
+        self.assertFalse(ok)
+        self.assertIn("unknown keys ['skp']", log)
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_once_key_is_unknown(self):
+        _, errors = files._resolve_entries(self.entries(once=True), self.d)
+        self.assertIn("unknown keys ['once']", errors[0])
+
     def _appearing(self, content):
         real = files.atomic_write
 
