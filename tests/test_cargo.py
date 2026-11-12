@@ -101,7 +101,10 @@ class CargoInstallTest(unittest.TestCase):
             [
                 (["install", "genpass", "--version", "0.5.1"], "/cargo"),
                 (["install", "latest"], "/cargo"),
-                (["install", "--git", "https://example.com/x.git", "--rev", "abc"], "/cargo"),
+                (
+                    ["install", "--git", "https://example.com/x.git", "--rev", "abc", "fromgit"],
+                    "/cargo",
+                ),
             ],
         )
         self.assertEqual(state["cargo"]["context"], "|/cargo")

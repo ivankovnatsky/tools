@@ -136,7 +136,11 @@ def _install_args(pkg: str, pkg_info: Dict) -> List[str]:
     source = get_pkg_source(pkg_info) or pkg
     commit = get_pkg_commit(pkg_info)
     if commit:
-        return ["--git", source, "--rev", commit]
+        args = ["--git", source, "--rev", commit]
+        # A repo can hold several crates with binaries; name the one to build.
+        if get_pkg_source(pkg_info):
+            args.append(pkg)
+        return args
     version = get_pkg_version(pkg_info)
     if version and version != "latest":
         return [source, "--version", version]
