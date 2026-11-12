@@ -511,6 +511,22 @@ class SystemFilesTest(SystemFilesBase):
         self.assertEqual(_read_file(target), "hand\n")
         self.assertEqual(state["files"], {target: {"hash": "kept"}})
 
+    def test_backup_false_survives_narrowing(self):
+        target = os.path.join(self.home, "b")
+        _write(target, "hand\n")
+        _write(target + ".tools", "earlier\n")
+        entries = [{"source": "etc/shells", "target": target, "backup": False}]
+        state = {}
+        ok = self.narrowed(
+            {target},
+            entries,
+            state,
+            lambda c: files_mod.install_files(c["files"], self.config_dir, state),
+        )
+        self.assertTrue(ok)
+        self.assertNotEqual(_read_file(target), "hand\n")
+        self.assertEqual(_read_file(target + ".tools"), "earlier\n")
+
 
 def _read_file(path):
     with open(path) as f:

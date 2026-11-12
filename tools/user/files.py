@@ -192,8 +192,10 @@ class FilePlan(NamedTuple):
     existing: Optional[bytes] = None
 
 
-def _replace(target: str, reason: str, existing: Optional[bytes] = None) -> FilePlan:
-    refused = aside_refused(target)
+def _replace(
+    target: str, reason: str, existing: Optional[bytes] = None, backup: bool = True
+) -> FilePlan:
+    refused = aside_refused(target) if backup else None
     if refused:
         return FilePlan("error", refused)
     return FilePlan("replace", reason, existing)
@@ -204,16 +206,23 @@ def _uid(path: str) -> int:
 
 
 def plan_file(
-    target: str, desired: bytes, desired_mode: int, record, owner: Optional[int] = None
+    target: str,
+    desired: bytes,
+    desired_mode: int,
+    record,
+    owner: Optional[int] = None,
+    backup: bool = True,
 ) -> FilePlan:
     """What deploying ``desired`` to ``target`` does; shared by deploy and diff.
 
     With ``owner`` (0 for system entries), a file owned by anyone else is replaced
-    whatever it holds: its owner could change it after any check."""
+    whatever it holds: its owner could change it after any check.
+
+    Without ``backup``, a replaced file is overwritten instead of moved aside."""
     if not os.path.lexists(target):
         return FilePlan("create")
     if os.path.islink(target):
-        return _replace(target, "a symlink")
+        return _replace(target, "a symlink", backup=backup)
     if not os.path.isfile(target):
         return FilePlan("error", f"{target} exists and is not a regular file")
     try:
@@ -222,15 +231,15 @@ def plan_file(
     except OSError as e:
         return FilePlan("error", f"cannot read {target}: {e}")
     if owner is not None and _uid(target) != owner:
-        return _replace(target, f"not owned by uid {owner}", existing)
+        return _replace(target, f"not owned by uid {owner}", existing, backup)
     if existing == desired:
         if stat.S_IMODE(os.lstat(target).st_mode) == desired_mode:
             return FilePlan("unchanged", existing=existing)
         return FilePlan("chmod", existing=existing)
     if not _tracked(target, record):
-        return _replace(target, "not tracked by tools", existing)
+        return _replace(target, "not tracked by tools", existing, backup)
     if hashlib.sha256(existing).hexdigest() != record.get("hash"):
-        return _replace(target, "modified since tools wrote it", existing)
+        return _replace(target, "modified since tools wrote it", existing, backup)
     return FilePlan("update", existing=existing)
 
 
@@ -242,15 +251,17 @@ def _copy_file(
     secrets: bool = False,
     record=None,
     owner: Optional[int] = None,
+    backup: bool = True,
 ) -> Tuple[Optional[bool], str]:
     """Copy source to target atomically, applying mode if provided.
 
-    ``owner``: see `plan_file`.
+    ``owner`` and ``backup``: see `plan_file`.
 
     Returns (result, source_hash) where result is:
     True if written, False on error, None if up to date.
 
-    A target tools did not write, or that changed since, is moved aside first.
+    A target tools did not write, or that changed since, is moved aside first
+    (overwritten without ``backup``).
 
     When ``secrets`` is true — or either side (incoming or existing)
     trips the ``looks_like_secret`` heuristic — the inline diff body is
@@ -267,7 +278,7 @@ def _copy_file(
 
     source_hash = hashlib.sha256(desired).hexdigest()
     desired_mode = mode if mode is not None else stat.S_IMODE(os.stat(source).st_mode)
-    fp = plan_file(target, desired, desired_mode, record, owner)
+    fp = plan_file(target, desired, desired_mode, record, owner, backup)
     try:
         dirname = os.path.dirname(target)
         if fp.action == "create" and dirname:
@@ -278,7 +289,7 @@ def _copy_file(
             return True, source_hash
     except FileExistsError:
         # Appeared since planning: judge it like any existing file.
-        fp = plan_file(target, desired, desired_mode, record, owner)
+        fp = plan_file(target, desired, desired_mode, record, owner, backup)
     except OSError as e:
         log(f"Failed to write {target}: {e}", Color.RED)
         return False, source_hash
@@ -308,13 +319,17 @@ def _copy_file(
     # Content moved aside is never shown: it may hold hand-written secrets.
 
     try:
-        moved = atomic_write(target, desired, desired_mode, backup=fp.action == "replace")
+        moved = atomic_write(
+            target, desired, desired_mode, backup=backup and fp.action == "replace"
+        )
     except OSError as e:
         log(f"Failed to write {target}: {e}", Color.RED)
         return False, source_hash
 
     if moved:
         log(f"Moved aside ({fp.reason}): {target} -> {moved}", Color.YELLOW)
+    elif fp.action == "replace":
+        log(f"Overwritten ({fp.reason}; backup: false): {target}", Color.YELLOW)
     log(f"{'Updated' if fp.action == 'update' else 'Replaced'}: {target}", Color.GREEN)
     if diff_body:
         print(diff_body)
@@ -334,6 +349,7 @@ _KEYS = {
     "onChange",
     "onUpdate",
     "skip",
+    "backup",
 }
 
 
@@ -489,6 +505,7 @@ class Entry(NamedTuple):
     directory: bool = False
     on_update: Optional[str] = None
     skip: bool = False
+    backup: bool = True
 
 
 def declared_hooks(entries, skipped: bool = False) -> set:
@@ -626,6 +643,13 @@ def _resolve_entries(
                 f"skip is supported on single files and templates, not dir: trees: {entry!r}"
             )
             continue
+        backup = entry.get("backup", True)
+        if not isinstance(backup, bool):
+            errors.append(f"`backup` must be a bool, got {type(backup).__name__} in {entry!r}")
+            continue
+        if entry.get("directory") is True and "backup" in entry:
+            errors.append(f"`backup` does not apply to a directory entry: {entry!r}")
+            continue
         if entry_system != system:
             continue
 
@@ -666,6 +690,7 @@ def _resolve_entries(
                             False,
                             on_update,
                             skip,
+                            backup,
                         )
                     )
             continue
@@ -677,7 +702,17 @@ def _resolve_entries(
                 errors.append(f"source not found: {entry['source']}")
                 continue
             file_pairs.append(
-                Entry(target, source, entry_mode, entry_secrets, on_change, False, on_update, skip)
+                Entry(
+                    target,
+                    source,
+                    entry_mode,
+                    entry_secrets,
+                    on_change,
+                    False,
+                    on_update,
+                    skip,
+                    backup,
+                )
             )
             continue
 
@@ -787,6 +822,7 @@ def install_files(
                 secrets=e.secrets,
                 record=record,
                 owner=0 if system else None,
+                backup=e.backup,
             )
             if source_hash and result is not False:
                 managed[target] = _record(target, source_hash)

@@ -333,6 +333,7 @@ def _diff_files(
                 effective_mode,
                 state_files.get(target),
                 0 if system else None,
+                e.backup,
             )
             if fp.action == "create":
                 changes.append(f"  + create {target}")
@@ -340,7 +341,11 @@ def _diff_files(
                 changes.append(f"  ! {fp.reason}")
                 continue
             elif fp.action == "replace":
-                note = aside_note(target, fp.reason)
+                note = (
+                    aside_note(target, fp.reason)
+                    if e.backup
+                    else f"{fp.reason}; overwritten, backup: false"
+                )
                 changes.append(f"  ~ replace {target} ({note}; content not shown)")
             elif fp.action == "update":
                 is_secret = (

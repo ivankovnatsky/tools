@@ -1045,3 +1045,49 @@ class SkipTest(MoveAsideTest):
             self.assertFalse(
                 _print_sections([("files", ["  = skip /x (skip: true)", "  + create /y"])])
             )
+
+
+class BackupFalseTest(MoveAsideTest):
+    def test_modified_target_overwritten_without_backup(self):
+        self.assertTrue(self.deploy(self.entries(backup=False))[0])
+        _write(self.target, "app rewrote this\n")
+        self.assertEqual(
+            self.diff(self.entries(backup=False)),
+            [
+                f"  ~ replace {self.target} (modified since tools wrote it; "
+                "overwritten, backup: false; content not shown)"
+            ],
+        )
+        ok, log = self.deploy(self.entries(backup=False))
+        self.assertTrue(ok)
+        self.assertIn("backup: false", log)
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+        self.assertEqual(_backups(self.target), [])
+
+    def test_earlier_backup_does_not_block(self):
+        _write(self.target + ".tools", "old backup\n")
+        _write(self.target, "mine\n")
+        self.assertEqual(self.diff(self.entries(backup=False))[0][:4], "  ~ ")
+        self.assertTrue(self.deploy(self.entries(backup=False))[0])
+        self.assertEqual(_read(self.target), "fresh = 1\n")
+        self.assertEqual(_read(self.target + ".tools"), "old backup\n")
+
+    def test_dir_tree_propagates_backup_false(self):
+        _write(os.path.join(self.d, "tree", "a.conf"), "a\n")
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.d, "home")}):
+            target = os.path.join(self.d, "home", "a.conf")
+            _write(target, "mine\n")
+            self.assertTrue(self.deploy([{"dir": "tree", "backup": False}])[0])
+            self.assertEqual(_read(target), "a\n")
+            self.assertEqual(_backups(target), [])
+
+    def test_non_bool_backup_is_a_config_error(self):
+        ok, _ = self.deploy(self.entries(backup="no"))
+        self.assertFalse(ok)
+        self.assertIn("`backup` must be a bool", self.diff(self.entries(backup="no"))[0])
+
+    def test_backup_on_directory_entry_is_a_config_error(self):
+        entries = [{"target": os.path.join(self.d, "made"), "directory": True, "backup": False}]
+        ok, _ = self.deploy(entries)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(os.path.join(self.d, "made")))

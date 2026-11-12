@@ -337,6 +337,8 @@ class _Files:
                 item["onUpdate"] = e.on_update
             if e.skip:
                 item["skip"] = True
+            if not e.backup:
+                item["backup"] = False
             out.append(item)
         return out
 

@@ -227,6 +227,12 @@ Notable keys:
   rewrites (recent-project lists and the like), and flip it off for one deploy
   to push repo changes; the target is then treated as before (moved aside once
   if it changed since tools wrote it).
+- `backup: false` (on user `source`/`target` and `dir:` entries, not system
+  files) overwrites a
+  target tools did not write, or that changed since, instead of moving it aside
+  to `<target>.tools`; an earlier backup does not block it. Use it for files an
+  app rewrites when the repo version should always win (what the app wrote
+  there is lost); `skip: true` keeps the app's version instead.
 - `directory: true` ensures the directory (and its parents) exists and applies
   `mode`. Only a directory tools created is tracked, and it is removed only
   while empty; parents and pre-existing directories are never removed. Other
@@ -374,6 +380,7 @@ templates:
 - Nothing is removed through a managed link.
 - sops/templates state keeps device, inode and mtime, never values or hashes.
 - A target whose content differs is replaced. If tools did not write it (untracked) or it changed since tools wrote it, it is first renamed to `<target>.tools`, keeping its mode, and the backup path is logged; a file tools wrote and nobody changed is replaced without a backup. This applies to `files`, `sops`, `templates`, `fetch` and `env`. A symlink at the target is never followed: the link itself is renamed. Backups are never removed by tools.
+- `files:` entries with `backup: false` are overwritten instead (see Config).
 - A target is moved aside at most once: if it needs replacing again while `<target>.tools` already exists, that entry fails (`!` in diff) and the file is left as is; other entries proceed. Remove the backup to let tools move it aside again.
 - The replacement is written to a temp file first, so a failed write or download leaves the old file in place.
 - `tools diff` shows such a write as `~ replace <target> (<reason>; old file moved aside to <target>.tools ...)`.
