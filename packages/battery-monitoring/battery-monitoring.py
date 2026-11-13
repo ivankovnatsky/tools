@@ -49,7 +49,9 @@ LOG = logging.getLogger("battery-monitoring")
 DASHBOARD = Path(__file__).with_name("dashboard.html")
 
 DEFAULT_PN = "A1763"  # C1000 Gen 2
-TRIGGER_TIMEOUT = 300  # seconds the device keeps publishing before re-trigger
+# anker-solix-api ignores message_poller(timeout=) for mapped models (A1763) and
+# always sends the 60s default, so re-trigger before that lapses.
+TRIGGER_TIMEOUT = 60
 BLIND_ALERT_AFTER = 2  # consecutive readless polls before alerting "can't read battery"
 
 
