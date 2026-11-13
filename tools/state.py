@@ -78,6 +78,26 @@ def save_json(path: str, data: Dict):
         raise
 
 
+DEFAULT_STATE_FILE = "~/.local/state/tools/state.json"
+
+# Under sudo, root's records (system files, daemons, system defaults) live under this key
+# of the user's state file.
+ROOT_KEY = "root"
+
+
+def state_file_path(config: Dict) -> str:
+    # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not crash expanduser.
+    return os.path.expanduser(config.get("stateFile") or DEFAULT_STATE_FILE)
+
+
+def root_records(state: Dict) -> Dict:
+    """Root's records in a loaded user state, created empty when missing."""
+    records = state.get(ROOT_KEY)
+    if not isinstance(records, dict):
+        records = state[ROOT_KEY] = {}
+    return records
+
+
 def lock_path(state_file: str) -> str:
     return f"{state_file}.lock"
 

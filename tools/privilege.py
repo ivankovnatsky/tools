@@ -1,8 +1,9 @@
 """Who tools acts for: the login user, or root via `sudo tools deploy` on that user's behalf.
 
 Under sudo, root does only system work (`files` system entries, launchd daemons,
-`defaults` system scope, `settingsctl` host settings, `users` login shells), keeps its own state in
-`ROOT_STATE_FILE` and never writes in the user's home; everything else runs in a forked
+`defaults` system scope, `settingsctl` host settings, `users` login shells), keeps its
+records under `root` in the user's state file (written by a child dropped to the user)
+and never writes in the user's home; everything else runs in a forked
 child that has permanently dropped to the user (`run_as_user`). tools itself never calls
 sudo.
 """
@@ -16,7 +17,6 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
-ROOT_STATE_FILE = "/var/db/tools/state.json"
 ROOT_SECTIONS = ("launchd", "defaults", "files", "settingsctl", "users")
 
 SUDO_USER_ERROR = (

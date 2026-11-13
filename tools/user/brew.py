@@ -549,7 +549,14 @@ def _record(state: Dict, brews, casks, taps, mas, trusted) -> None:
     }
 
 
-def install_brew_packages(brew_config: dict, state: dict, update: bool = False) -> bool:
+INSTALL = "install"
+REMOVE = "remove"
+_REMOVE_KEYS = ("taps_remove", "trust_remove", "brews_remove", "casks_remove")
+
+
+def install_brew_packages(
+    brew_config: dict, state: dict, update: bool = False, phase: str | None = None
+) -> bool:
     """Declarative Homebrew package management.
 
     State is the source of truth: we reconcile the desired config against what
@@ -564,6 +571,11 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
 
     Installed packages are only upgraded with ``update``: `brew upgrade` on
     the tracked formulae and casks, `mas upgrade` on the tracked apps.
+
+    ``phase`` splits one reconcile in two: INSTALL (taps, upgrades, installs, Mac App
+    Store apps) and REMOVE (removals, cleanup, untaps), so a runtime brew removes is
+    still there while other sections uninstall what they installed with it. None does
+    both.
     """
     if sys.platform != "darwin":
         return True
@@ -575,7 +587,16 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
         return False
 
     prev = state.get("brew", {})
-    plan = _plan(spec, prev)
+    whole = _plan(spec, prev)
+    # The other phase's work is left out; cleanup still sees all of it (e.g. App Store
+    # apps still to remove keep `mas`).
+    plan = {
+        k: [] if phase is not None and (k in _REMOVE_KEYS) != (phase == REMOVE) else v
+        for k, v in whole.items()
+    }
+    cleanup = None if phase == INSTALL else spec.cleanup
+    if phase == REMOVE:
+        update = False
 
     # tracked sets mirror what we believe is installed; mutate on success only.
     inst_brews = set(prev.get("brews", []))
@@ -592,7 +613,7 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
     def unchanged() -> bool:
         if "brew" not in state:
             _record(state, inst_brews, inst_casks, inst_taps, inst_mas, inst_trust)
-        elif inst_mas != spec.mas:
+        elif inst_mas != spec.mas and not whole["mas_install"] and not whole["mas_remove"]:
             # No install/remove work means the app-id sets already match, so
             # any dict difference is a pure rename ({"Old": 1} -> {"New": 1}).
             # Adopt the new names or state carries the stale key forever.
@@ -606,7 +627,7 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
     }
     upgrades = update and any(upgrade.values())
     planned = any(plan.values())
-    if not planned and not upgrades and not spec.cleanup:
+    if not planned and not upgrades and not cleanup:
         debug("All brew packages in sync", Color.BLUE)
         return unchanged()
 
@@ -628,7 +649,7 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
 
     clean = _no_cleanup()
     cleanup_planned = False
-    if spec.cleanup:
+    if cleanup:
         live, err = query_installed(brew, env, spec)
         if err:
             log(f"brew cleanup skipped: {err}", Color.RED)
@@ -636,7 +657,7 @@ def install_brew_packages(brew_config: dict, state: dict, update: bool = False) 
         elif live["deferred"]:
             log(f"brew cleanup deferred until tapped: {', '.join(live['deferred'])}", Color.YELLOW)
         else:
-            clean = cleanup_targets(spec, prev, plan, live)
+            clean = cleanup_targets(spec, prev, whole, live)
             cleanup_planned = True
     if not planned and not upgrades and not any(clean.values()):
         debug("All brew packages in sync", Color.BLUE)

@@ -429,14 +429,23 @@ def show_diff(
 ) -> bool:
     """Show what deploy would change. Returns True if no changes needed.
 
-    As root (``root``) only system sections are diffed, against the root-owned state file.
+    As root (``root``) only system sections are diffed, against root's records in the user's
+    state file.
     With ``only``, narrowed sections are diffed exactly as deploy narrows them.
     """
-    from tools.state import find_state_file, load_json, migrate_state_schema
+    from tools.state import (
+        find_state_file,
+        load_json,
+        migrate_state_schema,
+        root_records,
+        state_file_path,
+    )
 
     view = selection.view(only or {}, config, config_dir)
     if root:
-        state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+        state = root_records(
+            migrate_state_schema(load_json(find_state_file(state_file_path(config))))
+        )
         if view and not _hide(view, state):
             return False
         return _print_sections(

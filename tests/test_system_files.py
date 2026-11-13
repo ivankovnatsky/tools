@@ -306,14 +306,9 @@ class RootDiffTest(SystemFilesBase):
         self.assertIn("! refusing", rows[0])
 
     def test_show_diff_as_root_includes_files(self):
-        root_state = os.path.join(self.tmp, "root", "state.json")
-        with (
-            self.as_root(),
-            mock.patch.object(privilege, "ROOT_STATE_FILE", root_state),
-        ):
-            clean, out = _quiet(
-                diff.show_diff, {"files": self.entries}, self.config_dir, (), root=True
-            )
+        config = {"files": self.entries, "stateFile": os.path.join(self.tmp, "state.json")}
+        with self.as_root():
+            clean, out = _quiet(diff.show_diff, config, self.config_dir, (), root=True)
         self.assertFalse(clean)
         self.assertIn(f"+ create {self.target}", out)
 

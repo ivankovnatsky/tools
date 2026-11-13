@@ -22,12 +22,17 @@ from tools.mgmt import install_mgmt, release_mgmt
 from tools.mgmt import spec as mgmt_spec
 from tools.mgmt.keys import key_path as mgmt_key_path
 from tools.state import (
+    ROOT_KEY,
     load_json,
+    lock_path,
     migrate_state_file,
     migrate_state_schema,
+    root_records,
     save_json,
+    state_file_path,
     state_lock,
 )
+from tools.user import brew as brew_section
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
@@ -149,10 +154,8 @@ def _read_state(config: dict, root: bool) -> dict:
     """The state a run would act on, read without migrating anything."""
     from tools.state import find_state_file
 
-    if root:
-        return migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
-    state_file = os.path.expanduser(config.get("stateFile") or "~/.local/state/tools/state.json")
-    return migrate_state_schema(load_json(find_state_file(state_file)))
+    state = migrate_state_schema(load_json(find_state_file(state_file_path(config))))
+    return root_records(state) if root else state
 
 
 def _check_only(config: dict, config_paths: list[str], only, root: bool = False) -> None:
@@ -287,9 +290,11 @@ def _sudo_deploy(
     update: bool,
     only=None,
 ) -> None:
-    """System sections as root, then every user section in a child dropped to the user.
-    One prompt covers both; a failed system phase stops before the user phase. Process
-    restarts from both phases run once, at the end."""
+    """User sections in a child dropped to the user, then system sections as root
+    (daemons and host settings run what the user phase installs), then `mgmt` in
+    another user child (its services may be daemons root just started). One prompt
+    covers all; a failed phase stops the ones after it. Process restarts from every
+    phase run once, at the end."""
     pin_hostname()
     if only:
         # Both phases' --only checks before either runs anything.
@@ -300,37 +305,59 @@ def _sudo_deploy(
     if not approve and _sudo_diff(inv, config_paths, scope, only):
         _confirm()
     system = _system_scope(scope)
+    user, mgmt = scope, ()
+    if system and (not scope or "mgmt" in scope):
+        if mgmt_has_work(_load_merged_config(config_paths).get("mgmt")):
+            user = tuple(s for s in (scope or ALL_SECTIONS) if s != "mgmt")
+            mgmt = ("mgmt",)
     restarts: list = []
     daemons: list = []
     try:
+        if user or not scope:
+            rc = _user_phase(inv, config_paths, user, update, only, restarts, daemons)
+            if rc != 0:
+                if system or mgmt:
+                    log(f"Deploy as {inv.login} failed; not running the later phases", Color.RED)
+                sys.exit(1)
         if system:
             merged = _load_merged_config(config_paths)
             config_dir = _resolve_config_dir(config_paths)
-            ok = _deploy(merged, config_dir, system, update, True, restarts, only)
-            if not ok:
-                log(f"System sections failed; not running the rest as {inv.login}", Color.RED)
+            if not _deploy(merged, config_dir, system, update, True, restarts, only, inv=inv):
+                if mgmt:
+                    log("System sections failed; not running mgmt", Color.RED)
                 sys.exit(1)
-        r, w = os.pipe()
-        child_restarts: list = []
-        reader = threading.Thread(
-            target=_read_restarts, args=(r, child_restarts, daemons), daemon=True
-        )
-        reader.start()
-        try:
-            rc = privilege.run_as_user(
-                inv, lambda: _user_deploy(config_paths, scope, update, w, only)
-            )
-        finally:
-            os.close(w)
-            reader.join()
-            os.close(r)
-            restarts += child_restarts
-        if rc != 0:
+        if mgmt and _user_phase(inv, config_paths, mgmt, update, only, restarts, daemons) != 0:
             sys.exit(1)
     finally:
         run_restarts(list(dict.fromkeys(restarts)))
         if daemons and not _restart_daemons(inv, config_paths, daemons):
             sys.exit(1)
+
+
+def _user_phase(
+    inv: privilege.Invoker,
+    config_paths: list[str],
+    scope: tuple,
+    update: bool,
+    only,
+    restarts: list,
+    daemons: list,
+) -> int:
+    """`_user_deploy` in a child dropped to the user; its restart queues land in
+    restarts and daemons. Returns the child's exit code."""
+    r, w = os.pipe()
+    child_restarts: list = []
+    reader = threading.Thread(target=_read_restarts, args=(r, child_restarts, daemons), daemon=True)
+    reader.start()
+    try:
+        return privilege.run_as_user(
+            inv, lambda: _user_deploy(config_paths, scope, update, w, only)
+        )
+    finally:
+        os.close(w)
+        reader.join()
+        os.close(r)
+        restarts += child_restarts
 
 
 def _restart_daemons(inv: privilege.Invoker, config_paths: list[str], queued: list) -> bool:
@@ -339,8 +366,9 @@ def _restart_daemons(inv: privilege.Invoker, config_paths: list[str], queued: li
     unless re-owed since (seq changed); the rest stay owed."""
     seqs = {label: seq for label, seq in queued}
     merged = _load_merged_config(config_paths)
-    with state_lock(privilege.ROOT_STATE_FILE):
-        state = migrate_state_schema(load_json(privilege.ROOT_STATE_FILE))
+    state_file = state_file_path(merged)
+    with state_lock(state_file):
+        state = root_records(migrate_state_schema(load_json(state_file)))
     done: set = set()
     ok = restart_daemons(
         merged.get("launchd"),
@@ -389,28 +417,25 @@ def _deploy(
     restarts: list | None = None,
     only: selection.Only | None = None,
     daemons: list | None = None,
+    inv: privilege.Invoker | None = None,
 ) -> bool:
     """Apply config to bring system to desired state. Returns True on success.
 
     Already-installed items are only upgraded (pulled, refetched) with ``update``.
-    As root (``root``) only system sections run, against the root-owned state file.
+    As root (``root``) only system sections run, against root's records in the user's
+    state file, which is written by a child dropped to the user.
     With ``restarts``, queued process restarts are added there instead of run.
     With ``daemons``, launchd daemons owed a restartUnits restart are added there for the
     root parent; without it they stay pending.
     """
+    state_file = state_file_path(config)
     if root:
-        state_file = privilege.ROOT_STATE_FILE
-    else:
-        # `or`, not a default arg: an explicit `stateFile:` (YAML null) must not
-        # crash expanduser — and it must resolve identically to show_diff.
-        state_file = os.path.expanduser(
-            config.get("stateFile") or "~/.local/state/tools/state.json"
-        )
+        _ensure_user_owned(inv, lock_path(state_file))
     # Overlapping runs (watch, scheduled and manual deploys) would otherwise
     # each save their own copy and drop the other's records.
     with state_lock(state_file):
         return _deploy_locked(
-            config, config_dir, state_file, scope, update, root, restarts, only, daemons
+            config, config_dir, state_file, scope, update, root, restarts, only, daemons, inv
         )
 
 
@@ -424,10 +449,21 @@ def _deploy_locked(
     restarts: list | None = None,
     only: selection.Only | None = None,
     daemons: list | None = None,
+    inv: privilege.Invoker | None = None,
 ) -> bool:
-    if not root:
+    if root:
+        full = migrate_state_schema(load_json(state_file))
+        state = root_records(full)
+
+        def save(records: dict) -> None:
+            _save_as_user(inv, state_file, {**full, ROOT_KEY: records})
+
+    else:
         migrate_state_file(state_file)
-    state = migrate_state_schema(load_json(state_file))
+        state = migrate_state_schema(load_json(state_file))
+
+        def save(records: dict) -> None:
+            save_json(state_file, records)
 
     active = set(scope) if scope else set(ALL_SECTIONS)
 
@@ -441,7 +477,7 @@ def _deploy_locked(
     # become permanently unowned.
     try:
         # Mid-run saves must carry the records set aside for --only too.
-        persist = lambda: save_json(state_file, view.merged(state) if view else state)  # noqa: E731
+        persist = lambda: save(view.merged(state) if view else state)  # noqa: E731
         if view:
             try:
                 view.hide(state)
@@ -477,8 +513,37 @@ def _deploy_locked(
             if view:
                 view.restore(state)
     finally:
-        save_json(state_file, state)
+        save(state)
     return success
+
+
+def _ensure_user_owned(inv: privilege.Invoker | None, path: str) -> None:
+    """As root: create path (and its parents) as the user, so root never creates files in
+    the user's home."""
+    if os.path.exists(path) or not (inv and inv.root):
+        return
+
+    def create() -> int:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        return 0
+
+    if privilege.run_as_user(inv, create) != 0:
+        raise RuntimeError(f"could not create {path} as {inv.login}")
+
+
+def _save_as_user(inv: privilege.Invoker | None, state_file: str, state: dict) -> None:
+    """Save the user's state file; as root, from a child dropped to the user."""
+    if not (inv and inv.root):
+        save_json(state_file, state)
+        return
+
+    def save() -> int:
+        save_json(state_file, state)
+        return 0
+
+    if privilege.run_as_user(inv, save) != 0:
+        raise RuntimeError(f"could not save {state_file} as {inv.login}")
 
 
 def _finish_restarts(restarts: list, deferred: list | None) -> None:
@@ -579,6 +644,12 @@ def _run_sections(
     # UV_PYTHON_INSTALL_DIR) even under a --scope that excludes env.
     env_export_process(config.get("env"))
 
+    # Installs before everything that runs them: sops, git, node, uv, go, rust.
+    if "brew" in active:
+        success &= install_brew_packages(
+            config.get("brew", {}), state, update, phase=brew_section.INSTALL
+        )
+
     # One registry for every file-writing section, taken before any of them runs.
     conflicts = registry()
     # sops and templates first: later sections (mcp secretPaths, ${sopsPath:}
@@ -631,6 +702,14 @@ def _run_sections(
     for line in secrets_flow.format_notify(report):
         log(line, Color.YELLOW)
 
+    # Before bun/npm/mcp: install scripts can bring runtimes and CLIs (claude).
+    # Gate on state as well as config, or dropping the last entry means the
+    # reconciler never runs again and its state is orphaned forever.
+    if "curlShell" in active and (
+        config.get("curlShell") or state.get("curlShell", {}).get("installed")
+    ):
+        success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
+
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
     # with nothing configured raises KeyError on a machine show_diff calls
     # clean. Gate them like uv/go: run only when there is work or state.
@@ -677,12 +756,11 @@ def _run_sections(
         if mcp_servers or state.get("mcp", {}).get("servers"):
             success &= install_mcp_servers(mcp_servers, paths, state)
 
-    # Gate on state as well as config, or dropping the last entry means the
-    # reconciler never runs again and its state is orphaned forever.
-    if "curlShell" in active and (
-        config.get("curlShell") or state.get("curlShell", {}).get("installed")
-    ):
-        success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
+    # Removals after the package managers, which may still need a runtime brew drops.
+    if "brew" in active:
+        success &= install_brew_packages(
+            config.get("brew", {}), state, update, phase=brew_section.REMOVE
+        )
 
     if "files" in active:
         success &= install_files(
@@ -708,9 +786,6 @@ def _run_sections(
     # After skills, so links into freshly installed skill dirs find their source.
     if "links" in active and links_has_work(config.get("links") or [], state):
         success &= install_links(config.get("links") or [], state)
-
-    if "brew" in active:
-        success &= install_brew_packages(config.get("brew", {}), state, update)
 
     if "ollamaModels" in active:
         success &= install_ollama_models(config.get("ollamaModels", {}) or {}, state, update)
@@ -814,8 +889,9 @@ def main(verbose):
 def deploy(config, scope, only, approve, update):
     """Apply config to bring system to desired state.
 
-    Under `sudo`, system work (system files, launchd daemons, system defaults, settingsctl
-    host settings) runs as root first, then everything else as the invoking user.
+    Under `sudo`, everything but system work runs as the invoking user first, then system
+    work (system files, launchd daemons, system defaults, settingsctl host settings) as root,
+    then mgmt as the user.
     """
     inv = _invoker()
     scope, only = _selection(scope, only)
@@ -891,14 +967,9 @@ def status(config):
 
     inv = _invoker()
     merged = _load_merged_config(list(config))
+    state = migrate_state_schema(load_json(find_state_file(state_file_path(merged))))
     if inv.root:
-        state_file = privilege.ROOT_STATE_FILE
-    else:
-        state_file = os.path.expanduser(
-            merged.get("stateFile") or "~/.local/state/tools/state.json"
-        )
-        state_file = find_state_file(state_file)
-    state = migrate_state_schema(load_json(state_file))
+        state = root_records(state)
     try:
         rows = status_rows(merged.get("launchd"), state)
     except PermissionError as e:

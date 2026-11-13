@@ -835,3 +835,119 @@ class BrewPrefixTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrewPhaseTest(unittest.TestCase):
+    """INSTALL runs taps, installs and Mac App Store apps; REMOVE runs removals and
+    untaps; together they do what one unphased reconcile does."""
+
+    def _run(self, phase, state):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd[1:])
+            return 0, "", ""
+
+        config = {"brews": ["new"], "taps": ["x/new"]}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertTrue(brew.install_brew_packages(config, state, phase=phase))
+        return calls
+
+    def state(self):
+        return {"brew": {"brews": ["old"], "casks": [], "taps": ["x/old"], "masApps": {}}}
+
+    def test_install_phase_never_removes(self):
+        state = self.state()
+        calls = self._run(brew.INSTALL, state)
+        self.assertEqual(calls, [["tap", "x/new"], ["install", "new"]])
+        self.assertEqual(state["brew"]["brews"], ["new", "old"])
+        self.assertEqual(state["brew"]["taps"], ["x/new", "x/old"])
+
+    def test_remove_phase_never_installs(self):
+        state = self.state()
+        calls = self._run(brew.REMOVE, state)
+        self.assertEqual(calls, [["uninstall", "old"], ["autoremove"], ["untap", "x/old"]])
+        self.assertEqual(state["brew"]["brews"], [])
+        self.assertEqual(state["brew"]["taps"], [])
+
+    def test_both_phases_converge_like_one_run(self):
+        state = self.state()
+        self._run(brew.INSTALL, state)
+        self._run(brew.REMOVE, state)
+        self.assertEqual(state["brew"]["brews"], ["new"])
+        self.assertEqual(state["brew"]["taps"], ["x/new"])
+
+    def test_install_phase_skips_the_cleanup_query(self):
+        state = self.state()
+        with mock.patch.object(brew, "query_installed") as query:
+            calls = self._run_cleanup(brew.INSTALL, state)
+        query.assert_not_called()
+        self.assertNotIn(["uninstall", "old"], calls)
+
+    def _run_cleanup(self, phase, state):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd[1:])
+            return 0, "", ""
+
+        config = {"brews": ["new"], "onActivation": {"cleanup": "zap"}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            brew.install_brew_packages(config, state, phase=phase)
+        return calls
+
+
+class BrewPhaseCleanupTest(unittest.TestCase):
+    def test_remove_phase_cleanup_keeps_mas_while_an_app_removal_is_pending(self):
+        live = {"brews": [], "casks": [], "taps": [], "leaves": [], "deferred": [], "pending": []}
+        spec, _ = brew.parse_brew({"brews": [], "onActivation": {"cleanup": "zap"}})
+        prev = {"masApps": {"App": 1}}
+        seen = []
+
+        def targets(spec, prev, plan, live):
+            seen.append(plan["mas_remove"])
+            return brew._no_cleanup()
+
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", return_value=(0, "", "")),
+            mock.patch.object(brew, "query_installed", return_value=(live, None)),
+            mock.patch.object(brew, "cleanup_targets", side_effect=targets),
+        ):
+            brew.install_brew_packages(
+                {"onActivation": {"cleanup": "zap"}}, {"brew": prev}, phase=brew.REMOVE
+            )
+        self.assertEqual(seen, [[("App", 1)]])
+
+
+class BrewPhaseMasTest(unittest.TestCase):
+    def test_remove_phase_never_records_apps_install_did_not_install(self):
+        state = {}
+        config = {"masApps": {"Pages": 1}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", return_value=(0, "", "")),
+            mock.patch.object(brew, "_mas_bin_from_env", return_value=None),
+        ):
+            self.assertFalse(brew.install_brew_packages(config, state, phase=brew.INSTALL))
+            self.assertEqual(state["brew"]["masApps"], {})
+            self.assertTrue(brew.install_brew_packages(config, state, phase=brew.REMOVE))
+        self.assertEqual(state["brew"]["masApps"], {})
+
+    def test_rename_is_still_adopted(self):
+        state = {"brew": {"brews": [], "casks": [], "taps": [], "masApps": {"Old": 1}}}
+        with mock.patch.object(brew.sys, "platform", "darwin"):
+            self.assertTrue(
+                brew.install_brew_packages({"masApps": {"New": 1}}, state, phase=brew.REMOVE)
+            )
+        self.assertEqual(state["brew"]["masApps"], {"New": 1})

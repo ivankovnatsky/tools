@@ -2808,6 +2808,55 @@ class DisabledLogDirTest(LaunchdTestBase):
         self.assertFalse(os.path.exists(self.daemon_path("d")))
 
 
+class MissingProgramTest(LaunchdTestBase):
+    """A job whose program is missing (its package failed to install) is not started."""
+
+    def test_missing_program_is_not_started_until_it_exists(self):
+        program = os.path.join(self.tmp, "bin", "tailscaled")
+        raw = self.cfg(daemons={"ts": {"command": program, "keepAlive": False}})
+        self.assertIn(f"  ! skip org.example.ts: program {program} not found; not starting it",
+                      self.diff(raw))  # fmt: skip
+        self.deploy(raw)
+        self.assertFalse(os.path.exists(self.daemon_path("ts")))
+        self.assertEqual(self.fake.verbs("bootstrap"), [])
+
+        os.makedirs(os.path.dirname(program))
+        open(program, "w").close()
+        self.assertTrue(self.deploy(raw))
+        self.assertTrue(os.path.exists(self.daemon_path("ts")))
+        self.assertIn("org.example.ts", self.fake.loaded)
+
+    def test_program_arguments_and_quoted_commands(self):
+        app = "/Applications/No Such.app/Contents/MacOS/app"
+        args = launchd.Service("a", "l", program_arguments=[app, "-v"])
+        quoted = launchd.Service("a", "l", command=f'"{app}" \\\n  --flag')
+        self.assertEqual(launchd.program_of(args), app)
+        self.assertEqual(launchd.program_of(quoted), app)
+        self.assertIsNone(launchd.program_of(launchd.Service("a", "l", command="srv --x")))
+        for svc in (
+            launchd.Service("a", "l", command="/opt/${X}/bin/foo"),
+            launchd.Service("a", "l", command="/opt/`uname -m`/foo"),
+            launchd.Service("a", "l", command="/opt/x/foo", pre_start="install foo"),
+        ):
+            self.assertIsNone(launchd.program_of(svc), svc)
+
+    def test_not_judged_when_waiting_or_relative_or_disabled(self):
+        missing = os.path.join(self.tmp, "Volumes", "Storage", "bin", "x")
+        cases = {
+            "relative command": {"command": "srv --flag"},
+            "waitForPaths absent": {
+                "command": "/nonexistent/bin/x",
+                "waitForPaths": [os.path.join(self.tmp, "absent")],
+            },
+            "disabled": {"command": "/nonexistent/bin/x", "disabled": True},
+        }
+        for name, svc in cases.items():
+            with self.subTest(name):
+                self.assertNotIn("not found", "\n".join(self.diff(self.cfg({"a": svc}))))
+        self.env.ismount = lambda _p: False
+        self.assertNotIn("not found", "\n".join(self.diff(self.cfg({"a": {"command": missing}}))))
+
+
 class CliGatingTest(unittest.TestCase):
     def _deploy(self, config, state):
         with (
@@ -2851,17 +2900,20 @@ class CliStatusTest(unittest.TestCase):
         self.assertIn("system/org.example.b: not loaded", result.output)
         save.assert_not_called()
 
-    def test_status_as_root_reads_only_the_root_state(self):
+    def test_status_as_root_reads_only_the_root_records(self):
+        user = {"version": 2, "launchd": {"services": {"u": {}}}}
+        root = {"launchd": {"services": {"r": {}}}}
         with (
             mock.patch.object(cli, "_invoker", return_value=SimpleNamespace(root=True)),
             mock.patch.object(cli, "_load_merged_config", return_value={"stateFile": "/u/s.json"}),
-            mock.patch.object(cli.privilege, "ROOT_STATE_FILE", "/root/state.json"),
-            mock.patch.object(cli, "load_json", return_value={}) as load,
-            mock.patch.object(cli, "status_rows", return_value=[]),
+            mock.patch("tools.state.os.path.isfile", return_value=True),
+            mock.patch.object(cli, "load_json", return_value={**user, "root": root}) as load,
+            mock.patch.object(cli, "status_rows", return_value=[]) as rows,
         ):
             result = CliRunner().invoke(cli.main, ["status"])
         self.assertEqual(result.exit_code, 0, result.output)
-        load.assert_called_once_with("/root/state.json")
+        load.assert_called_once_with("/u/s.json")
+        self.assertEqual(rows.call_args.args[1], root)
 
 
 if __name__ == "__main__":

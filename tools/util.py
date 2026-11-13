@@ -14,9 +14,14 @@ _DIFF_MAX_LINES = 200
 
 
 def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int, str, str]:
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, env=env or os.environ.copy(), cwd=cwd
-    )
+    """(returncode, stdout, stderr); a command that cannot start (e.g. its runtime is
+    not installed yet) is exit 127 with the reason in stderr instead of an exception."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=env or os.environ.copy(), cwd=cwd
+        )
+    except OSError as exc:
+        return 127, "", f"{exc.filename or cmd[0]}: {exc.strerror or exc}"
     return result.returncode, result.stdout, result.stderr
 
 

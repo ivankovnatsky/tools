@@ -99,26 +99,29 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
 - tools refuses to run as root unless sudo started it for a normal user:
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
-- First, as root: `files` entries the user cannot write, `launchd` daemons,
-  `defaults` `system:` keys, `settingsctl` host settings and `users` login
-  shells, with root's own state in
-  `/var/db/tools/state.json`. Root never reads or writes the
-  user's state file, the `mgmt` key, or anything under the user's home: a
-  daemon whose plist, log dir, log files or `workingDirectory` falls under it
-  is an error (other daemons still deploy).
-- Then everything else (all other sections, other `files` entries, launchd
+- First, everything else (all other sections, other `files` entries, launchd
   agents, `user` and `currentHost` defaults) runs in a forked child that has permanently dropped
   to `SUDO_USER` (`initgroups`, `setgid`, `setuid`; it aborts if it can get
   uid 0 back). That child is a plain `tools deploy --approve` as the user: same
   config resolution, the user's state file, `HOME`/`USER`/`LOGNAME`/`SHELL`
   from the user's account, no `TMPDIR` or `SUDO_*` variables.
-- `PATH` in that child is the one sudo passed, with these added in front when
+- Then, as root: `files` entries the user cannot write, `launchd` daemons,
+  `defaults` `system:` keys, `settingsctl` host settings and `users` login
+  shells. Their records go under `root` in the user's state file, saved by a
+  child dropped to the user, so the file stays the user's. Root writes nothing else under the user's home,
+  nor the `mgmt` key: a daemon whose plist, log dir, log files or
+  `workingDirectory` falls under it is an error (other daemons still deploy).
+  Root goes second because daemons and host settings run what the user phase
+  installs (brew, uv).
+- Last, when root runs and `mgmt` has work: `mgmt` in another dropped child, so a
+  service it configures can be a daemon root just started.
+- `PATH` in the user child is the one sudo passed, with these added in front when
   they exist and are missing: `~/.local/bin`, `/opt/homebrew/bin`,
   `/opt/homebrew/sbin`, `/usr/local/bin`; `/usr/bin:/bin:/usr/sbin:/sbin` go
   last when missing. Shell rc files are never read.
 - Both diffs are shown first (root's, then the user's from a short-lived
-  dropped child) and one prompt covers both. A failed system phase stops the
-  run before the user phase; a failure in either exits non-zero.
+  dropped child) and one prompt covers both. A failed phase stops the phases
+  after it; a failure in any exits non-zero.
 - `--scope` restricts both phases; a scope without `files`, `launchd`,
   `defaults`, `settingsctl` or `users` skips the root phase. `sudo tools diff` shows both diffs the same way.
   `watch` and `reconcile` refuse root.
@@ -204,7 +207,7 @@ Notable keys:
   way is the user's when they own it; anything else is the user's when they
   can write the directory where the walk stopped. Otherwise it is a root-owned
   system file, deployed only
-  by `sudo tools deploy` and tracked in root's state. It takes only `source`,
+  by `sudo tools deploy` and tracked in root's records. It takes only `source`,
   `target`, `mode` and `secrets`; a target in a directory a non-root user can
   change is refused. A target not owned by root is replaced even when its
   content matches. As the user, deploy and diff leave it alone and print one
@@ -639,6 +642,11 @@ outdated dependency the new package requires). `environment` can override both.
 With `--update`, `brew upgrade` runs on the tracked formulae and casks and
 `mas upgrade` on the tracked App Store apps.
 
+A deploy runs brew twice: taps, installs and App Store apps first (before
+everything that runs them: sops, git, node, uv, go, rust), removals, cleanup and
+untaps after npm/uv/go/cargo, so a dropped runtime is still there while their
+packages are removed.
+
 Without `cleanup`, brew follows [State and ownership](#state-and-ownership):
 deploy never queries live brew and removes only formulae, casks, taps, App Store
 apps and trusted taps it recorded installing. Trusted taps it adds are untrusted
@@ -695,8 +703,8 @@ the cleanup removals are skipped (deploy reports failure) and diff shows
 
 `agents` (user domain, `gui/<uid>`) and `daemons` (system domain). macOS only.
 Agents mirror nix-config's home `local.launchd`, daemons its darwin one; see the differences below.
-`tools deploy` manages agents; `sudo tools deploy` manages daemons as root, then
-agents as the user (see "Running with sudo").
+`tools deploy` manages agents; `sudo tools deploy` manages agents as the user, then
+daemons as root (see "Running with sudo").
 
 ```yaml
 launchd:
@@ -735,6 +743,7 @@ Behaviour:
 
 - Wrapper, always (also for `programArguments`), as nix: `set -e`, `PATH=/bin:/usr/bin:$PATH`, `mkdir -p` + `chmod 755` logDir, waits, dirs, `preStart`, `exec`.
 - A section-level error (e.g. a bad `logDir`) holds every create, update and removal.
+- A job whose program (an absolute first word of `command`, or `programArguments[0]`) does not exist is skipped with a warning and not started, e.g. when its package failed to install; it is created on the deploy after it appears. Not judged for a job with `preStart` or a first word the shell expands (`$`, backticks), nor while a `waitForPaths` entry or the program's volume is missing.
 - The old `launchd.services`, `launchd.sudo` and per-job `domain` keys are config errors naming their replacement.
 - The same label under `agents` and `daemons` is a config error.
 - A label loaded from another plist is never booted out: a conflict error on create, forgotten with a warning on removal.
@@ -771,9 +780,9 @@ templates:
 
 - A create, update or replace of the file (not a chmod) records the label as owed in the user's state; the launchd section then pays it. Content is compared in memory, so no hash of a secret is stored.
 - Agents: a loaded job is restarted with `kickstart -k`; one this run created, updated, loaded or re-enabled already started with the new file; a disabled one has nothing to restart. A failed kickstart, or a job held by an error, stays owed for the next deploy.
-- Daemons: sops, templates and fetch are user-scope, so they change during the user phase of `sudo tools deploy`, after root has handled daemons. The user phase hands the labels to root, which kickstarts each one after it, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
+- Daemons: sops, templates and fetch are user-scope, so they change during the user phase of `sudo tools deploy`. The user phase hands the labels to root, which kickstarts each one after the root phase, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
 - A label no configured job has is dropped with a warning (not while the launchd section has errors, or under `--only`).
-- Prefer this to `restartOn` for files sops/templates/fetch write: a daemon's `restartOn` hash is read in the root phase, before the user phase rewrites them, so it sees the change one deploy late, and it keeps a hash of secret content in state.
+- Prefer this to `restartOn` for files sops/templates/fetch write: a daemon's `restartOn` keeps a hash of secret content in state.
 
 ### Differences from nix-config
 
@@ -1125,8 +1134,7 @@ Every deploy (including each `watch` run) holds an exclusive lock on
 `<stateFile>.lock` (0600) from reading the state to its last save, so
 overlapping runs (`watch`, scheduled and manual deploys) never drop each
 other's records; a second run logs `Waiting for another tools run to finish`
-and waits. Under sudo, root locks `/var/db/tools/state.json.lock` and the user
-child locks its own. `diff` and `status` only read and never wait. Saves go to
+and waits. Under sudo, each phase takes the same lock in turn. `diff` and `status` only read and never wait. Saves go to
 a unique temp file beside the state and are renamed into place.
 
 ## Security notes

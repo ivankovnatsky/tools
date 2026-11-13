@@ -37,3 +37,12 @@ class VersionChangedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunCommandTest(unittest.TestCase):
+    def test_missing_binary_is_exit_127_not_an_exception(self):
+        from tools.util import run_command
+
+        rc, out, err = run_command(["/nonexistent/tools-test/npm", "-v"])
+        self.assertEqual((rc, out), (127, ""))
+        self.assertEqual(err, "/nonexistent/tools-test/npm: No such file or directory")

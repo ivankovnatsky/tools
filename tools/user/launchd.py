@@ -219,6 +219,7 @@ class Env:
     home: Optional[str] = None
     login: Optional[str] = None  # login user name; default from uid
     ismount: Callable[[str], bool] = os.path.ismount
+    exists: Callable[[str], bool] = os.path.exists
     is_darwin: bool = field(default_factory=lambda: sys.platform == "darwin")
     bootout_polls: int = 50
     poll_interval: float = 0.2
@@ -1349,6 +1350,39 @@ def workdir_block(svc: Service, env: Env) -> Optional[str]:
     )
 
 
+def program_of(svc: Service) -> Optional[str]:
+    """The absolute program a job runs (programArguments[0] or the command's first
+    word), or None when it isn't a literal absolute path or `preStart` may provide it."""
+    if svc.pre_start:
+        return None
+    if svc.program_arguments:
+        first = svc.program_arguments[0]
+    else:
+        try:
+            words = shlex.split(svc.command or "")
+        except ValueError:
+            return None
+        first = words[0] if words else ""
+    # The wrapper's shell expands the command before `exec`.
+    literal = svc.program_arguments or not any(c in first for c in "$`")
+    return first if literal and os.path.isabs(first) else None
+
+
+def program_block(svc: Service, env: Env) -> Optional[str]:
+    """Why a job must not be started yet: its program is missing (e.g. its package failed
+    to install). Not judged while a waitForPaths entry or the program's volume is absent:
+    the job waits for those itself."""
+    program = program_of(svc)
+    if svc.disabled or program is None or env.exists(program):
+        return None
+    if any(not env.exists(p) for p in svc.wait_for_paths):
+        return None
+    volume = volume_of(program, env.volumes_root)
+    if volume and not env.ismount(volume):
+        return None
+    return f"program {program} not found; not starting it"
+
+
 def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> bool:
     """Create a missing workingDirectory: as the user for agents, root-only `mkdir`s as root
     for daemons (only where `_root_mkdir_ok`). False when a daemon that will be started
@@ -1609,7 +1643,7 @@ def plan(
                 continue
             # A disabled job only gets stopped, so a bad log dir must not hold the deploy.
             p.blocked += [(svc.label, e) for e in dir_errors]
-        blocked = workdir_block(svc, env)
+        blocked = workdir_block(svc, env) or program_block(svc, env)
         if blocked:
             p.blocked.append((svc.label, blocked))
             continue

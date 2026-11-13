@@ -98,3 +98,14 @@ class NpmUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NpmMissingRuntimeTest(unittest.TestCase):
+    def test_missing_npm_fails_the_section_without_raising(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = {"nodejs": str(Path(temp_dir) / "none"), "npmBin": f"{temp_dir}/bin"}
+            state = {}
+            with mock.patch.object(npm_mod, "log") as log:
+                self.assertFalse(install_npm_packages({"a": {}}, paths, state, {}))
+            self.assertIn("none/npm: No such file or directory", str(log.call_args_list))
+            self.assertNotIn("a", state.get("npm", {}).get("packages", {}))

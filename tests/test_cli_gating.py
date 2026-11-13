@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import tempfile
@@ -274,7 +275,6 @@ class RestartUnitsWiringTest(unittest.TestCase):
 
             with (
                 mock.patch.object(cli, "_load_merged_config", return_value=config),
-                mock.patch.object(cli.privilege, "ROOT_STATE_FILE", os.path.join(tmp, "root.json")),
                 mock.patch.object(cli, "restart_daemons", side_effect=restart),
                 mock.patch.object(cli.privilege, "run_as_user", side_effect=lambda _inv, fn: fn()),
             ):
@@ -649,7 +649,6 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.tmp = self._tmp.name
         self.user_state = os.path.join(self.tmp, "user", "state.json")
         os.makedirs(os.path.dirname(self.user_state))
-        self.root_state = os.path.join(self.tmp, "root", "state.json")
         self.config = {
             "stateFile": self.user_state,
             "launchd": {"daemons": {"d": {"command": "x"}}, "agents": {"a": {"command": "y"}}},
@@ -694,7 +693,6 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         if show_diff is not None:
             patches.append(mock.patch.object(cli, "show_diff", side_effect=show_diff))
         with (
-            mock.patch.object(privilege, "ROOT_STATE_FILE", self.root_state),
             mock.patch.object(privilege, "run_as_user", side_effect=self.fake_run_as_user),
             mock.patch.object(cli, "_load_merged_config", side_effect=self.load),
             mock.patch.object(cli, "migrate_state_file"),
@@ -724,25 +722,27 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(self.events[0], ("pin",))
 
-    def test_system_sections_as_root_then_everything_else_as_the_user(self):
+    def test_user_sections_then_system_sections_as_root(self):
         result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             self.steps(),
             [
-                ("install_launchd", 0),
-                ("install_defaults", 0),
                 ("drop", 501),
+                ("install_brew_packages", 501),
                 ("install_brew_packages", 501),
                 ("install_launchd", 501),
                 ("install_defaults", 501),
                 ("install_dock", 501),
+                ("install_launchd", 0),
+                ("install_defaults", 0),
+                ("drop", 501),
             ],
         )
         self.assertEqual(
             self.ops[0].calls[:3], [("initgroups", "me", 20), ("setgid", 20), ("setuid", 501)]
         )
-        self.assertTrue(os.path.exists(self.root_state))
+        self.assertIn("root", cli.load_json(self.user_state))
         self.assertTrue(os.path.exists(self.user_state))
         self.assertEqual({e[2] for e in self.events if e[0] == "load"}, {"/Users/me"})
 
@@ -786,14 +786,18 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def test_scope_restricts_both_phases(self):
         result = self.run_cli(["deploy", "--approve", "--scope", "brew"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(self.steps(), [("drop", 501), ("install_brew_packages", 501)])
-        self.assertFalse(os.path.exists(self.root_state))
+        self.assertEqual(
+            self.steps(),
+            [("drop", 501), ("install_brew_packages", 501), ("install_brew_packages", 501)],
+        )
+        self.assertNotIn("root", cli.load_json(self.user_state))
 
         self.events.clear()
         result = self.run_cli(["deploy", "--approve", "--scope", "launchd"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
-            self.steps(), [("install_launchd", 0), ("drop", 501), ("install_launchd", 501)]
+            self.steps(),
+            [("drop", 501), ("install_launchd", 501), ("install_launchd", 0), ("drop", 501)],
         )
 
     def test_only_narrows_both_phases(self):
@@ -818,7 +822,12 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             [(n, uid) for n, uid, _raw in seen],
-            [("install_launchd", 0), ("install_brew_packages", 501), ("install_launchd", 501)],
+            [
+                ("install_brew_packages", 501),
+                ("install_brew_packages", 501),
+                ("install_launchd", 501),
+                ("install_launchd", 0),
+            ],
         )
         for name, _uid, raw in seen:
             if name == "install_launchd":
@@ -843,18 +852,51 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
                 self.assertEqual(self.steps(), [("drop", 501)])
                 self.prompted.assert_not_called()
 
-    def test_failed_system_phase_stops_before_the_user_phase(self):
-        self.results[("install_launchd", 0)] = False
-        result = self.run_cli(["deploy", "--approve"])
-        self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("System sections failed; not running the rest as me", result.output)
-        self.assertNotIn(("drop", 501), self.events)
+    def run_with_mgmt(self, args):
+        self.config["mgmt"] = {"x": {}}
+        with (
+            mock.patch.object(cli, "mgmt_has_work", return_value=True),
+            mock.patch.object(cli, "install_mgmt", side_effect=self.step("install_mgmt")),
+        ):
+            return self.run_cli(args)
 
-    def test_failed_user_phase_fails_the_run(self):
+    def test_mgmt_runs_after_root_started_daemons(self):
+        result = self.run_with_mgmt(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        steps = self.steps()
+        self.assertEqual(
+            # The first drop saves root's records into the user's state.
+            steps[-4:],
+            [("install_defaults", 0), ("drop", 501), ("drop", 501), ("install_mgmt", 501)],
+        )
+        self.assertEqual(steps.count(("install_mgmt", 501)), 1)
+
+        self.events.clear()
+        result = self.run_with_mgmt(["deploy", "--approve", "--scope", "mgmt"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.steps(), [("drop", 501), ("install_mgmt", 501)])
+
+    def test_failed_system_phase_skips_mgmt(self):
+        self.results[("install_launchd", 0)] = False
+        result = self.run_with_mgmt(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("System sections failed; not running mgmt", result.output)
+        self.assertNotIn(("install_mgmt", 501), self.events)
+
+    def test_failed_user_phase_stops_before_the_system_phase(self):
         self.results[("install_brew_packages", 501)] = False
         result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Deploy as me failed; not running the later phases", result.output)
         self.assertIn(("install_dock", 501), self.events)
+        self.assertFalse([e for e in self.steps() if e[1] == 0])
+
+    def test_failed_system_phase_fails_the_run(self):
+        self.results[("install_launchd", 0)] = False
+        result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn(("install_dock", 501), self.events)
+        self.assertIn(("install_defaults", 0), self.events)
 
     def test_restarts_run_once_after_both_phases(self):
         self.queues = {"install_defaults": ["Dock"], "install_dock": ["Dock", "SystemUIServer"]}
@@ -864,11 +906,11 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(restarts, [("restart", ["Dock", "SystemUIServer"])])
         self.assertEqual(self.events[-1], restarts[0])
 
-    def test_root_restarts_run_when_the_user_phase_fails_or_is_skipped(self):
+    def test_restarts_run_when_either_phase_fails(self):
         self.queues = {"install_defaults": ["Dock"]}
         cases = {
             "user phase fails": ("install_brew_packages", 501),
-            "user phase skipped": ("install_launchd", 0),
+            "system phase fails": ("install_launchd", 0),
         }
         for label, failing in cases.items():
             with self.subTest(label):
@@ -907,9 +949,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0, result.output)
         self.assertEqual(self.events[-1], ("restart", ["Dock", "Finder"]))
 
-    def test_root_restarts_run_when_the_user_child_crashes(self):
-        self.queues = {"install_defaults": ["Dock"]}
-
+    def test_crashed_user_child_skips_the_system_phase(self):
         root_load = self.load
 
         def load(paths):
@@ -920,7 +960,8 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         with mock.patch.object(self, "load", side_effect=load):
             result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertEqual(self.events[-1], ("restart", ["Dock"]))
+        self.assertEqual(self.steps(), [("drop", 501)])
+        self.assertEqual(self.events[-1], ("restart", []))
 
     def test_failed_user_diff_deploys_nothing(self):
         def show_diff(_c, _d, _s, root=False, only=None):
@@ -948,6 +989,70 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         result = self.run_cli(["diff"], show_diff=lambda *_a, **_k: seen.append(1) or True)
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(len(seen), 2)
+
+
+class DeployOrderTest(unittest.TestCase):
+    """A fresh host converges in one run: runtimes before what runs them, user packages
+    before the root phase that starts daemons on them."""
+
+    def test_runtimes_install_before_what_runs_them(self):
+        calls = []
+
+        def rec(name):
+            return lambda *a, **k: calls.append(name) or True
+
+        config = {
+            "brew": {"brews": ["node"]},
+            "curlShell": {"https://example.com/install.sh": "bash"},
+            "gitRepos": {"/r": "u"},
+            "bun": {"packages": {"a": {}}},
+            "npm": {"packages": {"a": {}}},
+            "uv": {"packages": {"a": {}}},
+            "go": {"packages": {"a": {}}},
+            "cargo": {"packages": {"a": {}}},
+            "pi": {"packages": {"a": {}}},
+            "mcp": {"servers": {"a": {}}},
+            "launchd": {"agents": {"a": {"command": "a"}}},
+        }
+        patches = {
+            "env_export_process": None,
+            "load_json": {},
+            "migrate_state_file": None,
+            "save_json": None,
+            "state_lock": mock.MagicMock(),
+            "install_files": True,
+            "install_ollama_models": True,
+            "install_flatpak_packages": True,
+            "stale_units": set(),
+        }
+        recorded = {
+            "install_brew_packages": "brew",
+            "install_curl_shell_scripts": "curlShell",
+            "install_git_repos": "gitRepos",
+            "install_bun_packages": "bun",
+            "install_npm_packages": "npm",
+            "install_uv_packages": "uv",
+            "install_go_packages": "go",
+            "install_cargo_packages": "cargo",
+            "install_pi_packages": "pi",
+            "install_mcp_servers": "mcp",
+            "install_launchd": "launchd",
+        }
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(cli, name, return_value=value))
+            for name, label in recorded.items():
+                stack.enter_context(mock.patch.object(cli, name, side_effect=rec(label)))
+            stack.enter_context(mock.patch.object(cli.sops_section, "has_work", return_value=True))
+            stack.enter_context(
+                mock.patch.object(cli.secrets_flow, "deploy_sops", side_effect=rec("sops"))
+            )
+            self.assertTrue(cli._deploy(config, "/tmp"))
+        self.assertEqual(
+            calls,
+            ["brew", "sops", "gitRepos", "curlShell", "bun", "npm", "uv", "go", "cargo", "pi",
+             "mcp", "brew", "launchd"],
+        )  # fmt: skip
 
 
 if __name__ == "__main__":
