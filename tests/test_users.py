@@ -581,7 +581,7 @@ class WiringTest(unittest.TestCase):
     def test_root_deploy_runs_with_records_only(self):
         state = created_state(guest=GUEST_REC)
         with (
-            mock.patch.object(cli, "load_json", return_value=state),
+            mock.patch.object(cli, "load_json", return_value={"root": state}),
             mock.patch.object(cli, "migrate_state_schema", side_effect=lambda s: s),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),

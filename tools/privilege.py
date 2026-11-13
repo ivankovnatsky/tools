@@ -1,7 +1,7 @@
 """Who tools acts for: the login user, or root via `sudo tools deploy` on that user's behalf.
 
 Under sudo, root does only system work (`files` system entries, launchd daemons,
-`defaults` system scope, `settingsctl` host settings, `users` login shells), keeps its
+`defaults` system scope, `settingsctl` host settings, `users` accounts), keeps its
 records under `root` in the user's state file (written by a child dropped to the user)
 and never writes in the user's home; everything else runs in a forked
 child that has permanently dropped to the user (`run_as_user`). tools itself never calls
