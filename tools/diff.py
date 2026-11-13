@@ -731,8 +731,8 @@ def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
         changes = _diff_files(config.get("files") or [], config_dir, state, system=True)
         if changes:
             sections.append(("files", changes))
-    if "users" in active and users_has_work(config.get("users")):
-        changes = diff_users(config.get("users"))
+    if "users" in active and users_has_work(config.get("users"), state):
+        changes = diff_users(config.get("users"), state)
         if changes:
             sections.append(("users", changes))
     if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):

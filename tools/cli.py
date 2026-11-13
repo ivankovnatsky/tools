@@ -568,8 +568,8 @@ def _run_root_sections(
     if "files" in active and files_has_system_work(config.get("files"), state):
         success &= install_files(config.get("files") or [], config_dir, state, system=True)
     # After files, which may write /etc/shells.
-    if "users" in active and users_has_work(config.get("users")):
-        success &= install_users(config.get("users"))
+    if "users" in active and users_has_work(config.get("users"), state):
+        success &= install_users(config.get("users"), state)
     if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
         success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):

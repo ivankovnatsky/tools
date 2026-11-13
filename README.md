@@ -967,21 +967,25 @@ settingsctl:
 
 ## users
 
-`users:` checks the uid and sets the login shell of existing accounts on macOS.
-tools never creates, deletes or renumbers accounts.
+`users:` checks the uid and sets the login shell of macOS accounts, and creates
+and deletes accounts it is asked to own. tools never renumbers accounts.
 
 ```yaml
 users:
   ivan:
     uid: 502                       # checked only
     shell: /opt/homebrew/bin/fish  # dscl . -create /Users/ivan UserShell ...
+  guest:
+    uid: 600                       # required with create; 501 or higher
+    create: true                   # create when missing
+    deleteHome: false              # on deletion also remove /Users/guest
 ```
 
 - Runs in the sudo phase, after system `files` (which may write `/etc/shells`).
   Without sudo, `deploy` and `diff` read the accounts and print a note pointing
   at `sudo tools deploy --scope users`.
 - A uid that differs is reported and that user is skipped, shell included. A
-  missing user fails the section.
+  missing user without `create: true` fails the section.
 - Only local accounts (`dscl .`) are changed; a user found only in another
   directory node fails the section.
 - The shell must be listed in `/etc/shells` and be executable by that user, or
@@ -989,7 +993,21 @@ users:
   (brew runs in the user phase) is reported and skipped.
 - `diff` checks the current `/etc/shells`, not one the same run's `files`
   section is about to write.
-- A user that leaves config is left as is. Any config error holds the section.
+- `create: true` creates a missing account with `dscl .`: the given uid,
+  primary group staff (20), `shell` (default `/bin/zsh`, must be in
+  `/etc/shells`) and home `/Users/NAME` made by `createhomedir`. It has no
+  password (`Password *`, login disabled); tools never handles passwords, so
+  set one yourself (`sudo passwd NAME`) if it should log in. Creation is
+  refused, and the section fails, when the name or uid is taken or
+  `/Users/NAME` already exists.
+- Created accounts are recorded in root's state. Once one leaves config it is
+  deleted with `dscl . -delete`; its home is kept unless `deleteHome: true` was
+  deployed while the entry was still in config, and then removed only if it is
+  a directory owned by that uid. A recorded account whose uid changed, or that
+  is no longer local, is reported and kept; one already gone is forgotten.
+- Never deleted: accounts tools did not create, root, uid 0, uids below 501, the
+  current user and `SUDO_USER`. Any other user that leaves config is left as is.
+  Any config error holds the section.
 
 ## plist
 
