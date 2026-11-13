@@ -12,8 +12,8 @@ FISH = "/opt/homebrew/bin/fish"
 MINI = {"ivan": {"uid": 502, "shell": FISH}}
 
 
-def account(name="ivan", uid=502, shell="/bin/zsh"):
-    return pwd.struct_passwd((name, "*", uid, 20, "", f"/Users/{name}", shell))
+def account(name="ivan", uid=502, shell="/bin/zsh", gid=20):
+    return pwd.struct_passwd((name, "*", uid, gid, "", f"/Users/{name}", shell))
 
 
 def getpwnam_of(*accounts):
@@ -112,7 +112,8 @@ class PlanTest(unittest.TestCase):
             os.chmod(d, 0o755)
             link = os.path.join(hidden, "sh")
             os.symlink("/bin/sh", link)
-            other = account("bob", uid=os.getuid() + 4242, shell=link)
+            # The Nix sandbox root is 0750 group nixbld; share our gid to get past it.
+            other = account("bob", uid=os.getuid() + 4242, shell=link, gid=os.getgid())
             self.assertIsNone(users._shell_error("/bin/sh", other))
             self.assertIn(f"({hidden})", users._shell_error(link, other))
 
