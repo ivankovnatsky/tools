@@ -16,7 +16,7 @@ from tools.user import defaults as defaults_section
 from tools.user import launchd as launchd_section
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
-from tools.user.brew import _normalize_tap, parse_brew
+from tools.user.brew import _normalize_tap, entry_name, parse_brew
 from tools.user.files import _resolve_entries, declared_hooks
 from tools.user.secrets_flow import template_hooks
 
@@ -141,9 +141,14 @@ class _Brew:
             value = source.get(key)
             return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
+        def packages(key):
+            value = raw.get(key)
+            names = (entry_name(v) for v in value) if isinstance(value, list) else ()
+            return {n for n in names if n}
+
         return {
-            "brews": set(strings("brews")),
-            "casks": set(strings("casks")),
+            "brews": packages("brews"),
+            "casks": packages("casks"),
             "taps": {_normalize_tap(t) for t in strings("taps")},
             "trust": {_normalize_tap(t) for t in strings("taps", _dict(raw.get("trust")))},
             "masApps": set(_dict(raw.get("masApps"))),
@@ -161,9 +166,15 @@ class _Brew:
         raw = _dict(raw)
         taps = {_normalize_tap(x) for x in names}
         out = dict(raw)
-        for key, keep in (("brews", names), ("casks", names), ("taps", taps)):
+        for key in ("brews", "casks"):
             if isinstance(raw.get(key), list):
-                out[key] = [v for v in raw[key] if v in keep or _normalize_tap(str(v)) in keep]
+                out[key] = [
+                    v
+                    for v in raw[key]
+                    if entry_name(v) in names or _normalize_tap(str(entry_name(v))) in names
+                ]
+        if isinstance(raw.get("taps"), list):
+            out["taps"] = [v for v in raw["taps"] if v in taps or _normalize_tap(str(v)) in taps]
         if isinstance(raw.get("masApps"), dict):
             out["masApps"] = {k: v for k, v in raw["masApps"].items() if k in names}
         trust = raw.get("trust")

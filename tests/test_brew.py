@@ -951,3 +951,147 @@ class BrewPhaseMasTest(unittest.TestCase):
                 brew.install_brew_packages({"masApps": {"New": 1}}, state, phase=brew.REMOVE)
             )
         self.assertEqual(state["brew"]["masApps"], {"New": 1})
+
+
+class BrewRestartUnitsTest(unittest.TestCase):
+    UNIT = "launchd:org.example.forgejo"
+    CONFIG = {
+        "brews": ["jq", {"name": "forgejo", "restartUnits": [UNIT]}],
+        "casks": [{"name": "app", "restartUnits": ["launchd:org.example.app"]}],
+    }
+
+    def _run(self, config, state, fake_run, update=False):
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            return brew.install_brew_packages(config, state, update)
+
+    def owed(self, state, unit=UNIT):
+        entry = state.get("restartUnits", {}).get(unit)
+        return entry and entry["sources"]
+
+    def test_parse_accepts_names_and_mappings(self):
+        spec, errors = brew.parse_brew(self.CONFIG)
+        self.assertEqual(errors, [])
+        self.assertEqual(spec.brews, {"jq", "forgejo"})
+        self.assertEqual(spec.casks, {"app"})
+        self.assertEqual(spec.brew_units, {"forgejo": [self.UNIT]})
+        self.assertEqual(spec.cask_units, {"app": ["launchd:org.example.app"]})
+
+    def test_parse_rejects_bad_entries(self):
+        for raw in (
+            {"brews": [{"restartUnits": [self.UNIT]}]},
+            {"brews": [{"name": "x", "restartUnits": self.UNIT}]},
+            {"brews": [{"name": "x", "args": []}]},
+            {"casks": [""]},
+            {"casks": [1]},
+        ):
+            _, errors = brew.parse_brew(raw)
+            self.assertTrue(errors, raw)
+
+    def test_install_owes_restart_and_records_plain_names(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            return 0, "", ""
+
+        state = {}
+        self.assertTrue(self._run(self.CONFIG, state, fake_run))
+        self.assertIn(["/brew", "install", "forgejo", "jq"], calls)
+        self.assertIn(["/brew", "install", "--cask", "app"], calls)
+        self.assertEqual(state["brew"]["brews"], ["forgejo", "jq"])
+        self.assertEqual(self.owed(state), ["brew/brews/forgejo"])
+        self.assertEqual(self.owed(state, "launchd:org.example.app"), ["brew/casks/app"])
+
+    def test_failed_install_owes_only_what_landed(self):
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1] == "install":
+                return 1, "", "boom"
+            if cmd[1] == "list":
+                return 0, "jq\n", ""
+            return 0, "", ""
+
+        state = {}
+        self.assertFalse(self._run({"brews": self.CONFIG["brews"]}, state, fake_run))
+        self.assertIsNone(self.owed(state))
+
+    def test_unchanged_owes_nothing(self):
+        state = _state(brews=["forgejo", "jq"], casks=["app"])
+
+        def fake_run(cmd, env=None, cwd=None):
+            raise AssertionError(f"ran {cmd}")
+
+        self.assertTrue(self._run(self.CONFIG, state, fake_run))
+        self.assertNotIn("restartUnits", state)
+
+    def _upgrade(self, before, after, fail=()):
+        versions = iter([before, after])
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            if cmd[1:4] == ["list", "--formula", "--versions"]:
+                out = next(versions)
+                return (1, "", "boom") if out is None else (0, out, "")
+            if cmd[1] in fail:
+                return 1, "", "boom"
+            return 0, "", ""
+
+        state = _state(brews=["forgejo", "jq"])
+        result = self._run({"brews": self.CONFIG["brews"]}, state, fake_run, update=True)
+        return result, state, calls
+
+    def test_upgrade_owes_restart_only_when_version_changed(self):
+        result, state, calls = self._upgrade("forgejo 1.0\n", "forgejo 1.0 1.1\n")
+        self.assertTrue(result)
+        self.assertIn(["/brew", "list", "--formula", "--versions", "forgejo"], calls)
+        self.assertIn(["/brew", "upgrade", "--formula", "forgejo", "jq"], calls)
+        self.assertEqual(self.owed(state), ["brew/brews/forgejo"])
+
+        _, state, _ = self._upgrade("forgejo 1.1\n", "forgejo 1.1\n")
+        self.assertNotIn("restartUnits", state)
+
+    def test_upgrade_with_unknown_versions_owes_restart(self):
+        _, state, _ = self._upgrade(None, "forgejo 1.1\n")
+        self.assertEqual(self.owed(state), ["brew/brews/forgejo"])
+
+    def test_failed_upgrade_still_owes_what_changed(self):
+        result, state, _ = self._upgrade("forgejo 1.0\n", "forgejo 1.1\n", fail=("upgrade",))
+        self.assertFalse(result)
+        self.assertEqual(self.owed(state), ["brew/brews/forgejo"])
+
+    def test_upgrade_without_units_queries_no_versions(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            return 0, "", ""
+
+        self._run({"brews": ["jq"]}, _state(brews=["jq"]), fake_run, update=True)
+        self.assertEqual(calls, [["/brew", "upgrade", "--formula", "jq"]])
+
+    def test_diff_shows_queued_restart(self):
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "run_command", side_effect=AssertionError("ran")),
+        ):
+            rows = dict(brew.diff_brew(self.CONFIG, _state(brews=["jq"])))
+        self.assertEqual(rows["brews"], ["    + install forgejo", f"      notify: {self.UNIT}"])
+        self.assertEqual(
+            rows["casks"], ["    + install app", "      notify: launchd:org.example.app"]
+        )
+
+    def test_removing_a_mapping_entry_uninstalls_it(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            return 0, "", ""
+
+        state = _state(brews=["forgejo", "jq"])
+        self.assertTrue(self._run({"brews": [{"name": "jq"}]}, state, fake_run))
+        self.assertIn(["/brew", "uninstall", "forgejo"], calls)
+        self.assertEqual(state["brew"]["brews"], ["jq"])

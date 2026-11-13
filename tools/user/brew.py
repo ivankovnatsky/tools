@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_bin_optional, system_path
+from tools.user import secrets_flow
 from tools.util import run_command
 
 _BREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
@@ -134,6 +135,7 @@ _FORMULA_NAME_KEYS = ("name", "full_name", "aliases", "oldnames")
 _CASK_NAME_KEYS = ("token", "full_token", "old_tokens")
 # brew bundle never untaps homebrew/core; cleanup also leaves the other built-in taps.
 _CORE_TAP = "homebrew/core"
+_PACKAGE_KEYS = {"name", "restartUnits"}
 _CLEANUP_KEPT_TAPS = {_CORE_TAP, "homebrew/cask", "homebrew/bundle"}
 
 
@@ -148,6 +150,48 @@ class BrewSpec:
     auto_update: Optional[bool] = None
     cleanup: Optional[str] = None
     trusted_taps: Set[str] = field(default_factory=set)
+    # name -> restartUnits, only for entries that have any
+    brew_units: Dict[str, List[str]] = field(default_factory=dict)
+    cask_units: Dict[str, List[str]] = field(default_factory=dict)
+
+
+def entry_name(item) -> Optional[str]:
+    """Name of a `brews`/`casks` item: a plain name or a mapping's `name`."""
+    if isinstance(item, dict):
+        item = item.get("name")
+    return item if isinstance(item, str) and item else None
+
+
+def _packages(raw: Dict, key: str, errors: List[str]) -> Tuple[Set[str], Dict[str, List[str]]]:
+    """A `brews`/`casks` list: names, or `{name, restartUnits}` mappings."""
+    value = raw.get(key)
+    if value is None:
+        return set(), {}
+    if not isinstance(value, list):
+        errors.append(f"{key} must be a list, got {type(value).__name__}")
+        return set(), {}
+    names: Set[str] = set()
+    units: Dict[str, List[str]] = {}
+    for item in value:
+        name = entry_name(item)
+        if name is None:
+            errors.append(f"{key}: {item!r} must be a non-empty name or a mapping with one")
+            continue
+        names.add(name)
+        if not isinstance(item, dict):
+            continue
+        unknown = set(item) - _PACKAGE_KEYS
+        if unknown:
+            errors.append(f"{key}.{name}: unknown keys {sorted(unknown)}")
+        try:
+            listed = secrets_flow.parse_restart_units(item.get("restartUnits"), f"{key}.{name}")
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        if listed:
+            merged = units.setdefault(name, [])
+            merged += [u for u in listed if u not in merged]
+    return names, units
 
 
 def _str_list(raw: Dict, key: str, where: str, errors: List[str]) -> List[str]:
@@ -210,9 +254,11 @@ def parse_brew(raw) -> Tuple[BrewSpec, List[str]]:
     if cleanup is not None and cleanup not in CLEANUP_MODES:
         errors.append(f"onActivation.cleanup must be one of {list(CLEANUP_MODES)}, got {cleanup!r}")
 
+    brews, brew_units = _packages(raw, "brews", errors)
+    casks, cask_units = _packages(raw, "casks", errors)
     spec = BrewSpec(
-        brews=set(_str_list(raw, "brews", "brews", errors)),
-        casks=set(_str_list(raw, "casks", "casks", errors)),
+        brews=brews,
+        casks=casks,
         taps={_normalize_tap(t) for t in _str_list(raw, "taps", "taps", errors)},
         mas=dict(mas),
         environment=dict(environment),
@@ -220,6 +266,8 @@ def parse_brew(raw) -> Tuple[BrewSpec, List[str]]:
         auto_update=_bool(on_activation, "autoUpdate", "onActivation.autoUpdate", errors),
         cleanup=cleanup,
         trusted_taps={_normalize_tap(t) for t in _str_list(trust, "taps", "trust.taps", errors)},
+        brew_units=brew_units,
+        cask_units=cask_units,
     )
     if errors:
         return BrewSpec(), errors
@@ -373,6 +421,26 @@ def query_installed(brew: str, env: Dict, spec: BrewSpec) -> Tuple[Optional[Dict
         pending |= set(_lines(stdout))
     snapshot["pending"] = sorted(pending)
     return snapshot, None
+
+
+def _versions(brew: str, env: Dict, kind: str, names: List[str]) -> Optional[Dict[str, str]]:
+    """Installed versions by short name (`brew list --versions`); None when unknown."""
+    rc, stdout, _ = run_command([brew, "list", kind, "--versions"] + names, env)
+    if rc != 0:
+        return None
+    return {
+        name: versions for name, _, versions in (line.partition(" ") for line in _lines(stdout))
+    }
+
+
+def _version(versions: Dict[str, str], name: str) -> Optional[str]:
+    return versions.get(name, versions.get(name.rsplit("/", 1)[-1]))
+
+
+def _owe(state: Dict, units: Dict[str, List[str]], kind: str, names) -> None:
+    for name in sorted(names):
+        if units.get(name):
+            secrets_flow.owe_restarts(state, units[name], f"brew/{kind}/{name}")
 
 
 def _tap_of(name: str) -> Optional[str]:
@@ -688,13 +756,25 @@ def install_brew_packages(
 
     # --- Upgrades of what was already installed, before installs and removals ---
     if upgrades:
-        for kind in ("--formula", "--cask"):
+        for kind, units, label in (
+            ("--formula", spec.brew_units, "brews"),
+            ("--cask", spec.cask_units, "casks"),
+        ):
             if upgrade[kind]:
+                # Only packages whose installed version changed owe their restartUnits.
+                watched = [n for n in upgrade[kind] if units.get(n)]
+                before = _versions(brew, env, kind, watched) if watched else {}
                 log(f"Upgrading {', '.join(upgrade[kind])}", Color.BLUE)
                 rc, _, stderr = run_command([brew, "upgrade", kind] + upgrade[kind], env)
                 if rc != 0:
                     log(f"Failed to upgrade {', '.join(upgrade[kind])}: {stderr}", Color.RED)
                     success = False
+                after = _versions(brew, env, kind, watched) if watched else {}
+                if before is None or after is None:
+                    changed = watched
+                else:
+                    changed = [n for n in watched if _version(before, n) != _version(after, n)]
+                _owe(state, units, label, changed)
         if upgrade["mas"] and (mas := _mas_bin_from_env(env)):
             log(f"Upgrading Mac App Store apps: {', '.join(upgrade['mas'])}", Color.BLUE)
             rc, _, stderr = run_command([mas, "upgrade"] + upgrade["mas"], env)
@@ -716,8 +796,10 @@ def install_brew_packages(
             subset = _installed_subset(brew, env, brews_to_install, "--formula")
             if subset is not None:
                 inst_brews |= subset
+                _owe(state, spec.brew_units, "brews", subset)
         else:
             inst_brews |= set(brews_to_install)
+            _owe(state, spec.brew_units, "brews", brews_to_install)
     casks_to_install = plan["casks_install"]
     if casks_to_install:
         log(f"Installing casks: {', '.join(casks_to_install)}", Color.GREEN)
@@ -732,8 +814,10 @@ def install_brew_packages(
             subset = _installed_subset(brew, env, casks_to_install, "--cask")
             if subset is not None:
                 inst_casks |= subset
+                _owe(state, spec.cask_units, "casks", subset)
         else:
             inst_casks |= set(casks_to_install)
+            _owe(state, spec.cask_units, "casks", casks_to_install)
 
     # --- Removals ---
     zap = spec.cleanup == "zap"
@@ -849,11 +933,21 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
     taps += [f"    - untap {t}{unowned}" for t in clean["taps"]]
     trust = [f"    + trust tap {t}" for t in plan["trust_add"]]
     trust += [f"    - untrust tap {t}" for t in plan["trust_remove"]]
-    brews = [f"    + install {f}" for f in plan["brews_install"]]
+    brews = [
+        row
+        for f in plan["brews_install"]
+        for row in [f"    + install {f}"]
+        + [f"      notify: {u}" for u in spec.brew_units.get(f, [])]
+    ]
     brews += [f"    - remove {f}" for f in plan["brews_remove"]]
     brews += [f"    - remove {f}{unowned}" for f in clean["brews"]]
     brews += [f"    - remove {f} (dependency nothing else needs)" for f in clean["orphans"]]
-    casks = [f"    + install {c}" for c in plan["casks_install"]]
+    casks = [
+        row
+        for c in plan["casks_install"]
+        for row in [f"    + install {c}"]
+        + [f"      notify: {u}" for u in spec.cask_units.get(c, [])]
+    ]
     casks += [f"    - {cask_verb} {c}" for c in plan["casks_remove"]]
     casks += [f"    - {cask_verb} {c}{unowned}" for c in clean["casks"]]
     # Mac App Store apps are reconciled by deploy, so they have to appear here

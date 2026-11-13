@@ -87,6 +87,27 @@ class ParseTest(unittest.TestCase):
         )
 
 
+class BrewMappingEntriesTest(unittest.TestCase):
+    CONFIG = {
+        "brew": {
+            "brews": ["jq", {"name": "forgejo", "restartUnits": ["launchd:org.x.forgejo"]}],
+            "casks": [{"name": "app"}],
+        }
+    }
+
+    def test_mapping_entries_are_matched_by_name(self):
+        only = {"brew": frozenset({"forgejo", "app", "missing"})}
+        self.assertEqual(
+            selection.unmatched(only, self.CONFIG, "/tmp"),
+            ["--only brew:missing: no such item in the brew config"],
+        )
+
+    def test_narrowed_config_keeps_the_mapping(self):
+        view = selection.View({"brew": frozenset({"forgejo"})}, self.CONFIG, "/tmp")
+        self.assertEqual(view.config["brew"]["brews"], [self.CONFIG["brew"]["brews"][1]])
+        self.assertEqual(view.config["brew"]["casks"], [])
+
+
 class FullSectionErrorsTest(unittest.TestCase):
     """A narrowed section is refused while the whole section has config errors."""
 

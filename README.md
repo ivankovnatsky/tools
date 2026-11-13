@@ -625,7 +625,11 @@ skipped):
 ```yaml
 brew:
   taps: [user/homebrew-tap] # `user/homebrew-foo` == `user/foo`
-  brews: [jq, user/tap/tool]
+  brews:
+    - jq
+    - user/tap/tool
+    - name: forgejo # a mapping takes the name plus restartUnits
+      restartUnits: [launchd:com.example.forgejo]
   casks: [kitty]
   masApps: { Pages: 409201541 } # name: App Store id, needs `mas`
   environment: { HOMEBREW_NO_ENV_HINTS: "1" }
@@ -645,6 +649,10 @@ upgrade one already installed or its dependents (Homebrew still upgrades an
 outdated dependency the new package requires). `environment` can override both.
 With `--update`, `brew upgrade` runs on the tracked formulae and casks and
 `mas upgrade` on the tracked App Store apps.
+
+A `brews` or `casks` item is a name, or a mapping with `name` and
+`restartUnits` (see "restartUnits" under launchd); state, `--only`, cleanup and
+ownership only ever use the name.
 
 A deploy runs brew twice: taps, installs and App Store apps first (before
 everything that runs them: sops, git, node, uv, go, rust), removals, cleanup and
@@ -773,7 +781,7 @@ Behaviour:
 
 ### restartUnits
 
-`sops`/`templates`/`fetch` entries, user `files:` entries and `uv`/`go` packages name the jobs that read or run them, as sops-nix's `restartUnits`:
+`sops`/`templates`/`fetch` entries, user `files:` entries, `uv`/`go` packages and `brew` formulae and casks name the jobs that read or run them, as sops-nix's `restartUnits`:
 
 ```yaml
 templates:
@@ -793,8 +801,9 @@ uv:
       source: git+https://example.com/tools#subdirectory=packages/battery-monitoring
       restartUnits: [launchd:com.example.battery-monitoring-serve]
 ```
+- `brew` formulae and casks owe it when a `brew install` puts them on the machine (after a failed batch, only the ones `brew list` shows landed) and, with `--update`, when `brew upgrade` changed their installed version (`brew list --versions` before and after; if either query fails, they owe it anyway). An unchanged package, or one that only gained `restartUnits`, owes nothing. `tools diff` shows the units under each `+ install` row as `notify: <unit>`.
 - Agents: a loaded job is restarted with `kickstart -k`; one this run created, updated, loaded or re-enabled already started with the new file; a disabled one has nothing to restart. A failed kickstart, or a job held by an error, stays owed for the next deploy.
-- Daemons: sops, templates, fetch, user files and packages are user-scope, so they change during the user phase of `sudo tools deploy`. The user phase hands the labels to root, which kickstarts each one after the root phase, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
+- Daemons: sops, templates, fetch, user files and packages (brew included) are user-scope, so they change during the user phase of `sudo tools deploy`. The user phase hands the labels to root, which kickstarts each one after the root phase, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
 - A label no configured job has is dropped with a warning (not while the launchd section has errors, or under `--only`).
 - Prefer this to `restartOn` for files sops/templates/fetch/files write and for package binaries: a daemon's `restartOn` keeps a hash of secret content in state.
 
