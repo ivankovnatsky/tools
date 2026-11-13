@@ -125,13 +125,32 @@ def under_home(path: str, home: Optional[str]) -> bool:
 StatFn = Callable[[str], os.stat_result]
 
 
-def root_only(path: str, stat_fn: StatFn = os.stat, lstat_fn: StatFn = os.lstat) -> bool:
+def root_only(
+    path: str,
+    stat_fn: StatFn = os.stat,
+    lstat_fn: StatFn = os.lstat,
+    sticky_ok: bool = False,
+    sticky_self: bool = False,
+) -> bool:
     """Only root can change what path runs: every component of the original path is
-    root-owned (non-symlinks also not group/world-writable), and so is its canonical target."""
+    root-owned (non-symlinks also not group/world-writable), and so is its canonical target.
+
+    ``sticky_ok``: an ancestor (path itself too with ``sticky_self``) may be a root-owned
+    sticky directory such as /tmp, where others can add entries but not rename or remove
+    root's.
+    """
     if not os.path.isabs(path):
         return False
+    final = os.path.normpath(path)
+
+    def writable(st, current: str, last: str) -> bool:
+        if not st.st_mode & 0o022:
+            return False
+        sticky = stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX
+        return not (sticky_ok and sticky and (sticky_self or current != last))
+
     current = "/"
-    for part in [""] + [c for c in os.path.normpath(path).split(os.sep) if c]:
+    for part in [""] + [c for c in final.split(os.sep) if c]:
         current = os.path.join(current, part) if part else current
         try:
             st = lstat_fn(current)
@@ -139,15 +158,16 @@ def root_only(path: str, stat_fn: StatFn = os.stat, lstat_fn: StatFn = os.lstat)
             return False
         if st.st_uid != 0:
             return False
-        if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022:
+        if not stat.S_ISLNK(st.st_mode) and writable(st, current, final):
             return False
-    current = os.path.realpath(path)
+    real = os.path.realpath(path)
+    current = real
     while True:
         try:
             st = stat_fn(current)
         except OSError:
             return False
-        if st.st_uid != 0 or st.st_mode & 0o022:
+        if st.st_uid != 0 or writable(st, current, real):
             return False
         parent = os.path.dirname(current)
         if parent == current:
@@ -187,12 +207,14 @@ def user_can_write(path: str, inv: Optional[Invoker] = None, stat_fn: StatFn = o
 
 
 def root_dir_error(
-    path: str, stat_fn: StatFn = os.stat, lstat_fn: StatFn = os.lstat
+    path: str, stat_fn: StatFn = os.stat, lstat_fn: StatFn = os.lstat, sticky_ok: bool = False
 ) -> Optional[str]:
     """Why root must not create or write inside dir `path`: its deepest existing component
-    (and every component above it) must be root-owned and not group/world-writable."""
+    (and every component above it) must be root-owned and not group/world-writable
+    (``sticky_ok``: see `root_only`)."""
     existing = existing_ancestor(path)
-    if not root_only(existing, stat_fn, lstat_fn):
+    below = existing != os.path.normpath(path)
+    if not root_only(existing, stat_fn, lstat_fn, sticky_ok, sticky_ok and below):
         return f"{existing} is not root-only (root-owned, not group/world-writable)"
     return None
 

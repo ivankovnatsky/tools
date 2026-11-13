@@ -686,7 +686,8 @@ def _run_sections(
             )
         return ok
 
-    success &= secrets(conflicts, secrets_flow.EARLY if inside else None)
+    rendered = secrets(conflicts, secrets_flow.EARLY if inside else None)
+    success &= rendered
 
     if "gitRepos" in active and (
         config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
@@ -696,7 +697,21 @@ def _run_sections(
         conflicts = registry()
 
     if inside:
-        success &= secrets(conflicts, secrets_flow.LATE)
+        late = secrets(conflicts, secrets_flow.LATE)
+        rendered &= late
+        success &= late
+    # Only a full sops (and templates) run proves every secret is in place.
+    full_run = (
+        not view and "sops" in active and ("templates" in active or not config.get("templates"))
+    )
+    if rendered and (
+        full_run
+        or (
+            "launchd" in active
+            and secrets_flow.rendered_in_state(full.get("sops"), full.get("templates"), state)
+        )
+    ):
+        success &= secrets_flow.mark_rendered(full.get("sops"))
     if run_templates:
         success &= secrets_flow.run_template_hooks(config.get("templates"), state)
     for line in secrets_flow.format_notify(report):

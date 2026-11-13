@@ -257,6 +257,10 @@ Notable keys:
   and diff does not list it. A failing command fails the deploy; it is not kept
   pending and runs again on the next `--update`. Use it to drive an app's own
   plugin manager, with `onChange` installing what a new config declares.
+- `restartUnits: [launchd:<label>]` (on user `files:` entries) restarts that
+  launchd job whenever the entry's `onChange` would run, once that `onChange`
+  (if any) succeeded, including a retry of one that failed earlier. Use it for
+  a binary an `onChange` builds. See "restartUnits" under launchd.
 
   ```yaml
   files:
@@ -724,13 +728,14 @@ launchd:
 | Option | Default | Notes |
 | --- | --- | --- |
 | `command` / `programArguments` | — | exactly one; wrapper ends `exec <command>` (as nix) or `exec "$@"` |
-| `waitForSecrets` | false | wait until `sops.secretsDir` exists, for agents and daemons alike (tools' sops is user-scope; a daemon's `user` must be able to reach that dir); a config error when the sops section is invalid or declares no secrets |
+| `waitForSecrets` | false | wait until `<sops.secretsDir>/.tools-rendered` exists, for agents and daemons alike (tools' sops is user-scope; a daemon's `user` must be able to reach that dir); a config error when the sops section is invalid or declares no secrets |
 | `waitForPath` / `waitForPaths` | — | wait until each path exists |
+| `waitForMounts` | — | wait until each path is a mount point (its device differs from its parent's), so a leftover `/Volumes/<name>` directory does not pass |
 | `dataDir`, `extraDirs` | — | `mkdir -p` at start; `extraDirs` also takes `{path, mode, owner, group}` (root daemons only) |
 | `preStart` | — | shell run before the command |
 | `keepAlive` | true | bool or `{successfulExit, crashed, pathState, ...}` |
 | `runAtLoad` / `throttleInterval` | true / 10 | |
-| `logDir` | `/tmp/agents/log/launchd` (agents), `/var/log/tools/launchd` (daemons) | logs `<name>.log`, `<name>.error.log`; `stdoutPath`/`stderrPath` override; also settable for the whole section (`launchd.logDir`), a service's own `logDir` wins |
+| `logDir` | `/tmp/agents/log/launchd` (agents), `/tmp/log/launchd` (daemons) | logs `<name>.log`, `<name>.error.log`; `stdoutPath`/`stderrPath` override; also settable for the whole section (`launchd.logDir`), a service's own `logDir` wins |
 | `user` / `group` | — | daemons only; or `extraServiceConfig.UserName/GroupName`, not both |
 | `bash` (section) | `/bin/bash` | shell that runs the wrapper; for daemons every path component (symlinks too) and the target must be root-owned, not group/world-writable; the plist gets the resolved target |
 | `restartOn` | — | files hashed into state; a change (or a file appearing) runs `kickstart -k`; an unreadable file is logged and not tracked; for sops/templates/fetch files use their `restartUnits` (see below) |
@@ -741,7 +746,7 @@ launchd:
 
 Behaviour:
 
-- Wrapper, always (also for `programArguments`), as nix: `set -e`, `PATH=/bin:/usr/bin:$PATH`, `mkdir -p` + `chmod 755` logDir, waits, dirs, `preStart`, `exec`.
+- Wrapper, always (also for `programArguments`), as nix: `set -e`, `PATH=/bin:/usr/bin:$PATH`, `mkdir -p` + `chmod 755` logDir (not for daemons with a `user`), waits, dirs, `preStart`, `exec`.
 - A section-level error (e.g. a bad `logDir`) holds every create, update and removal.
 - A job whose program (an absolute first word of `command`, or `programArguments[0]`) does not exist is skipped with a warning and not started, e.g. when its package failed to install; it is created on the deploy after it appears. Not judged for a job with `preStart` or a first word the shell expands (`$`, backticks), nor while a `waitForPaths` entry or the program's volume is missing.
 - The old `launchd.services`, `launchd.sudo` and per-job `domain` keys are config errors naming their replacement.
@@ -750,10 +755,10 @@ Behaviour:
 - Plists are compared parsed; a change is written atomically, then `bootout` + `bootstrap`. A job that isn't loaded gets loaded.
 - Agent logs are pre-created by tools. Every daemon gets its missing `logDir` created as root, one root-only directory per component; with a user also `touch -h` and `chown -h user:group` (group default `staff`). Symlinked log paths are skipped.
 - A missing `workingDirectory` is created at deploy, since launchd enters it before the wrapper runs: agents as the user; daemons as root only inside an existing `/var/lib` or `/Library/Application Support`, one root-only directory per component, with no symlink below that root. Otherwise a job that will be started is skipped (`! skip` in `tools diff`) until you create the directory; `disabled: true` still disables and unloads it.
-- Paths only the wrapper uses (`waitForPath(s)`, `dataDir`, `extraDirs`) keep `$NAME`/`${NAME}` for the job's shell to expand at runtime, as nix-config does; `~` is your home for agents and the job's `$HOME` for daemons. Other path options (`workingDirectory`, `logDir`, `stdoutPath`/`stderrPath`, `restartOn`, `keepAlive.pathState`) are read by launchd or tools from the plist or at deploy, so their `$VARS`/`~` expand at deploy from your environment; for a daemon running as another user (root included) they are rejected.
+- Paths only the wrapper uses (`waitForPath(s)`, `waitForMounts`, `dataDir`, `extraDirs`) keep `$NAME`/`${NAME}` for the job's shell to expand at runtime, as nix-config does; `~` is your home for agents and the job's `$HOME` for daemons. Other path options (`workingDirectory`, `logDir`, `stdoutPath`/`stderrPath`, `restartOn`, `keepAlive.pathState`) are read by launchd or tools from the plist or at deploy, so their `$VARS`/`~` expand at deploy from your environment; for a daemon running as another user (root included) they are rejected.
 - `extraDirs` `mode`/`owner`/`group` are rejected unless the job is a root daemon: the wrapper's `chmod`/`chown` would fail under `set -e` and crash-loop the job.
 - `disabled` is compared with launchd's live override (`print-disabled`), so changes made outside tools are corrected.
-- Daemon log paths must be absolute, normalized, without `..`, under `/var/log`. As root, every existing component of a daemon's log dir (and of each log file's parent) must be root-owned and not group/world-writable, checked at plan and again at apply; missing components are created one `mkdir` at a time and each must come out a root-only directory. A failing daemon is not written or loaded; if it is `disabled: true`, it is still disabled and booted out (plist and logs left untouched).
+- Daemon log paths must be absolute, normalized, without `..`, under `/var/log` or the default `/tmp/log/launchd`. As root, a daemon's log dir (and each log file's parent) must not be a symlink, and every existing component must be root-owned and not group/world-writable, except a root-owned sticky ancestor such as `/tmp`, checked at plan and again at apply; missing components are created one `mkdir` at a time and each must come out a root-only directory. A failing daemon is not written or loaded; if it is `disabled: true`, it is still disabled and booted out (plist and logs left untouched).
 - State records only steps that succeeded; a failed activation shows as `retry` in `tools diff`.
 - `tools diff` lists every change deploy would make to tracked jobs: creates, updates, adoptions, loads, restarts, removals, and removals held by a config error (`! held: remove ...`).
 - `launchd:`, `launchd.agents` or `launchd.daemons` that is not a mapping (e.g. `[]`, `false`) is a config error that holds every change; only an absent or null key means "no jobs".
@@ -763,12 +768,12 @@ Behaviour:
 - Removal re-reads the plist and stops if it changed since tools wrote it; a disabled label is re-enabled first.
 - An unreadable plist or a malformed state entry for a configured job holds that job and fails the deploy, with a fix hint.
 - As root every daemon change is a fixed command run directly (`install`, `launchctl`, `rm`, log `mkdir`/`touch`/`chown`) on paths derived from the label or the checked logDir; tools never calls sudo.
-- Unlike nix-config's `/tmp/log`, daemon logs never live under a world- or group-writable directory, so a local user can't redirect root's `mkdir`/`touch`/`chown` or launchd's log opens.
+- Daemon logs default to nix-config's `/tmp/log/launchd`. Inside sticky `/tmp`, a root-owned `log` and `log/launchd` can't be renamed or replaced by a local user, so the check above holds at deploy. `/tmp` is emptied at boot, though: root daemons' wrappers recreate it as root (daemons with a `user` skip the wrapper's `mkdir`), but a local user who creates `/tmp/log` first owns it, and `sudo tools deploy` then refuses those daemons until it is removed by hand. For a dir that must stay root-only across reboots, set `logDir` under `/var/log`.
 - A missing daemon `workingDirectory` is created the same root-only way.
 
 ### restartUnits
 
-`sops`/`templates`/`fetch` entries name the jobs that read them, as sops-nix's `restartUnits`:
+`sops`/`templates`/`fetch` entries, user `files:` entries and `uv`/`go` packages name the jobs that read or run them, as sops-nix's `restartUnits`:
 
 ```yaml
 templates:
@@ -779,10 +784,19 @@ templates:
 ```
 
 - A create, update or replace of the file (not a chmod) records the label as owed in the user's state; the launchd section then pays it. Content is compared in memory, so no hash of a secret is stored.
+- `uv`/`go` packages owe it after each successful `uv tool install`/`go install` (a new package, a changed version, source or commit, and with `--update` a reinstall of an unpinned go package) and each successful `uv tool upgrade` under `--update`; neither tells whether the upgrade changed anything, so an unpinned package restarts its jobs on every `--update`.
+
+```yaml
+uv:
+  packages:
+    battery-monitoring:
+      source: git+https://example.com/tools#subdirectory=packages/battery-monitoring
+      restartUnits: [launchd:com.example.battery-monitoring-serve]
+```
 - Agents: a loaded job is restarted with `kickstart -k`; one this run created, updated, loaded or re-enabled already started with the new file; a disabled one has nothing to restart. A failed kickstart, or a job held by an error, stays owed for the next deploy.
-- Daemons: sops, templates and fetch are user-scope, so they change during the user phase of `sudo tools deploy`. The user phase hands the labels to root, which kickstarts each one after the root phase, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
+- Daemons: sops, templates, fetch, user files and packages are user-scope, so they change during the user phase of `sudo tools deploy`. The user phase hands the labels to root, which kickstarts each one after the root phase, only if it is a configured, enabled daemon whose plist tools wrote and loaded, then clears the ones it handled from the user's state (a failed kickstart stays owed). A plain `tools deploy` keeps them owed and says so; `tools diff` lists them as `~ restart system/<label> (...; under sudo tools deploy)`.
 - A label no configured job has is dropped with a warning (not while the launchd section has errors, or under `--only`).
-- Prefer this to `restartOn` for files sops/templates/fetch write: a daemon's `restartOn` keeps a hash of secret content in state.
+- Prefer this to `restartOn` for files sops/templates/fetch/files write and for package binaries: a daemon's `restartOn` keeps a hash of secret content in state.
 
 ### Differences from nix-config
 
@@ -792,9 +806,10 @@ templates:
 | label | `com.ivankovnatsky.<name>` | `labelPrefix` required | no personal default in a public tool |
 | `enable` | per service, default false | listing a service enables it | YAML list is the switch |
 | `waitForPath` | one path | also `waitForPaths` list | several secrets/volumes |
-| `waitForSecrets` | `/run/secrets` (daemons), `~/.config/sops-nix/secrets` (agents) | `sops.secretsDir` for both | waits on the dir tools writes secrets to |
+| `waitForSecrets` | `/run/secrets` (daemons), `~/.config/sops-nix/secrets` (agents) | `<sops.secretsDir>/.tools-rendered` for both | tools renders in place; deploy writes the marker once sops and templates rendered completely (`sops` and `templates` in scope, no `--only`; or with `launchd` in scope when state shows every secret and template written and present), as sops-nix switches `/run/secrets` after rendering |
+| `waitForMounts` | — | waits for a mount point | `waitForPath` passes on a leftover empty mount dir |
 | bash | `pkgs.bash` | `/bin/bash`, or `bash:` | stable path; root-owned for daemons |
-| logDir `chmod 755` | can fail and kill the job | agents skip it if not owner; daemons `\|\| true` | avoids a crash loop |
+| logDir `chmod 755` | can fail and kill the job | only when the job owns the dir and it is not a symlink | avoids a crash loop and root following a planted symlink |
 | extraServiceConfig | can override anything | log paths checked; `Label`/`Program*` reserved | log-path safety |
 | ownership | nix-darwin owns all plists | state; never touches foreign plists | safe migration |
 | errors | eval fails | bad entry holds removals, deploy fails | partial apply stays honest |
@@ -802,7 +817,7 @@ templates:
 | extras | — | `restartOn`, `restartOnChange`, `disabled`, `secrets`, `tools diff` | |
 | tools-only options | — | `programArguments`, `keepAlive` mapping, `stdoutPath`/`stderrPath`, `user`/`group`, `workingDirectory`, `processType`, `nice`, `startInterval`, `startCalendarInterval`, `extraDirs` mode/owner/group, numeric `environment` values (made strings) | plain plist keys or conveniences |
 | foreign loaded label | n/a | never booted out (create or removal) | ownership |
-| daemon logDir | `/tmp/log/launchd`; `mkdir`/`touch`/`chown` only with `UserName` | `/var/log/tools/launchd`, root-only dirs checked at apply; `mkdir` for every daemon; `touch -h`/`chown -h` with a user | launchd opens logs as root before the wrapper; `/tmp` is world-writable |
+| daemon logDir | `/tmp/log/launchd`; `mkdir`/`touch`/`chown` only with `UserName` | same default; root-owned, non-symlink dirs checked at plan and apply; `mkdir` for every daemon; `touch -h`/`chown -h` with a user | launchd opens logs as root before the wrapper |
 | `workingDirectory` | not created | created at deploy (daemons only under the allowed roots) | launchd `chdir`s before the wrapper |
 | section `logDir` | none (per service only) | `launchd.logDir` sets every job's default | one place for a log root |
 | `$VARS`/`~` in plist and deploy-time paths | left literal in the plist | expanded at deploy; rejected for daemons running as another user | launchd never expands them; deploy-time expansion would use your env, not the job's |

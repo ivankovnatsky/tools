@@ -421,3 +421,106 @@ class RealSopsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderedMarkerTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.realpath(self._tmp.name)
+        sops_file = os.path.join(self.tmp, "secrets.yaml")
+        with open(sops_file, "w") as f:
+            f.write("ENC")
+        self.secrets_dir = os.path.join(self.tmp, "secrets")
+        self.marker = os.path.join(self.secrets_dir, sops.RENDERED_MARKER)
+        self.config = {
+            "sops": {
+                "binary": "/fake/sops",
+                "secretsDir": self.secrets_dir,
+                "defaultSopsFile": sops_file,
+                "secrets": {"tok": {"key": "token"}},
+            },
+            "templates": {
+                "c": {
+                    "path": os.path.join(self.secrets_dir, "rendered", "c.json"),
+                    "format": "json",
+                    "content": {"a": 1},
+                }
+            },
+        }
+        self.decrypt_rc = 0
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_sections(self, active, view=None):
+        real = sops.Decryptor
+
+        def decryptor(settings):
+            def runner(cmd, env):
+                return self.decrypt_rc, b'{"token": "tok-value"}', "boom"
+
+            return real(settings, runner=runner, env={})
+
+        with (
+            mock.patch.object(sops, "Decryptor", decryptor),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return cli._run_sections(self.config, self.tmp, {}, {}, set(active), view=view)
+
+    def test_marker_written_after_sops_and_templates_rendered(self):
+        self.assertTrue(self.run_sections({"sops", "templates"}))
+        self.assertTrue(os.path.isfile(self.marker))
+        self.assertTrue(os.path.isfile(os.path.join(self.secrets_dir, "rendered", "c.json")))
+
+    def test_no_marker_when_a_secret_fails(self):
+        self.decrypt_rc = 1
+        self.assertFalse(self.run_sections({"sops", "templates"}))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_no_marker_when_templates_are_out_of_scope(self):
+        self.assertTrue(self.run_sections({"sops"}))
+        self.assertFalse(os.path.exists(self.marker))
+        del self.config["templates"]
+        self.assertTrue(self.run_sections({"sops"}))
+        self.assertTrue(os.path.isfile(self.marker))
+
+    def test_no_marker_when_no_secret_lives_in_secrets_dir(self):
+        del self.config["templates"]
+        self.config["sops"]["secrets"]["tok"]["path"] = os.path.join(self.tmp, "elsewhere")
+        self.assertTrue(self.run_sections({"sops"}))
+        self.assertFalse(os.path.exists(self.secrets_dir))
+
+    def test_symlinked_marker_is_refused(self):
+        del self.config["templates"]
+        os.makedirs(self.secrets_dir)
+        victim = os.path.join(self.tmp, "victim")
+        os.symlink(victim, self.marker)
+        self.assertFalse(self.run_sections({"sops"}))
+        self.assertFalse(os.path.exists(victim))
+
+    def test_launchd_scope_marks_when_state_shows_everything_rendered(self):
+        state = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.run_sections_state({"sops", "templates"}, state))
+        os.remove(self.marker)
+        with mock.patch.object(cli, "install_launchd", return_value=True):
+            self.assertTrue(self.run_sections_state({"launchd"}, state))
+        self.assertTrue(os.path.isfile(self.marker))
+        os.remove(self.marker)
+        os.remove(os.path.join(self.secrets_dir, "rendered", "c.json"))
+        with mock.patch.object(cli, "install_launchd", return_value=True):
+            self.assertTrue(self.run_sections_state({"launchd"}, state))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def run_sections_state(self, active, state):
+        real = sops.Decryptor
+
+        def decryptor(settings):
+            return real(settings, runner=lambda c, e: (0, b'{"token": "t"}', ""), env={})
+
+        config = {**self.config, "launchd": {}}
+        with (
+            mock.patch.object(sops, "Decryptor", decryptor),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return cli._run_sections(config, self.tmp, state, {}, set(active))

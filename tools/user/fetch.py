@@ -476,11 +476,7 @@ def _fetch_record(e: Entry, sha: str) -> Dict:
 
 
 def _owe_restarts(state: Dict, e: Entry) -> None:
-    source = f"fetch/{e.target}"
-    secrets_flow.add_pending_restarts(state, [(u, source) for u in e.restart_units])
-    for unit in e.restart_units:
-        if not unit.startswith(secrets_flow.LAUNCHD_UNIT):
-            log(f"notify {unit} (changed: {source}); no handler yet", Color.YELLOW)
+    secrets_flow.owe_restarts(state, e.restart_units, f"fetch/{e.target}")
 
 
 def install_fetch(

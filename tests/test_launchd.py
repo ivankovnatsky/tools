@@ -4,7 +4,6 @@ import plistlib
 import pwd
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -427,8 +426,8 @@ class PlistTest(LaunchdTestBase):
         logs = os.path.join(self.tmp, "logs")
         script = self.plist(
             {"command": "srv", "waitForSecrets": True, "waitForPath": "/opt/ready",
-             "waitForPaths": ["/opt/more"], "dataDir": "/opt/data", "extraDirs": ["/opt/x"],
-             "preStart": "prep"},
+             "waitForPaths": ["/opt/more"], "waitForMounts": ["/Volumes/Disk"],
+             "dataDir": "/opt/data", "extraDirs": ["/opt/x"], "preStart": "prep"},
             secrets_dir=os.path.join(self.tmp, "secrets"),
         )["ProgramArguments"][2]  # fmt: skip
         self.assertEqual(
@@ -437,10 +436,14 @@ class PlistTest(LaunchdTestBase):
                 "set -e",
                 'export PATH="/bin:/usr/bin:$PATH"',
                 f"/bin/mkdir -p {logs}",
-                f"if [ -O {logs} ]; then /bin/chmod 755 {logs}; fi",
+                f"if [ -O {logs} ] && [ ! -L {logs} ]; then /bin/chmod 755 {logs}; fi",
                 'echo "Waiting for sops secrets..."',
-                f"while [ ! -e {self.tmp}/secrets ]; do sleep 1; done",
+                f"while [ ! -e {self.tmp}/secrets/.tools-rendered ]; do sleep 1; done",
                 'echo "Sops secrets available."',
+                "echo 'Waiting for mount /Volumes/Disk...'",
+                'until [ -d /Volumes/Disk ] && [ "$(/usr/bin/stat -L -f %d /Volumes/Disk)" != '
+                '"$(/usr/bin/stat -L -f %d /Volumes/Disk/..)" ]; do sleep 1; done',
+                "echo '/Volumes/Disk mounted.'",
                 "echo 'Waiting for /opt/ready...'",
                 "while [ ! -e /opt/ready ]; do sleep 1; done",
                 "echo '/opt/ready available.'",
@@ -458,13 +461,27 @@ class PlistTest(LaunchdTestBase):
         )
         self.assertIn("waitForPath must be a string", errors[0])
 
+    def test_wait_for_mounts_parses_like_wait_for_paths(self):
+        script = self.plist(
+            {"command": "srv", "waitForMounts": "$VOL/Disk"}, daemon=True
+        )["ProgramArguments"][2]  # fmt: skip
+        self.assertIn(
+            'until [ -d "${VOL}"/Disk ] && [ "$(/usr/bin/stat -L -f %d "${VOL}"/Disk)" != '
+            '"$(/usr/bin/stat -L -f %d "${VOL}"/Disk/..)" ]; do sleep 1; done',
+            script,
+        )
+        _s, _svcs, errors = launchd.parse_launchd(
+            self.cfg({"s": {"command": "x", "waitForMounts": ["Volumes/Disk"]}})
+        )
+        self.assertIn("waitForMounts", errors[0])
+
     def test_daemon_waits_for_the_same_secrets_dir(self):
         script = self.plist(
             {"command": "srv", "waitForSecrets": True},
             secrets_dir="/state/secrets",
             daemon=True,
         )["ProgramArguments"][2]
-        self.assertIn("while [ ! -e /state/secrets ]; do sleep 1; done", script)
+        self.assertIn("while [ ! -e /state/secrets/.tools-rendered ]; do sleep 1; done", script)
 
     def test_wait_for_secrets_without_sops_secrets_dir_is_an_error(self):
         raw = self.cfg({"s": {"command": "srv", "waitForSecrets": True}})
@@ -480,7 +497,8 @@ class PlistTest(LaunchdTestBase):
             launchd.install_launchd(raw, self.state, self.env, secrets_dir="/state/secrets")
         )
         with open(self.agent_path("s"), "rb") as f:
-            self.assertIn("while [ ! -e /state/secrets ]", plistlib.load(f)["ProgramArguments"][2])
+            script = plistlib.load(f)["ProgramArguments"][2]
+        self.assertIn("while [ ! -e /state/secrets/.tools-rendered ]", script)
 
     def test_extra_service_config_user_owns_daemon_logs_like_nix(self):
         svc = {"command": "x", "extraServiceConfig": {"UserName": "_dns"}}
@@ -502,11 +520,16 @@ class PlistTest(LaunchdTestBase):
         env = launchd.Env(uid=UID, home=self.tmp)
         self.assertEqual(
             (env.system_log_dir, env.user_log_dir),
-            ("/var/log/tools/launchd", "/tmp/agents/log/launchd"),
+            ("/tmp/log/launchd", "/tmp/agents/log/launchd"),
         )
-        script = pl["ProgramArguments"][2].splitlines()
+        self.assertNotIn("/bin/mkdir", pl["ProgramArguments"][2])
+        script = self.plist({"command": "x"}, daemon=True)["ProgramArguments"][2].splitlines()
         self.assertEqual(
-            script[2:4], [f"/bin/mkdir -p {syslogs}", f"/bin/chmod 755 {syslogs} || true"]
+            script[2:4],
+            [
+                f"/bin/mkdir -p {syslogs}",
+                f"if [ -O {syslogs} ] && [ ! -L {syslogs} ]; then /bin/chmod 755 {syslogs}; fi",
+            ],
         )
         pl = self.plist({"command": "x"}, logDir="/var/log/tools")
         self.assertEqual(pl["StandardOutPath"], "/var/log/tools/svc.log")
@@ -2012,8 +2035,14 @@ class ParityReviewTest(LaunchdTestBase):
         self.assertEqual(pl["StandardOutPath"], "/tmp/agents/log/launchd/web.log")
         self.assertEqual(pl["StandardErrorPath"], "/tmp/agents/log/launchd/web.error.log")
         script = pl["ProgramArguments"][2]
-        self.assertIn("while [ ! -e /Users/someone/.local/state/tools/secrets ]", script)
-        self.assertIn("if [ -O /tmp/agents/log/launchd ]; then /bin/chmod 755", script)
+        self.assertIn(
+            "while [ ! -e /Users/someone/.local/state/tools/secrets/.tools-rendered ]", script
+        )
+        self.assertIn(
+            "if [ -O /tmp/agents/log/launchd ] && [ ! -L /tmp/agents/log/launchd ]; "
+            "then /bin/chmod 755",
+            script,
+        )
 
     def test_user_and_extra_user_name_conflict(self):
         for svc in (
@@ -2293,7 +2322,7 @@ class SignOffTest(LaunchdTestBase):
         os.makedirs(os.path.join(self.tmp, "real"))
         os.symlink(os.path.join(self.tmp, "real"), self.env.system_log_dir)
         self.user_owned.add(self.env.system_log_dir)
-        self.assertIn("not root-only", " ".join(self.diff(self.daemon_cfg(user="_svc"))))
+        self.assertIn("is a symlink", " ".join(self.diff(self.daemon_cfg(user="_svc"))))
         self.assertFalse(self.deploy(self.daemon_cfg(user="_svc")))
         self.assertEqual(self.fake.system_calls, [])
         self.assertFalse(os.path.exists(self.daemon_path("d")))
@@ -2348,13 +2377,55 @@ class SignOffTest(LaunchdTestBase):
         self.assertFalse(self.deploy(self.daemon_cfg()))
         self.assertFalse(os.path.exists(self.daemon_path("d")))
 
-    def test_default_daemon_log_dir_is_root_only(self):
+    def test_default_daemon_log_dir_is_tmp_log_like_nix(self):
         env = launchd.Env(uid=UID, home=self.tmp)
-        self.assertEqual(env.system_log_dir, "/var/log/tools/launchd")
+        self.assertEqual(env.system_log_dir, "/tmp/log/launchd")
         self.assertFalse(any(r.startswith(("/tmp", "/private/tmp")) for r in env.system_log_roots))
-        if sys.platform == "darwin":
-            self.assertIsNone(launchd.root_dir_error(env.system_log_dir, env))
-        self.assertIsNotNone(launchd.root_dir_error("/tmp/log/launchd", env))
+
+    def sticky_tmp(self):
+        """A root-owned sticky world-writable dir, as /private/tmp."""
+        sticky = os.path.join(self.tmp, "tmp")
+        os.makedirs(sticky)
+        os.chmod(sticky, 0o1755)
+        self.writable.add(sticky)
+        self.env.system_log_dir = os.path.join(sticky, "log", "launchd")
+        return sticky
+
+    def test_log_dir_in_sticky_tmp_is_created_root_only(self):
+        sticky = self.sticky_tmp()
+        logs = self.env.system_log_dir
+        self.assertTrue(self.deploy(self.daemon_cfg()))
+        self.assertIn(["/bin/mkdir", "-m", "755", os.path.join(sticky, "log")],
+                      self.fake.system_calls)  # fmt: skip
+        self.assertIn(["/bin/mkdir", "-m", "755", logs], self.fake.system_calls)
+        self.assertEqual(self.read(self.daemon_path("d"))["StandardOutPath"],
+                         os.path.join(logs, "d.log"))  # fmt: skip
+        self.assertTrue(self.deploy(self.daemon_cfg()))
+
+    def test_user_owned_dir_in_sticky_tmp_is_refused(self):
+        sticky = self.sticky_tmp()
+        os.makedirs(os.path.join(sticky, "log"))
+        self.user_owned.add(os.path.join(sticky, "log"))
+        self.assertIn("is not root-only", " ".join(self.diff(self.daemon_cfg())))
+        self.assertFalse(self.deploy(self.daemon_cfg()))
+        self.assertEqual(self.fake.system_calls, [])
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_root_owned_symlink_log_dir_is_refused(self):
+        sticky = self.sticky_tmp()
+        os.makedirs(os.path.join(sticky, "log"))
+        os.makedirs(os.path.join(self.tmp, "real"))
+        os.symlink(os.path.join(self.tmp, "real"), self.env.system_log_dir)
+        self.assertIn(f"{self.env.system_log_dir} is a symlink",
+                      " ".join(self.diff(self.daemon_cfg())))  # fmt: skip
+        self.assertFalse(self.deploy(self.daemon_cfg()))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
+
+    def test_sticky_dir_is_not_allowed_as_the_log_dir_itself(self):
+        sticky = self.sticky_tmp()
+        self.env.system_log_dir = sticky
+        self.assertFalse(self.deploy(self.daemon_cfg()))
+        self.assertFalse(os.path.exists(self.daemon_path("d")))
 
 
 class OpenBugsTest(LaunchdTestBase):

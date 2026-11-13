@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from tools import fsutil, util
+from tools.log import Color, log
 from tools.user import git_repos, sops, templates
 
 
@@ -631,6 +632,41 @@ def files_targets(entries, config_dir: str) -> List[str]:
     return [e.target for e in resolved]
 
 
+def rendered_in_state(sops_raw, templates_raw, state: Dict) -> bool:
+    """Every configured secret and template is recorded as written and still exists."""
+    parsed = sops.parse_sops(sops_raw)
+    tmpls, errors = templates.parse_templates(templates_raw or {}, *parsed.secrets_dir())
+    if parsed.errors or errors:
+        return False
+    for section, paths in (
+        ("sops", [s.path for s in parsed.secrets]),
+        ("templates", [t.target for t in tmpls]),
+    ):
+        installed = _installed(state, section)
+        if not all(p in installed and os.path.exists(p) for p in paths):
+            return False
+    return True
+
+
+def mark_rendered(sops_raw) -> bool:
+    """Create sops.RENDERED_MARKER in secretsDir (when a secret lives there) after sops and
+    templates rendered completely; launchd's waitForSecrets waits on it."""
+    secrets_dir = sops.secrets_dir_kwargs(sops_raw)["secrets_dir"]
+    if not secrets_dir:
+        return True
+    marker = os.path.join(secrets_dir, sops.RENDERED_MARKER)
+    if not os.path.isdir(secrets_dir):
+        log(f"sops: not marking secrets rendered: {secrets_dir} is missing", Color.RED)
+        return False
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        os.close(fd)
+    except OSError as e:
+        log(f"sops: cannot write {marker}: {e}", Color.RED)
+        return False
+    return True
+
+
 LAUNCHD_UNIT = "launchd:"
 RESTARTS_KEY = "restartUnits"
 
@@ -650,6 +686,22 @@ def add_pending_restarts(state: Dict, notify: List[Tuple[str, str]]) -> None:
         if source not in entry["sources"]:
             entry["sources"].append(source)
         entry["seq"] += 1
+
+
+def owe_restarts(state: Dict, units, source: str) -> None:
+    """Record `launchd:` restartUnits as owed for `source`; other kinds only get a notice."""
+    add_pending_restarts(state, [(u, source) for u in units])
+    for unit in units:
+        if not unit.startswith(LAUNCHD_UNIT):
+            log(f"notify {unit} (changed: {source}); no handler yet", Color.YELLOW)
+
+
+def parse_restart_units(value, where: str) -> List[str]:
+    """A `restartUnits` value: absent, or a list of strings."""
+    units = [] if value is None else value
+    if not isinstance(units, list) or not all(isinstance(u, str) for u in units):
+        raise ValueError(f"{where}: restartUnits must be a list of strings")
+    return list(units)
 
 
 def _valid_entry(entry) -> bool:

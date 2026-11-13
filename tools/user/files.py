@@ -17,10 +17,12 @@ from tools.fsutil import (
     same_identity,
 )
 from tools.log import Color, debug, log
+from tools.user import secrets_flow
 from tools.util import (
     format_diff_bytes,
     looks_like_secret,
     parse_on_change,
+    pending_hooks,
     run_hooks,
     settle_hooks,
 )
@@ -350,6 +352,7 @@ _KEYS = {
     "onUpdate",
     "skip",
     "backup",
+    "restartUnits",
 }
 
 
@@ -506,6 +509,7 @@ class Entry(NamedTuple):
     on_update: Optional[str] = None
     skip: bool = False
     backup: bool = True
+    restart_units: Tuple[str, ...] = ()
 
 
 def declared_hooks(entries, skipped: bool = False) -> set:
@@ -626,6 +630,11 @@ def _resolve_entries(
         except ValueError as e:
             errors.append(str(e))
             continue
+        try:
+            units = tuple(secrets_flow.parse_restart_units(entry.get("restartUnits"), "files"))
+        except ValueError as e:
+            errors.append(f"{e} in {entry!r}")
+            continue
 
         secrets_raw = entry.get("secrets", False)
         if not isinstance(secrets_raw, bool):
@@ -663,7 +672,17 @@ def _resolve_entries(
                 continue
             target = os.path.normpath(os.path.expanduser(str(entry["target"])))
             file_pairs.append(
-                Entry(target, None, entry_mode, False, on_change, True, on_update, skip)
+                Entry(
+                    target,
+                    None,
+                    entry_mode,
+                    False,
+                    on_change,
+                    True,
+                    on_update,
+                    skip,
+                    restart_units=units,
+                )
             )
             continue
 
@@ -691,6 +710,7 @@ def _resolve_entries(
                             on_update,
                             skip,
                             backup,
+                            units,
                         )
                     )
             continue
@@ -712,6 +732,7 @@ def _resolve_entries(
                     on_update,
                     skip,
                     backup,
+                    units,
                 )
             )
             continue
@@ -729,6 +750,34 @@ def _resolve_entries(
         prev = resolved_map.get(e.target)
         resolved_map[e.target] = e._replace(secrets=e.secrets or bool(prev and prev.secrets))
     return list(resolved_map.values()), errors
+
+
+def _owe_restarts(
+    entries, resolved: List[Entry], rewritten: set, retried: set, state: Dict
+) -> None:
+    """restartUnits of entries rewritten this run, or whose earlier failed onChange was
+    retried (also when the entry no longer resolves), once their onChange succeeded."""
+    failed = set(((state.get("onChange") or {}).get("files")) or {})
+    owed: Dict[str, List[str]] = {}
+    for e in resolved:
+        if e.restart_units and not e.skip and e.target in rewritten:
+            if not (e.on_change and e.on_change in failed):
+                owed.setdefault(f"files/{e.target}", []).extend(e.restart_units)
+    for raw in entries if isinstance(entries, list) else []:
+        if not isinstance(raw, dict) or raw.get("skip") is True:
+            continue
+        hook = raw.get("onChange")
+        if not isinstance(hook, str) or hook not in retried or hook in failed:
+            continue
+        try:
+            units = secrets_flow.parse_restart_units(raw.get("restartUnits"), "files")
+        except ValueError:
+            continue
+        where = raw.get("target") or raw.get("dir")
+        source = f"files/{os.path.expanduser(str(where))}"
+        owed.setdefault(source, []).extend(units)
+    for source, units in owed.items():
+        secrets_flow.owe_restarts(state, list(dict.fromkeys(units)), source)
 
 
 def _conflict(target: str, conflicts: Optional[Dict[str, str]]) -> Optional[str]:
@@ -788,6 +837,7 @@ def install_files(
     released = set()
     updates: Dict[str, List[str]] = {}
     unsettled = set()
+    rewritten = set()
     for e in _ordered(resolved):
         target = e.target
         reason = _conflict(target, conflicts) or (root_target_error(target) if system else None)
@@ -837,6 +887,7 @@ def install_files(
                 held[target] = state_files[target]
         elif result is True:
             changed = True
+            rewritten.add(target)
             if e.on_change:
                 hooks.setdefault(e.on_change, []).append(target)
 
@@ -910,10 +961,12 @@ def install_files(
         merged.update(managed)
         state["files"] = merged
 
+    retried = set(pending_hooks(state, "files", declared_hooks(entries)))
     settled = settle_hooks(
         state, "files", hooks, declared_hooks(entries), declared_hooks(entries, skipped=True)
     )
     success &= settled
+    _owe_restarts(entries, resolved, rewritten, retried, state)
 
     if update:
         # An entry that failed to resolve may declare the same command.

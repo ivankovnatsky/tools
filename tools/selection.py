@@ -339,6 +339,8 @@ class _Files:
                 item["skip"] = True
             if not e.backup:
                 item["backup"] = False
+            if e.restart_units:
+                item["restartUnits"] = list(e.restart_units)
             out.append(item)
         return out
 

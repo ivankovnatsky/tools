@@ -2,6 +2,7 @@ import os
 from typing import Dict
 
 from tools.log import Color, debug, log
+from tools.user import secrets_flow
 from tools.util import (
     get_pkg_commit,
     get_pkg_source,
@@ -91,9 +92,20 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         for pkg, pkg_info in packages.items()
         if pkg not in state_packages or version_changed(pkg, pkg_info, state, "uv")
     ]
+    units: Dict[str, list] = {}
+    for pkg, pkg_info in packages.items():
+        try:
+            units[pkg] = secrets_flow.parse_restart_units(
+                pkg_info.get("restartUnits"), f"uv.packages.{pkg}"
+            )
+        except ValueError as e:
+            log(str(e), Color.RED)
+            success = False
     if to_install:
         log(f"Installing UV packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
+            if pkg not in units:
+                continue
             pkg_info = packages[pkg]
             source = get_pkg_source(pkg_info)
             commit = get_pkg_commit(pkg_info)
@@ -112,18 +124,21 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
                 continue
             log(f"Installed: {spec}", Color.GREEN)
             tracked[pkg] = _uv_entry(pkg_info)
+            secrets_flow.owe_restarts(state, units[pkg], f"uv/{pkg}")
     elif not to_remove:
         debug("All UV packages already installed", Color.BLUE)
 
     if update:
         for pkg, pkg_info in packages.items():
-            if pkg in tracked and pkg not in to_install and pkg_unpinned(pkg_info):
+            if pkg in tracked and pkg not in to_install and pkg in units and pkg_unpinned(pkg_info):
                 log(f"Upgrading UV package: {pkg}", Color.BLUE)
                 cmd = [f"{paths['uv']}/uv", "tool", "upgrade", pkg]
                 returncode, _, stderr = run_command(cmd, env)
                 if returncode != 0:
                     log(f"Failed to upgrade UV package {pkg}: {stderr}", Color.RED)
                     success = False
+                else:
+                    secrets_flow.owe_restarts(state, units[pkg], f"uv/{pkg}")
 
     # Refresh metadata for desired packages already installed and unchanged
     # (drops any legacy fields such as the old "binary").

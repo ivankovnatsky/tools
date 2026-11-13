@@ -360,6 +360,14 @@ class DeployTest(unittest.TestCase):
                         ],
                     )
 
+    def test_files_keep_restart_units(self):
+        with open(os.path.join(self.tmp, "s"), "w") as f:
+            f.write("s")
+        target = os.path.join(self.tmp, "o")
+        config = {"files": [{"source": "s", "target": target, "restartUnits": ["launchd:a.b"]}]}
+        view = selection.View({"files": frozenset({target})}, config, self.tmp)
+        self.assertEqual(view.config["files"][0]["restartUnits"], ["launchd:a.b"])
+
     def test_shared_hook_never_runs_for_unselected_paths(self):
         src = os.path.join(self.tmp, "s")
         with open(src, "w") as f:

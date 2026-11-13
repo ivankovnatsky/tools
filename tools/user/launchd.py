@@ -54,6 +54,7 @@ from xml.parsers.expat import ExpatError
 
 from tools import privilege
 from tools.log import Color, debug, log
+from tools.user import sops
 from tools.user.files import _parse_mode
 from tools.util import format_diff_bytes, looks_like_secret, run_command
 
@@ -98,6 +99,7 @@ _SERVICE_KEYS = {
     "preStart",
     "waitForPaths",
     "waitForPath",
+    "waitForMounts",
     "waitForSecrets",
     "keepAlive",
     "runAtLoad",
@@ -153,7 +155,8 @@ class Service:
     extra_dirs: List[ExtraDir] = field(default_factory=list)
     pre_start: str = ""
     wait_for_paths: List[str] = field(default_factory=list)
-    wait_for_secrets: bool = False  # block until Settings.secrets_dir exists
+    wait_for_mounts: List[str] = field(default_factory=list)  # block until each is a mount point
+    wait_for_secrets: bool = False  # block until sops rendering completed in Settings.secrets_dir
     keep_alive: Any = True  # bool or plist dict
     run_at_load: bool = True
     start_interval: Optional[int] = None
@@ -182,7 +185,7 @@ class Settings:
     errors: List[str] = field(default_factory=list)  # section-level: hold every change
 
 
-DEFAULT_LOG_DIR = "/var/log/tools/launchd"
+DEFAULT_LOG_DIR = "/tmp/log/launchd"
 DEFAULT_AGENT_LOG_DIR = "/tmp/agents/log/launchd"
 
 
@@ -196,14 +199,14 @@ class Env:
 
     agents_dir: Optional[str] = None  # default <home>/Library/LaunchAgents
     daemons_dir: str = "/Library/LaunchDaemons"
-    # Agents: nix-config's home local.launchd `logDir`. Daemons: root-only, unlike its /tmp/log.
+    # nix-config's local.launchd `logDir` defaults: home (agents) and darwin (daemons).
     user_log_dir: Optional[str] = DEFAULT_AGENT_LOG_DIR
     system_log_dir: str = DEFAULT_LOG_DIR
     bash: str = BASH  # root-owned and stable; `launchd.bash` overrides
     stat: Callable[[str], Any] = os.stat
     lstat: Callable[[str], Any] = os.lstat
     # Daemon log paths must sit under one of these (or system_log_dir), and as root every
-    # existing component must also pass `_root_only`.
+    # existing component must also pass `log_dir_error`.
     system_log_roots: Tuple[str, ...] = ("/var/log", "/private/var/log")
     # Missing daemon workingDirectories are created as root only under one of these.
     system_dir_roots: Tuple[str, ...] = (
@@ -570,6 +573,8 @@ def _parse_service(
         svc.wait_for_paths = _runtime_paths(raw["waitForPath"], "waitForPath", rh)
     if raw.get("waitForPaths") is not None:
         svc.wait_for_paths += _runtime_paths(raw["waitForPaths"], "waitForPaths", rh)
+    if raw.get("waitForMounts") is not None:
+        svc.wait_for_mounts = _runtime_paths(raw["waitForMounts"], "waitForMounts", rh)
     if raw.get("restartOn") is not None:
         svc.restart_on = _abs_paths(raw["restartOn"], "restartOn", h)
 
@@ -674,11 +679,11 @@ def parse_launchd(
         except KeyError:
             login = None
     errors: List[str] = []
-    sops = {"secrets_dir": secrets_dir, "secrets_dir_error": secrets_dir_error}
+    sops_kw = {"secrets_dir": secrets_dir, "secrets_dir_error": secrets_dir_error}
     if not isinstance(raw, dict):
         msg = f"launchd must be a mapping, got {type(raw).__name__}"
-        return Settings(errors=[msg], **sops), [], [msg]
-    settings = Settings(errors=errors, **sops)
+        return Settings(errors=[msg], **sops_kw), [], [msg]
+    settings = Settings(errors=errors, **sops_kw)
     for key in sorted(set(raw) & set(_REMOVED_SECTION_KEYS)):
         errors.append(f"`launchd.{key}` {_REMOVED_SECTION_KEYS[key]}")
     unknown = set(raw) - _SECTION_KEYS - set(_REMOVED_SECTION_KEYS)
@@ -747,35 +752,41 @@ def volume_of(path: str, volumes_root: str) -> Optional[str]:
 def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: Optional[str] = None) -> str:
     """The inline starter body, structured like nix-config's local.launchd starter."""
     lines = ["set -e", 'export PATH="/bin:/usr/bin:$PATH"']
-    if log_dir:
+    # A daemon running as another user would recreate a root-only log dir (e.g. after /tmp
+    # is emptied at boot) as its own; tools creates it as root at deploy instead.
+    if log_dir and (svc.domain == "user" or runs_as_root(svc)):
         q = shlex.quote(log_dir)
         lines.append(f"/bin/mkdir -p {q}")
-        if svc.domain == "user":
-            # A dir the agent doesn't own (e.g. root's) would fail chmod and kill the job.
-            lines.append(f"if [ -O {q} ]; then /bin/chmod 755 {q}; fi")
-        else:
-            lines.append(f"/bin/chmod 755 {q} || true")
+        # Only a dir the job owns: chmod would fail on another's (killing the job) and,
+        # as root, follow a symlink planted at the path.
+        lines.append(f"if [ -O {q} ] && [ ! -L {q} ]; then /bin/chmod 755 {q}; fi")
     if svc.wait_for_secrets:
         if not secrets_dir:
             raise ValueError("waitForSecrets needs sops.secretsDir")
-        q = shlex.quote(secrets_dir)
+        q = shlex.quote(os.path.join(secrets_dir, sops.RENDERED_MARKER))
         lines += [
             'echo "Waiting for sops secrets..."',
             f"while [ ! -e {q} ]; do sleep 1; done",
             'echo "Sops secrets available."',
         ]
-    for path in svc.wait_for_paths:
+
+    def wait(path: str, waiting: str, available: str, loop: str) -> None:
         q = shell_path(path)
         if _VAR.search(path):
-            waiting, available = f"'Waiting for '{q}...", f"{q}' available.'"
+            msgs = f"'{waiting} '{q}...", f"{q}' {available}.'"
         else:
-            waiting = shlex.quote(f"Waiting for {path}...")
-            available = shlex.quote(f"{path} available.")
-        lines += [
-            f"echo {waiting}",
-            f"while [ ! -e {q} ]; do sleep 1; done",
-            f"echo {available}",
-        ]
+            msgs = shlex.quote(f"{waiting} {path}..."), shlex.quote(f"{path} {available}.")
+        lines.extend([f"echo {msgs[0]}", loop.format(q=q), f"echo {msgs[1]}"])
+
+    for path in svc.wait_for_mounts:
+        # A mount point's device differs from its parent's; a leftover plain dir's does not.
+        loop = (
+            'until [ -d {q} ] && [ "$(/usr/bin/stat -L -f %d {q})" != '
+            '"$(/usr/bin/stat -L -f %d {q}/..)" ]; do sleep 1; done'
+        )
+        wait(path, "Waiting for mount", "mounted", loop)
+    for path in svc.wait_for_paths:
+        wait(path, "Waiting for", "available", "while [ ! -e {q} ]; do sleep 1; done")
     dirs = ([ExtraDir(svc.data_dir)] if svc.data_dir else []) + svc.extra_dirs
     for d in dirs:
         q = shell_path(d.path)
@@ -1214,6 +1225,17 @@ def root_dir_error(path: str, env: Env) -> Optional[str]:
     return privilege.root_dir_error(path, env.stat, env.lstat)
 
 
+def log_dir_error(path: str, env: Env) -> Optional[str]:
+    """Why root must not create or use daemon log dir `path`: it is a symlink, or it (or
+    an ancestor) is not root-only; a root-owned sticky ancestor like /tmp is allowed."""
+    try:
+        if stat.S_ISLNK(env.lstat(path).st_mode):
+            return f"{path} is a symlink"
+    except OSError:
+        pass
+    return privilege.root_dir_error(path, env.stat, env.lstat, sticky_ok=True)
+
+
 def _root_dir_problems(svc: Service, settings: Settings, env: Env) -> List[str]:
     """As root, the dirs a daemon's logs live in must be root-only (checked at plan and apply)."""
     if not env.root or svc.domain != "system":
@@ -1222,7 +1244,7 @@ def _root_dir_problems(svc: Service, settings: Settings, env: Env) -> List[str]:
     dirs += [os.path.dirname(p) for p in log_paths(svc, settings, env)]
     problems = []
     for d in dict.fromkeys(dirs):
-        why = root_dir_error(d, env)
+        why = log_dir_error(d, env)
         if why:
             problems.append(f"log dir {d}: {why}")
     return problems
@@ -1232,10 +1254,11 @@ def _root_dir_errors(svc: Service, settings: Settings, env: Env) -> List[str]:
     return [f"{svc.name}: {p}" for p in _root_dir_problems(svc, settings, env)]
 
 
-def _secure_mkdirs(path: str, svc: Service, env: Env) -> bool:
+def _secure_mkdirs(path: str, svc: Service, env: Env, check=root_dir_error) -> bool:
     """Create missing components of `path` one at a time as root; each new one must be a
-    real root-only directory (mkdir never follows a symlink planted at its own path)."""
-    why = root_dir_error(path, env)
+    real root-only directory (mkdir never follows a symlink planted at its own path).
+    `check` is the pre-check on `path`."""
+    why = check(path, env)
     if why:
         log(f"launchd: {svc.label}: not creating {path}: {why}", Color.RED)
         return False
@@ -1421,7 +1444,7 @@ def _daemon_logs(svc: Service, settings: Settings, env: Env) -> Optional[List[st
     validated in `plan`.
     """
     log_dir = log_dir_of(svc, settings, env)
-    if not _secure_mkdirs(log_dir, svc, env):
+    if not _secure_mkdirs(log_dir, svc, env, log_dir_error):
         return None
     user, group = log_account(svc)
     files = [p for p, generated in log_specs(svc, settings, env) if generated]

@@ -41,6 +41,8 @@ from tools.user import ssh_age
 
 DEFAULT_SECRETS_DIR = "~/.local/state/tools/secrets"
 DEFAULT_MODE = 0o400
+# In secretsDir once sops and templates rendered completely; launchd waitForSecrets waits on it.
+RENDERED_MARKER = ".tools-rendered"
 
 CHARSETS = {
     "alnum": string.ascii_letters + string.digits,

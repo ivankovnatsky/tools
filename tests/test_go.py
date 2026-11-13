@@ -110,3 +110,30 @@ class GoUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoRestartUnitsTest(unittest.TestCase):
+    def test_install_owes_restart_and_unchanged_does_not(self):
+        packages = {"gatus": {"source": "github.com/x/gatus", "version": "v1",
+                              "restartUnits": ["launchd:org.example.gatus"]}}  # fmt: skip
+        paths = {"goBin": "/gobin"}
+        state = {}
+        with (
+            mock.patch("tools.user.go.shutil.which", return_value="/go"),
+            mock.patch("tools.user.go.run_command", return_value=(0, "", "")),
+        ):
+            self.assertTrue(install_go_packages(packages, paths, state))
+            owed = state["restartUnits"]["launchd:org.example.gatus"]
+            self.assertEqual((owed["sources"], owed["seq"]), (["go/gatus"], 1))
+            self.assertTrue(install_go_packages(packages, paths, state))
+        self.assertEqual(state["restartUnits"]["launchd:org.example.gatus"]["seq"], 1)
+
+    def test_failed_install_owes_nothing(self):
+        packages = {"gatus": {"restartUnits": ["launchd:org.example.gatus"]}}
+        state = {}
+        with (
+            mock.patch("tools.user.go.shutil.which", return_value="/go"),
+            mock.patch("tools.user.go.run_command", return_value=(1, "", "err")),
+        ):
+            self.assertFalse(install_go_packages(packages, {"goBin": "/gobin"}, state))
+        self.assertNotIn("restartUnits", state)

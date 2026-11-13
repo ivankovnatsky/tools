@@ -3,6 +3,7 @@ import shutil
 from typing import Dict, Optional
 
 from tools.log import Color, debug, log
+from tools.user import secrets_flow
 from tools.util import (
     get_pkg_commit,
     get_pkg_source,
@@ -109,6 +110,16 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         for pkg in orphaned:
             tracked.pop(pkg, None)
 
+    units: Dict[str, list] = {}
+    for pkg, pkg_info in packages.items():
+        try:
+            units[pkg] = secrets_flow.parse_restart_units(
+                pkg_info.get("restartUnits"), f"go.packages.{pkg}"
+            )
+        except ValueError as e:
+            log(str(e), Color.RED)
+            success = False
+
     to_install = [
         pkg
         for pkg, pkg_info in packages.items()
@@ -135,6 +146,8 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         go_env.setdefault("GOBIN", go_bin)
         log(f"Installing Go packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
+            if pkg not in units:
+                continue
             spec = _install_spec(pkg, packages[pkg])
             cmd = [go_cmd, "install", spec]
             returncode, _, stderr = run_command(cmd, env=go_env)
@@ -144,6 +157,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
                 continue
             log(f"Installed: {spec}", Color.GREEN)
             tracked[pkg] = _go_entry(packages[pkg])
+            secrets_flow.owe_restarts(state, units[pkg], f"go/{pkg}")
     elif not orphaned:
         debug("All Go packages already installed", Color.BLUE)
 

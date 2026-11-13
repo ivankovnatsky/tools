@@ -401,6 +401,56 @@ class OnChangeTest(unittest.TestCase):
         self.assertNotIn("onChange", state)
         self.assertEqual(_diff_files(entries, self.d, state), [])
 
+    def test_restart_units_owed_after_write_and_successful_hook(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        flag = os.path.join(self.d, "flag")
+        hook = f"if [ -e {flag} ]; then {self.hook}; else touch {flag}; exit 3; fi"
+        unit = "launchd:org.example.caddy"
+        entries = [
+            {"source": "src/a.conf", "target": target, "onChange": hook, "restartUnits": [unit]}
+        ]
+        state = {}
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertFalse(ok)
+        self.assertNotIn("restartUnits", state)
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertEqual(state["restartUnits"][unit], {"sources": [f"files/{target}"], "seq": 1})
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(state["restartUnits"][unit]["seq"], 1)
+        _write(os.path.join(self.d, "src", "a.conf"), "two\n")
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(state["restartUnits"][unit]["seq"], 2)
+
+    def test_restart_units_owed_when_retried_hook_succeeds_for_unresolved_entry(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        flag = os.path.join(self.d, "flag")
+        hook = f"if [ -e {flag} ]; then {self.hook}; else touch {flag}; exit 3; fi"
+        unit = "launchd:org.example.caddy"
+        entries = [
+            {"source": "src/a.conf", "target": target, "onChange": hook, "restartUnits": [unit]}
+        ]
+        state = {}
+        _quiet(files.install_files, entries, self.d, state)
+        os.remove(os.path.join(self.d, "src", "a.conf"))
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(state["restartUnits"][unit]["sources"], [f"files/{target}"])
+
+    def test_restart_units_without_hook_and_invalid_value(self):
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        entries = [{"source": "src/a.conf", "target": target, "restartUnits": ["launchd:a.b"]}]
+        state = {}
+        (ok, _out) = _quiet(files.install_files, entries, self.d, state)
+        self.assertTrue(ok)
+        self.assertEqual(state["restartUnits"]["launchd:a.b"]["sources"], [f"files/{target}"])
+        bad = [{"source": "src/a.conf", "target": target, "restartUnits": "launchd:a.b"}]
+        _resolved, errors = files._resolve_entries(bad, self.d)
+        self.assertIn("restartUnits must be a list of strings", errors[0])
+
     def test_pending_hook_kept_while_entry_fails_to_resolve(self):
         _write(os.path.join(self.d, "src", "a.conf"), "one\n")
         target = os.path.join(self.d, "a.conf")

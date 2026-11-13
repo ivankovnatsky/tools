@@ -87,3 +87,41 @@ class UvUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UvRestartUnitsTest(unittest.TestCase):
+    UNITS = {"restartUnits": ["launchd:org.example.svc"]}
+
+    def owed(self, state):
+        return state.get("restartUnits", {}).get("launchd:org.example.svc")
+
+    def test_install_owes_restart(self):
+        state = {}
+        with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")):
+            self.assertTrue(install_uv_packages({"svc": dict(self.UNITS)}, PATHS, state))
+        self.assertEqual(self.owed(state)["sources"], ["uv/svc"])
+        self.assertNotIn("restartUnits", state["uv"]["packages"]["svc"])
+
+    def test_failed_install_owes_nothing(self):
+        state = {}
+        with mock.patch("tools.user.uv.run_command", return_value=(1, "", "err")):
+            self.assertFalse(install_uv_packages({"svc": dict(self.UNITS)}, PATHS, state))
+        self.assertIsNone(self.owed(state))
+
+    def test_unchanged_owes_nothing_and_upgrade_owes_restart(self):
+        state = {"uv": {"packages": {"svc": {"installed": True, "version": "latest"}},
+                        "context": "/bin|/tooldir"}}  # fmt: skip
+        with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")):
+            self.assertTrue(install_uv_packages({"svc": dict(self.UNITS)}, PATHS, state))
+            self.assertIsNone(self.owed(state))
+            self.assertTrue(install_uv_packages({"svc": dict(self.UNITS)}, PATHS, state, True))
+        self.assertEqual(self.owed(state)["sources"], ["uv/svc"])
+
+    def test_invalid_restart_units_is_an_error(self):
+        state = {}
+        with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")) as run:
+            self.assertFalse(
+                install_uv_packages({"svc": {"restartUnits": "launchd:x"}}, PATHS, state)
+            )
+        run.assert_not_called()
+        self.assertNotIn("restartUnits", state)
