@@ -26,6 +26,7 @@ SECTIONS = (
     "ollamaModels",
     "flatpak",
     "settingsctl",
+    "users",
     "plist",
     "launchd",
     "defaults",

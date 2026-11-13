@@ -766,9 +766,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
 
         result = self.run_cli(["deploy"], show_diff=show_diff)
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(
-            seen, [(True, 0, ("launchd", "defaults", "files", "settingsctl")), (False, 501, ())]
-        )
+        self.assertEqual(seen, [(True, 0, privilege.ROOT_SECTIONS), (False, 501, ())])
         self.prompted.assert_called_once()
         self.assertIn(("install_brew_packages", 501), self.events)
 

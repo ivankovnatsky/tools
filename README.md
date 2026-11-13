@@ -100,7 +100,8 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
   `SUDO_USER` must name a non-root user (and match `SUDO_UID` when set).
   Every subcommand checks this before doing anything.
 - First, as root: `files` entries the user cannot write, `launchd` daemons,
-  `defaults` `system:` keys and `settingsctl` host settings, with root's own state in
+  `defaults` `system:` keys, `settingsctl` host settings and `users` login
+  shells, with root's own state in
   `/var/db/tools/state.json`. Root never reads or writes the
   user's state file, the `mgmt` key, or anything under the user's home: a
   daemon whose plist, log dir, log files or `workingDirectory` falls under it
@@ -119,7 +120,7 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
   dropped child) and one prompt covers both. A failed system phase stops the
   run before the user phase; a failure in either exits non-zero.
 - `--scope` restricts both phases; a scope without `files`, `launchd`,
-  `defaults` or `settingsctl` skips the root phase. `sudo tools diff` shows both diffs the same way.
+  `defaults`, `settingsctl` or `users` skips the root phase. `sudo tools diff` shows both diffs the same way.
   `watch` and `reconcile` refuse root.
 - Without sudo, `deploy` runs only the user part and prints one note per
   section pointing at `sudo tools deploy --scope ...` for the system part.
@@ -954,6 +955,32 @@ settingsctl:
 - `appearanceInit` switches to dark mode once; settingsctl then writes
   `~/.local/state/settings/appearance/last-run` and later toggles are yours.
 - A key that leaves config is left as is. Any config error holds the section.
+
+## users
+
+`users:` checks the uid and sets the login shell of existing accounts on macOS.
+tools never creates, deletes or renumbers accounts.
+
+```yaml
+users:
+  ivan:
+    uid: 502                       # checked only
+    shell: /opt/homebrew/bin/fish  # dscl . -create /Users/ivan UserShell ...
+```
+
+- Runs in the sudo phase, after system `files` (which may write `/etc/shells`).
+  Without sudo, `deploy` and `diff` read the accounts and print a note pointing
+  at `sudo tools deploy --scope users`.
+- A uid that differs is reported and that user is skipped, shell included. A
+  missing user fails the section.
+- Only local accounts (`dscl .`) are changed; a user found only in another
+  directory node fails the section.
+- The shell must be listed in `/etc/shells` and be executable by that user, or
+  the section fails and the shell is left as is. A shell not installed yet
+  (brew runs in the user phase) is reported and skipped.
+- `diff` checks the current `/etc/shells`, not one the same run's `files`
+  section is about to write.
+- A user that leaves config is left as is. Any config error holds the section.
 
 ## plist
 

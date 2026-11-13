@@ -72,6 +72,8 @@ from tools.user.settingsctl import install_settingsctl
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
 from tools.user.skills import source_root as skills_source_root
+from tools.user.users import has_work as users_has_work
+from tools.user.users import install_users
 from tools.user.uv import install_uv_packages
 from tools.watch import is_excluded, is_watched, log_files, run_in_tmux, snapshot, watch_loop, wlog
 
@@ -500,6 +502,9 @@ def _run_root_sections(
     # Before daemons, whose restartOn may name these files.
     if "files" in active and files_has_system_work(config.get("files"), state):
         success &= install_files(config.get("files") or [], config_dir, state, system=True)
+    # After files, which may write /etc/shells.
+    if "users" in active and users_has_work(config.get("users")):
+        success &= install_users(config.get("users"))
     if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
         success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
@@ -716,6 +721,9 @@ def _run_sections(
     # After uv (installs settingsctl) and brew (installs the apps it grants).
     if "settingsctl" in active and config.get("settingsctl") is not None:
         success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
+
+    if "users" in active and users_has_work(config.get("users")):
+        success &= install_users(config.get("users"))
 
     # After brew, which installs the apps whose files these are.
     if "plist" in active and plist_has_work(config.get("plist")):

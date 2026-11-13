@@ -37,6 +37,8 @@ from tools.user.settingsctl import diff_settingsctl
 from tools.user.settingsctl import has_root_work as settingsctl_has_root_work
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
+from tools.user.users import diff_users
+from tools.user.users import has_work as users_has_work
 from tools.util import (
     SKIPPED_ROW,
     format_diff_bytes,
@@ -649,6 +651,11 @@ def show_diff(
         if changes:
             sections.append(("settingsctl", changes))
 
+    if "users" in active and users_has_work(config.get("users")):
+        changes = diff_users(config.get("users"))
+        if changes:
+            sections.append(("users", changes))
+
     if "plist" in active and plist_has_work(config.get("plist")):
         changes = diff_plist(config.get("plist"))
         if changes:
@@ -715,6 +722,10 @@ def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
         changes = _diff_files(config.get("files") or [], config_dir, state, system=True)
         if changes:
             sections.append(("files", changes))
+    if "users" in active and users_has_work(config.get("users")):
+        changes = diff_users(config.get("users"))
+        if changes:
+            sections.append(("users", changes))
     if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
         changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"))
         if changes:
