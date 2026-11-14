@@ -1,7 +1,7 @@
 import json
 import os
 import shutil
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
@@ -113,7 +113,8 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
             for pkg in orphaned:
                 entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
                 try:
-                    name = _crate_name(pkg, entry, paths)
+                    others = (set(state_pkgs) | set(packages)) - {pkg}
+                    name = _crate_name(pkg, entry, paths, others)
                 except CrateRecordError as e:
                     log(f"Failed to remove cargo package {pkg}: {e}", Color.RED)
                     success = False
@@ -170,8 +171,9 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
             # behind; remove it first so a failure keeps the record to retry.
             if old is not None and not context_changed:
                 try:
-                    old_name = _crate_name(pkg, old, paths)
-                    new_name = _crate_name(pkg, packages[pkg], paths)
+                    others = (set(tracked) | set(packages)) - {pkg}
+                    old_name = _crate_name(pkg, old, paths, others)
+                    new_name = _crate_name(pkg, packages[pkg], paths, others)
                 except CrateRecordError as e:
                     log(f"Failed to install cargo package {pkg}: {e}", Color.RED)
                     success = False
@@ -217,7 +219,7 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
     return success
 
 
-def _crate_name(pkg: str, pkg_info: Dict, paths: Dict) -> Optional[str]:
+def _crate_name(pkg: str, pkg_info: Dict, paths: Dict, others: Iterable[str] = ()) -> Optional[str]:
     """Package name `cargo uninstall` expects, matching `_install_args`.
 
     A `--git` install is named by the repo, not the config key, so it is
@@ -244,8 +246,11 @@ def _crate_name(pkg: str, pkg_info: Dict, paths: Dict) -> Optional[str]:
         if f"(git+{source}?" in rest and f"rev={commit}#" in rest:
             names.append(name)
     # One repo and rev can hold several installed crates; the key names it.
+    # Never fall back to a crate another configured or tracked key owns.
     if pkg in names:
         return pkg
+    taken = set(others)
+    names = [n for n in names if n not in taken]
     return names[0] if len(names) == 1 else None
 
 

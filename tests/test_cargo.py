@@ -60,6 +60,27 @@ class CargoRemovalTest(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], [["uninstall", "crate-b"]])
         self.assertEqual(set(state["cargo"]["packages"]), {"crate-a"})
 
+    def test_dropped_crate_never_falls_back_to_a_kept_sibling(self):
+        src = "https://example.com/x.git"
+        with tempfile.TemporaryDirectory() as root:
+            # crate-b was uninstalled by hand; only the kept crate-a is recorded.
+            record = {"installs": {f"crate-a 0.1.0 (git+{src}?rev=abc#abcdef)": {}}}
+            Path(root, ".crates2.json").write_text(json.dumps(record))
+            entry = {"installed": True, "version": "latest", "source": src, "commit": "abc"}
+            state = {
+                "cargo": {
+                    "context": f"{root}|",
+                    "root": root,
+                    "packages": {"crate-a": dict(entry), "crate-b": dict(entry)},
+                }
+            }
+            keep = {"crate-a": {"source": src, "commit": "abc"}}
+            success, calls = self._run(keep, {"cargoRoot": root}, state)
+
+        self.assertTrue(success)
+        self.assertEqual(calls, [])
+        self.assertEqual(set(state["cargo"]["packages"]), {"crate-a"})
+
     def test_uninstall_name_matches_install(self):
         with tempfile.TemporaryDirectory() as root:
             record = {
