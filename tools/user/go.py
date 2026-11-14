@@ -132,9 +132,21 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         legacy_bin = None
         if not context_changed and (paths.get("goBin") or paths.get("goPath")):
             legacy_bin = _resolve_go_bin(paths)
+        kept_paths = {
+            _installed_path(pkg, entry, legacy_bin)
+            for pkg, entry in state_pkgs.items()
+            if pkg in desired and isinstance(entry, dict)
+        }
         for pkg in orphaned:
             entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
             path = _installed_path(pkg, entry, legacy_bin)
+            if path and path in kept_paths:
+                log(
+                    f"Dropping Go package {pkg} from state (binary {path} still in use)",
+                    Color.YELLOW,
+                )
+                tracked.pop(pkg, None)
+                continue
             if not path:
                 log(
                     f"Dropping Go package {pkg} from state (install path unknown, "

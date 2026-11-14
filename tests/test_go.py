@@ -94,6 +94,21 @@ class GoRemovalTest(unittest.TestCase):
 
             self.assertFalse((go_bin / "gatus").exists())
 
+    def test_dropping_package_keeps_binary_a_kept_package_uses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binary = Path(temp_dir) / "tool"
+            binary.touch()
+            entry = {"installed": True, "source": "example.com/tool", "path": str(binary)}
+            state = {"go": {"packages": {"old": dict(entry), "new": dict(entry)}}}
+
+            success = install_go_packages(
+                {"new": {"source": "example.com/tool"}}, {"goBin": temp_dir}, state
+            )
+
+            self.assertTrue(success)
+            self.assertTrue(binary.exists())
+            self.assertEqual(set(state["go"]["packages"]), {"new"})
+
     def test_dropping_one_of_several_keeps_the_others(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             go_path = Path(temp_dir) / ".go"
