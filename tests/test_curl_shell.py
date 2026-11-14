@@ -20,17 +20,24 @@ class FakeProc:
 
 
 class CurlShellTest(unittest.TestCase):
-    def _run(self, scripts, state, curl_rc=0, shell_rc=0):
+    def _run(self, scripts, state, curl_rc=0, shell_rc=0, uninstall_rc=0):
+        self.uninstalls = []
+
         def fake_popen(cmd, **kw):
             if "curl" in cmd[0]:
                 return FakeProc(curl_rc)
             return FakeProc(shell_rc)
+
+        def fake_run(cmd, env=None, cwd=None):
+            self.uninstalls.append(cmd)
+            return uninstall_rc, "", "boom" if uninstall_rc else ""
 
         with (
             mock.patch.object(curl_shell, "system_bin", return_value="/usr/bin/curl"),
             mock.patch.object(curl_shell, "system_dir", return_value="/usr/bin"),
             mock.patch.object(curl_shell, "system_dir_optional", return_value=None),
             mock.patch.object(curl_shell.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(curl_shell, "run_command", side_effect=fake_run),
         ):
             return curl_shell.install_curl_shell_scripts(scripts, state)
 
@@ -67,6 +74,116 @@ class CurlShellTest(unittest.TestCase):
         self._run({}, state)
 
         self.assertEqual(state["curlShell"]["installed"], [])
+        self.assertEqual(self.uninstalls, [])
+
+    def test_install_records_uninstall_command(self):
+        state = {}
+        scripts = {"https://example/x.sh": {"shell": "bash", "uninstall": "rm -rf ~/.x"}}
+
+        self.assertTrue(self._run(scripts, state))
+
+        self.assertEqual(state["curlShell"]["installed"], ["https://example/x.sh"])
+        self.assertEqual(state["curlShell"]["uninstall"], {"https://example/x.sh": "rm -rf ~/.x"})
+
+    def test_failed_install_records_no_uninstall(self):
+        state = {}
+        scripts = {"https://example/x.sh": {"shell": "bash", "uninstall": "rm -rf ~/.x"}}
+
+        self.assertFalse(self._run(scripts, state, shell_rc=1))
+
+        self.assertNotIn("uninstall", state.get("curlShell", {}))
+
+    def test_uninstall_added_to_installed_entry_is_recorded(self):
+        # The config entry is gone by removal time, so an uninstall added later
+        # must reach state without a reinstall.
+        state = {"curlShell": {"installed": ["https://example/x.sh"]}}
+        scripts = {"https://example/x.sh": {"shell": "bash", "uninstall": "rm ~/.x"}}
+
+        self.assertTrue(self._run(scripts, state))
+
+        self.assertEqual(state["curlShell"]["uninstall"], {"https://example/x.sh": "rm ~/.x"})
+
+    def test_uninstall_dropped_from_installed_entry_is_cleared(self):
+        state = {
+            "curlShell": {
+                "installed": ["https://example/x.sh"],
+                "uninstall": {"https://example/x.sh": "rm ~/.x"},
+            }
+        }
+
+        self.assertTrue(self._run({"https://example/x.sh": "bash"}, state))
+
+        self.assertNotIn("uninstall", state["curlShell"])
+
+    def test_dropped_url_runs_recorded_uninstall(self):
+        state = {
+            "curlShell": {
+                "installed": ["https://example/gone.sh"],
+                "uninstall": {"https://example/gone.sh": "rm -rf ~/.gone"},
+            }
+        }
+
+        self.assertTrue(self._run({}, state))
+
+        self.assertEqual(self.uninstalls, [["/bin/sh", "-c", "rm -rf ~/.gone"]])
+        self.assertEqual(state["curlShell"]["installed"], [])
+        self.assertNotIn("uninstall", state["curlShell"])
+
+    def test_failed_uninstall_stays_tracked_for_retry(self):
+        record = {
+            "installed": ["https://example/gone.sh"],
+            "uninstall": {"https://example/gone.sh": "rm -rf ~/.gone"},
+        }
+        state = {"curlShell": dict(record)}
+
+        self.assertFalse(self._run({}, state, uninstall_rc=1))
+
+        self.assertEqual(state["curlShell"], record)
+
+    def test_malformed_entry_refuses_section(self):
+        # A typo must not read as "entry removed" and run its uninstall.
+        state = {
+            "curlShell": {
+                "installed": ["https://example/x.sh"],
+                "uninstall": {"https://example/x.sh": "rm ~/.x"},
+            }
+        }
+        scripts = {"https://example/x.sh": {"shel": "bash"}}
+
+        self.assertFalse(self._run(scripts, state))
+
+        self.assertEqual(self.uninstalls, [])
+        self.assertEqual(state["curlShell"]["installed"], ["https://example/x.sh"])
+
+
+class CurlShellDiffTest(unittest.TestCase):
+    def test_rows(self):
+        state = {
+            "curlShell": {
+                "installed": ["https://example/a.sh", "https://example/b.sh"],
+                "uninstall": {"https://example/a.sh": "rm ~/.a"},
+            }
+        }
+
+        rows = curl_shell.diff_curl_shell({"https://example/new.sh": "bash"}, state)
+
+        self.assertEqual(
+            rows,
+            [
+                "  + install https://example/new.sh",
+                "  - uninstall https://example/a.sh (runs: rm ~/.a)",
+                "  ~ forget https://example/b.sh (no uninstall; releases tracking)",
+            ],
+        )
+
+    def test_malformed_entry_shows_only_errors(self):
+        state = {"curlShell": {"installed": ["https://example/a.sh"]}}
+
+        rows = curl_shell.diff_curl_shell({"https://example/a.sh": {"uninstall": "x"}}, state)
+
+        self.assertEqual(
+            rows, ["  ! curlShell.https://example/a.sh: shell must be a non-empty string"]
+        )
 
 
 if __name__ == "__main__":

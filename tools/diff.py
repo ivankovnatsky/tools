@@ -15,6 +15,7 @@ from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
 from tools.user.brew import diff_brew
+from tools.user.curl_shell import diff_curl_shell
 from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
 from tools.user.dock import diff_dock
@@ -233,19 +234,6 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     for name in sorted(managed - current - desired):
         changes.append(f"  ~ forget {name}")
 
-    return changes
-
-
-def _diff_curl_shell(curl_shell: Dict, state: Dict):
-    changes = []
-    installed = set(state.get("curlShell", {}).get("installed", []))
-    desired = set(curl_shell.keys())
-    for name in sorted(desired - installed):
-        changes.append(f"  + install {name}")
-    # Deploy releases dropped URLs from state (there is no uninstall); the
-    # preview must show that or the interactive path never reconciles it.
-    for name in sorted(installed - desired):
-        changes.append(f"  ~ forget {name} (no uninstall; releases tracking)")
     return changes
 
 
@@ -566,7 +554,7 @@ def show_diff(
     if "curlShell" in active and (
         config.get("curlShell") or state.get("curlShell", {}).get("installed")
     ):
-        changes = _diff_curl_shell(config.get("curlShell") or {}, state)
+        changes = diff_curl_shell(config.get("curlShell"), state)
         if changes:
             sections.append(("curlShell", changes))
 

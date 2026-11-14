@@ -486,6 +486,33 @@ links:
 - A tracked link is repointed or removed only while it still points where
   tools left it, and removals are held while any entry is invalid.
 
+## curlShell
+
+`curlShell:` runs `curl -fsSL <url> | <shell>` once per url. An entry is a
+shell, or a mapping with `shell` and an optional `uninstall` command:
+
+```yaml
+curlShell:
+  https://example.com/install.sh: bash
+  https://example.com/other-install.sh:
+    shell: bash
+    uninstall: rm -rf ~/.other ~/.local/bin/other
+```
+
+- A url is installed once and tracked in state; it runs again only after it is
+  dropped from config and added back. There is no upgrade step.
+- `uninstall` is recorded in state when the url installs, and kept current
+  while the entry stays in config. When the entry is dropped, deploy runs the
+  recorded command via `/bin/sh -c` and then forgets the url. A failing
+  command fails the deploy and keeps the url tracked, so it is retried next
+  deploy.
+- A dropped url without a recorded `uninstall` is only released from state
+  (whatever the script installed stays).
+- `tools diff` shows `+ install <url>`, `- uninstall <url> (runs: <command>)`
+  and `~ forget <url> (no uninstall; releases tracking)`.
+- A malformed entry fails the section; nothing is installed or uninstalled
+  until it is fixed.
+
 ## fetch
 
 `fetch:` downloads files from https URLs, the nix `fetchurl` equivalent (a vim
@@ -1172,7 +1199,7 @@ Deploy records what it installs in the state file and only ever removes what it
 recorded — anything installed by hand is never touched (the one opt-in
 exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
 config removes it from the system on the next deploy (where an uninstall exists;
-`go`, `cargo` and `curlShell` only release tracking). Git checkout removal refuses to
+`go`, `cargo` and `curlShell` entries without `uninstall` only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
 
 Every deploy (including each `watch` run) holds an exclusive lock on

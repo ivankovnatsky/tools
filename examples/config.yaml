@@ -85,6 +85,11 @@ mcp:
   #       headers: ["Authorization: Bearer ${API_KEY}"] # expanded by claude, not tools
 
 curlShell: {}
+  # example (uninstall runs when the entry is dropped; see README "curlShell"):
+  #   https://example.test/install.sh: bash
+  #   https://example.test/other.sh:
+  #     shell: bash
+  #     uninstall: rm -rf ~/.other
 
 gitRepos: {}
 
