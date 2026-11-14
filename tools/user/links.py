@@ -25,6 +25,7 @@ picks it up.
 import os
 from typing import Dict, List, Optional, Tuple
 
+from tools import fsutil
 from tools.log import Color, debug, log
 
 # Distinct from skills' ".tools-tmp": both stage beside ~/.claude/skills/*.
@@ -110,6 +111,7 @@ def plan(entries, state: Dict) -> Dict[str, List]:
     # Paths skills.linkTargets owns; two owners would remove each other's link.
     owned_by_skills = state.get("skills", {}).get("links", {}) or {}
     desired, errors = resolve(entries)
+    installed = fsutil.respell(dict(installed), desired)
 
     result: Dict[str, List] = {
         "errors": errors,
@@ -181,6 +183,7 @@ def install_links(entries, state: Dict) -> bool:
     entries = entries or []
     section = state.setdefault("links", {})
     installed: Dict[str, Dict] = dict(section.get("installed", {}) or {})
+    fsutil.respell(installed, resolve(entries)[0])
     success = True
 
     p = plan(entries, {"links": {"installed": installed}, "skills": state.get("skills", {})})

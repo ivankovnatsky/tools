@@ -366,6 +366,7 @@ def plan(raw, state: Dict, conflicts=None, run: Optional[Callable] = None) -> Pl
     p.var_rows = _var_rows(spec, section)
 
     desired = spec.files() if spec else {}
+    installed = fsutil.respell(dict(installed), desired)
     for target, shell in desired.items():
         reason = conflicts.get(target) if conflicts else None
         if reason:
@@ -442,6 +443,7 @@ def install_env(raw, state: Dict, conflicts=None, run: Optional[Callable] = None
         for err in p.errors:
             log(f"env: {err}", Color.RED)
         return False
+    fsutil.respell(installed, p.spec.files() if p.spec else {})
     for warning in p.warnings:
         log(f"env: {warning}", Color.YELLOW)
     success = True

@@ -531,10 +531,12 @@ class FetchInstallTest(unittest.TestCase):
         self.assertTrue(self.deploy(raw))
         self.assertEqual(self.read(self.bin), b"t1")
         self.assertEqual(stat.S_IMODE(os.stat(self.bin).st_mode), 0o700)
+        record = self.state["fetch"]["installed"][self.bin]
         self.assertEqual(
-            self.state["fetch"]["installed"][self.bin],
+            {k: v for k, v in record.items() if k not in ("dev", "ino", "mtime_ns", "birthtime")},
             {"url": URL, "sha256": sha(self.opener.body), "install": BIN_SCRIPT, "type": "file"},
         )
+        self.assertEqual(record["ino"], os.lstat(self.bin).st_ino)
         self.assertEqual(self.leftovers(self.bin), [])
         self.assertEqual(self.diff(raw), [])
         self.assertTrue(self.deploy(raw))
@@ -558,10 +560,12 @@ class FetchInstallTest(unittest.TestCase):
         exe = os.path.join(self.app, "Contents", "MacOS", "App")
         self.assertEqual(self.read(exe), b"bin")
         self.assertEqual(stat.S_IMODE(os.stat(exe).st_mode), 0o755)
+        record = self.state["fetch"]["installed"][self.app]
         self.assertEqual(
-            self.state["fetch"]["installed"][self.app],
+            {k: v for k, v in record.items() if k not in ("dev", "ino", "mtime_ns", "birthtime")},
             {"url": URL, "sha256": raw[self.app]["sha256"], "install": APP_SCRIPT, "type": "dir"},
         )
+        self.assertEqual(record["ino"], os.lstat(self.app).st_ino)
         self.assertEqual(self.leftovers(self.app), [])
         self.assertEqual(self.diff(raw), [])
         self.assertTrue(self.deploy(raw, update=True))
@@ -697,6 +701,56 @@ class FetchInstallTest(unittest.TestCase):
             self.assertTrue(self.deploy({}), self.output)
         self.assertFalse(os.path.lexists(self.app))
         self.assertFalse(os.path.lexists(self.bin))
+
+    def _hand_installed_app(self):
+        # Old result kept alive until the copy exists, so its inode is not reused.
+        old = os.path.join(self.tmp, "old")
+        os.rename(self.app, old)
+        os.makedirs(os.path.join(self.app, "Contents"))
+        fetch._force_rmtree(old)
+        mine = os.path.join(self.app, "Contents", "mine")
+        with open(mine, "wb") as f:
+            f.write(b"hand")
+        return mine
+
+    def test_hand_installed_copy_not_removed(self):
+        self.deploy(self.app_raw())
+        mine = self._hand_installed_app()
+        self.assertEqual(
+            self.diff({}), [f"  ~ keep {self.app} (no longer the dir tools installed; not removed)"]
+        )
+        self.assertTrue(self.deploy({}), self.output)
+        self.assertEqual(self.read(mine), b"hand")
+
+    def test_reused_inode_is_not_the_installed_directory(self):
+        self.deploy(self.app_raw())
+        record = self.state["fetch"]["installed"][self.app]
+        fake = {**record, "ino": record["ino"], "mtime_ns": record["mtime_ns"] + 1}
+        if "birthtime" in record:
+            fake["birthtime"] = record["birthtime"] + 1
+        self.state["fetch"]["installed"][self.app] = fake
+        self.assertEqual(
+            self.diff({}), [f"  ~ keep {self.app} (no longer the dir tools installed; not removed)"]
+        )
+        self.assertTrue(self.deploy({}), self.output)
+        self.assertTrue(os.path.isdir(self.app))
+
+    def test_directory_without_birthtime_matches_on_mtime(self):
+        self.deploy(self.app_raw())
+        record = dict(self.state["fetch"]["installed"][self.app])
+        record.pop("birthtime", None)
+        self.assertTrue(fetch._same_result(self.app, record))
+        self.assertFalse(fetch._same_result(self.app, {**record, "mtime_ns": 0}))
+        legacy = {k: v for k, v in record.items() if k not in ("dev", "ino", "mtime_ns")}
+        self.assertTrue(fetch._same_result(self.app, legacy))
+
+    def test_hand_installed_copy_moved_aside_on_sha_change(self):
+        self.deploy(self.app_raw())
+        self._hand_installed_app()
+        raw = self.app_raw({"dist/App.app/Contents/MacOS/App": (b"bin2", 0o755)})
+        self.assertTrue(self.deploy(raw), self.output)
+        self.assertEqual(self.read(os.path.join(self.app + ".tools", "Contents", "mine")), b"hand")
+        self.assertEqual(self.read(os.path.join(self.app, "Contents", "MacOS", "App")), b"bin2")
 
     def test_missing_result_reinstalled(self):
         raw = self.app_raw()

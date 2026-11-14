@@ -93,6 +93,25 @@ class LinkTest(LinksTestBase):
         self.assertTrue(os.path.isdir(self.src))
         self.assertEqual(self.installed(), {})
 
+    def test_respelled_target_keeps_link_and_single_entry(self):
+        from tools import fsutil
+
+        real = os.path.dirname(self.target)
+        alias = os.path.join(self.tmp, "alias")
+        os.makedirs(real)
+        os.symlink(real, alias)
+        pairs = [(os.path.join(real, "a"), os.path.join(alias, "a"))]
+        if fsutil._case_insensitive(real):
+            pairs.append((os.path.join(real, "b"), os.path.join(real, "B")))
+        for first, second in pairs:
+            self.state = {}
+            self.assertTrue(self.deploy([self.entry(target=first)]))
+            entries = [self.entry(target=second)]
+            self.assertEqual(self.diff(entries), [], (first, second))
+            self.assertTrue(self.deploy(entries))
+            self.assertEqual(os.readlink(first), self.src, (first, second))
+            self.assertEqual(list(self.installed()), [second])
+
     def test_missing_source_is_skipped_not_linked(self):
         missing = os.path.join(self.tmp, "nope")
         entries = [self.entry(source=missing)]

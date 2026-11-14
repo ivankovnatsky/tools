@@ -155,11 +155,39 @@ def _is_install_record(record) -> bool:
     return isinstance(record, dict) and "type" in record
 
 
+def _birthtime(path: str) -> Optional[float]:
+    try:
+        return getattr(os.lstat(path), "st_birthtime", None)
+    except OSError:
+        return None
+
+
+def _same_result(target: str, record) -> bool:
+    """Whether ``target`` is the install result tools moved into place.
+
+    A directory's dev moves with remounts, so it is matched on inode plus
+    birth time, or mtime where the platform has no birth time: a freed
+    inode number is reused (ext4), so the inode alone is not identity.
+    Records without an inode predate identity tracking and pass.
+    """
+    if "ino" not in record:
+        return True
+    if record["type"] == "dir":
+        fp = fsutil.fingerprint(target)
+        if fp is None or fp["ino"] != record["ino"]:
+            return False
+        if "birthtime" in record:
+            return _birthtime(target) == record["birthtime"]
+        return fp["mtime_ns"] == record.get("mtime_ns")
+    return fsutil.same_identity(target, record)
+
+
 def _intact(target: str, record) -> bool:
-    """Whether ``target`` is still what tools put there: the recorded type for
-    an install result (never read), the recorded content for a plain file."""
+    """Whether ``target`` is still what tools put there: the recorded type and
+    inode for an install result (never read), the recorded content for a
+    plain file."""
     if _is_install_record(record):
-        return _kind(target) == record["type"]
+        return _kind(target) == record["type"] and _same_result(target, record)
     return not os.path.islink(target) and _file_hash(target) == (record or {}).get("hash")
 
 
@@ -230,7 +258,7 @@ def _plan_install(e: Entry, kind: str, record: Dict, update: bool) -> Change:
     ):
         return Change(e, "replace", "modified since tools wrote it")
     recorded = record.get("type", "file")
-    if kind != recorded:
+    if kind != recorded or (_is_install_record(record) and not _same_result(e.target, record)):
         return Change(e, "replace", f"no longer the {recorded} tools installed")
     why = _why_refetch(e, record, update)
     if why:
@@ -471,7 +499,15 @@ def download(
 
 def _fetch_record(e: Entry, sha: str) -> Dict:
     if e.install:
-        return {"url": e.url, "sha256": sha, "install": e.install, "type": _kind(e.target)}
+        fp = fsutil.fingerprint(e.target) or {}
+        return {
+            "url": e.url,
+            "sha256": sha,
+            "install": e.install,
+            "type": _kind(e.target),
+            **{k: fp[k] for k in ("dev", "ino", "mtime_ns") if k in fp},
+            **({"birthtime": birth} if (birth := _birthtime(e.target)) is not None else {}),
+        }
     return {**_record(e.target, sha), "url": e.url}
 
 

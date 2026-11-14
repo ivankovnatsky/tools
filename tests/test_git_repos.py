@@ -66,6 +66,7 @@ class GitReposRemovalTest(unittest.TestCase):
 
     def test_clean_repo_dropped_from_config_is_removed(self):
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 
@@ -77,6 +78,7 @@ class GitReposRemovalTest(unittest.TestCase):
     def test_repo_with_uncommitted_work_is_kept(self):
         # Removal is an rmtree; uncommitted work would be unrecoverable.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 
@@ -86,6 +88,7 @@ class GitReposRemovalTest(unittest.TestCase):
 
     def test_repo_with_unpushed_commits_is_kept(self):
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 
@@ -97,6 +100,7 @@ class GitReposRemovalTest(unittest.TestCase):
         # Stash entries are neither status output nor branch commits; rmtree
         # would delete them silently.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 
@@ -108,6 +112,7 @@ class GitReposRemovalTest(unittest.TestCase):
         # --all (all local refs plus HEAD), not --branches: a detached-HEAD
         # or local-tag-only commit is local work too.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             fake = FakeGit()
 
@@ -122,6 +127,7 @@ class GitReposRemovalTest(unittest.TestCase):
         # A stubborn checkout must not abort the deploy, and must stay in
         # state so the next run retries.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
 
             def boom(path):
@@ -142,12 +148,26 @@ class GitReposRemovalTest(unittest.TestCase):
         # A path git cannot interrogate counts as having work: refusing to
         # delete costs a stale directory, deleting costs the work.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 
             self._reconcile({}, state, FakeGit(failing_status=[d]), removed)
 
             self.assertEqual(removed, [])
+
+    def test_tracked_non_checkout_is_released_not_removed(self):
+        # git -C on a dir without .git interrogates the enclosing repo, which
+        # reads clean when its .gitignore is `**`.
+        with tempfile.TemporaryDirectory() as d:
+            state = {"gitRepos": {"installed": [d]}}
+            removed = []
+
+            self.assertTrue(self._reconcile({}, state, FakeGit(), removed))
+
+            self.assertEqual(removed, [])
+            self.assertTrue(os.path.isdir(d))
+            self.assertEqual(state["gitRepos"]["installed"], [])
 
     def test_untracked_directory_is_never_removed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -164,6 +184,7 @@ class GitReposRemovalTest(unittest.TestCase):
         # cli gates on config-or-state; the reconciler must not early-return
         # on an empty config while state still tracks something.
         with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
             removed = []
 

@@ -167,6 +167,8 @@ class ShellExecutionTest(unittest.TestCase):
             [exe, *argv[1:], script],
             capture_output=True,
             text=True,
+            # nix bash sources /etc/bashrc when stdin is a socket.
+            stdin=subprocess.DEVNULL,
             env={"PATH": self.start, "HOME": self.tmp},
         )
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -228,6 +230,28 @@ class DeployTest(EnvTestBase):
         self.assertEqual(section["vars"], {"EDITOR": "nvim"})
         self.assertEqual(section["path"], ["/opt/bin"])
         self.assertEqual(self.diff(raw), [])
+
+    def test_respelled_dir_keeps_files_and_single_entries(self):
+        from tools import fsutil
+
+        real = os.path.dirname(self.dir)
+        os.makedirs(self.dir)
+        alias = os.path.join(self.tmp, "alias")
+        os.symlink(real, alias)
+        spellings = [os.path.join(alias, "env")]
+        if fsutil._case_insensitive(real):
+            spellings.append(os.path.join(real, "ENV"))
+        for spelling in spellings:
+            self.state = {}
+            self.assertTrue(self.deploy(self.raw(vars={"A": "1"})))
+            raw = {"dir": spelling, "vars": {"A": "1"}}
+            self.assertEqual(self.diff(raw), [], spelling)
+            self.assertTrue(self.deploy(raw))
+            self.assertEqual(self.read("sh").count("export A="), 1, spelling)
+            self.assertEqual(
+                sorted(self.state["env"]["files"]),
+                sorted(os.path.join(spelling, f"env.{s}") for s in env.SHELLS),
+            )
 
     def test_changed_and_removed_vars(self):
         self.deploy(self.raw(vars={"EDITOR": "vi", "OLD": "x"}))

@@ -78,6 +78,16 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
     for dest_path in to_remove:
         expanded_path = os.path.expanduser(dest_path)
         if os.path.exists(expanded_path):
+            # git -C on a dir that lost its .git interrogates the enclosing
+            # repo, which can read clean (e.g. a `**` .gitignore).
+            if not is_checkout(expanded_path):
+                log(
+                    f"Releasing {dest_path}: no longer a git checkout, left in place.",
+                    Color.YELLOW,
+                )
+                installed.discard(dest_path)
+                state_changed = True
+                continue
             if _has_local_work(git_bin, expanded_path, env):
                 log(
                     f"Keeping {dest_path}: uncommitted or unpushed work. "
