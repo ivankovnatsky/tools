@@ -614,8 +614,8 @@ def install_fetch(
 # --------------------------------------------------------------------------
 
 
-def diff_fetch(raw, state: Dict, conflicts=None) -> List[str]:
-    p = plan(raw, state.get("fetch", {}).get("installed", {}) or {}, conflicts)
+def diff_fetch(raw, state: Dict, conflicts=None, update: bool = False) -> List[str]:
+    p = plan(raw, state.get("fetch", {}).get("installed", {}) or {}, conflicts, update)
     rows = [f"  ! {err}" for err in p.errors]
     for ch in p.changes:
         e = ch.entry

@@ -754,12 +754,14 @@ class BrewDiffTest(unittest.TestCase):
         self.assertEqual(rows["cleanup"], ["    ? cleanup deferred until tapped: u/t"])
         self.assertNotIn("brews", rows)
 
-    def test_deferred_cleanup_still_lists_owned_removals(self):
+    def test_deferred_cleanup_still_lists_owned_removals_and_autoremove(self):
         fake = FakeBrew(formulae={"old": {}})
         rows = self._diff(
             {"taps": ["u/t"], "onActivation": {"cleanup": "zap"}}, _state(brews=["old"]), fake
         )
-        self.assertEqual(rows["brews"], ["    - remove old"])
+        self.assertEqual(
+            rows["brews"], ["    - remove old", "    - autoremove dependencies nothing else needs"]
+        )
 
     def test_errors_are_shown(self):
         rows = self._diff({"onActivation": {"cleanup": "all"}}, {}, FakeBrew())

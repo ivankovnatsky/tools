@@ -186,11 +186,13 @@ def _system_scope(scope: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(s for s in (scope or privilege.ROOT_SECTIONS) if s in privilege.ROOT_SECTIONS)
 
 
-def _user_diff(config_paths: list[str], scope: tuple[str, ...], only=None) -> int:
+def _user_diff(
+    config_paths: list[str], scope: tuple[str, ...], only=None, update: bool = False
+) -> int:
     """`tools diff` as the user: 0 when clean, USER_CHANGES when changes are pending."""
     merged = _load_merged_config(config_paths)
     _check_only(merged, config_paths, only)
-    clean = show_diff(merged, _resolve_config_dir(config_paths), scope, only=only)
+    clean = show_diff(merged, _resolve_config_dir(config_paths), scope, only=only, update=update)
     return 0 if clean else USER_CHANGES
 
 
@@ -261,7 +263,9 @@ def _read_restarts(fd: int, out: list, daemons: list | None = None) -> None:
         daemons += labels
 
 
-def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple, only=None) -> bool:
+def _sudo_diff(
+    inv: privilege.Invoker, config_paths: list[str], scope: tuple, only=None, update: bool = False
+) -> bool:
     """Both diffs under sudo: system sections as root, the rest in a child dropped to the
     user. True when there are changes; exits when the user diff fails."""
     pin_hostname()
@@ -275,7 +279,7 @@ def _sudo_diff(inv: privilege.Invoker, config_paths: list[str], scope: tuple, on
             merged, _resolve_config_dir(config_paths), system, root=True, only=only
         )
     log(f"As {inv.login}:", Color.BLUE)
-    rc = privilege.run_as_user(inv, lambda: _user_diff(config_paths, scope, only))
+    rc = privilege.run_as_user(inv, lambda: _user_diff(config_paths, scope, only, update))
     if rc not in (0, USER_CHANGES):
         log(f"Diff as {inv.login} failed; nothing deployed", Color.RED)
         sys.exit(1)
@@ -291,10 +295,11 @@ def _sudo_deploy(
     only=None,
 ) -> None:
     """User sections in a child dropped to the user, then system sections as root
-    (daemons and host settings run what the user phase installs), then `mgmt` in
-    another user child (its services may be daemons root just started). One prompt
-    covers all; a failed phase stops the ones after it. Process restarts from every
-    phase run once, at the end."""
+    (daemons and host settings run what the user phase installs), then `launchd` and
+    `mgmt` in another user child (agents' restartOn may name system files root just
+    wrote; mgmt services may be daemons root just started). One prompt covers all; a
+    failed phase stops the ones after it. Process restarts from every phase run once,
+    at the end."""
     pin_hostname()
     if only:
         # Both phases' --only checks before either runs anything.
@@ -302,31 +307,36 @@ def _sudo_deploy(
         if privilege.run_as_user(inv, lambda: _user_check(config_paths, only)) != 0:
             log(f"--only check as {inv.login} failed; nothing deployed", Color.RED)
             sys.exit(1)
-    if not approve and _sudo_diff(inv, config_paths, scope, only):
+    if not approve and _sudo_diff(inv, config_paths, scope, only, update):
         _confirm()
     system = _system_scope(scope)
-    user, mgmt = scope, ()
-    if system and (not scope or "mgmt" in scope):
-        if mgmt_has_work(_load_merged_config(config_paths).get("mgmt")):
-            user = tuple(s for s in (scope or ALL_SECTIONS) if s != "mgmt")
-            mgmt = ("mgmt",)
+    user, late = scope, ()
+    if system:
+        late = tuple(
+            s
+            for s in (scope or ALL_SECTIONS)
+            if s == "launchd"
+            or (s == "mgmt" and mgmt_has_work(_load_merged_config(config_paths).get("mgmt")))
+        )
+        if late:
+            user = tuple(s for s in (scope or ALL_SECTIONS) if s not in late)
     restarts: list = []
     daemons: list = []
     try:
         if user or not scope:
             rc = _user_phase(inv, config_paths, user, update, only, restarts, daemons)
             if rc != 0:
-                if system or mgmt:
+                if system or late:
                     log(f"Deploy as {inv.login} failed; not running the later phases", Color.RED)
                 sys.exit(1)
         if system:
             merged = _load_merged_config(config_paths)
             config_dir = _resolve_config_dir(config_paths)
             if not _deploy(merged, config_dir, system, update, True, restarts, only, inv=inv):
-                if mgmt:
-                    log("System sections failed; not running mgmt", Color.RED)
+                if late:
+                    log(f"System sections failed; not running {', '.join(late)}", Color.RED)
                 sys.exit(1)
-        if mgmt and _user_phase(inv, config_paths, mgmt, update, only, restarts, daemons) != 0:
+        if late and _user_phase(inv, config_paths, late, update, only, restarts, daemons) != 0:
             sys.exit(1)
     finally:
         run_restarts(list(dict.fromkeys(restarts)))
@@ -458,12 +468,17 @@ def _deploy_locked(
         def save(records: dict) -> None:
             _save_as_user(inv, state_file, {**full, ROOT_KEY: records})
 
+        # restartUnits the user phase owes daemons live in the user's records.
+        owed = full
+
     else:
         migrate_state_file(state_file)
         state = migrate_state_schema(load_json(state_file))
 
         def save(records: dict) -> None:
             save_json(state_file, records)
+
+        owed = None
 
     active = set(scope) if scope else set(ALL_SECTIONS)
 
@@ -493,6 +508,7 @@ def _deploy_locked(
                     active,
                     persist,
                     restarts,
+                    owed,
                 )
             else:
                 success = _run_sections(
@@ -560,9 +576,11 @@ def _run_root_sections(
     active: set,
     persist=lambda: None,
     deferred: list | None = None,
+    owed: dict | None = None,
 ) -> bool:
     """Under sudo: system files, launchd daemons, system-scope defaults and settingsctl host
-    settings; nothing in user space."""
+    settings; nothing in user space. ``owed`` is the user's state: daemons it owes a
+    restartUnits restart are restarted here, once, and settled there."""
     success = True
     # Before daemons, whose restartOn may name these files.
     if "files" in active and files_has_system_work(config.get("files"), state):
@@ -573,11 +591,17 @@ def _run_root_sections(
     if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
         success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
+        # A daemon created, updated or retried here starts fresh: no second restart later.
+        done: set = set()
         success &= install_launchd(
             config.get("launchd"),
             state,
             **sops_section.secrets_dir_kwargs(config.get("sops")),
+            units=secrets_flow.pending_restarts(owed) if owed is not None else {},
+            done=done,
         )
+        if owed is not None:
+            secrets_flow.settle_restarts(owed, done)
     restarts: list = []
     try:
         if "defaults" in active and defaults_has_work(config.get("defaults"), state):
@@ -918,11 +942,11 @@ def deploy(config, scope, only, approve, update):
     _check_only(merged, config_paths, only)
     config_dir = _resolve_config_dir(config_paths)
 
-    if not approve and not show_diff(merged, config_dir, scope, only=only):
+    if not approve and not show_diff(merged, config_dir, scope, only=only, update=update):
         _confirm()
 
-    # Deploy runs even when the preview was clean: --update upgrades and
-    # state housekeeping have no diff line of their own.
+    # Deploy runs even when the preview was clean: state housekeeping has no
+    # diff line of its own.
     if not _deploy(merged, config_dir, scope, update, only=only):
         sys.exit(1)
 

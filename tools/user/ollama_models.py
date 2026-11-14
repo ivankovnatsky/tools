@@ -83,7 +83,7 @@ def _tracked_for_context(config: Dict, state: Dict) -> List[str]:
     return [_canonical(m) for m in section.get("installed", [])]
 
 
-def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
+def diff_ollama_models(config: Dict, state: Dict, update: bool = False) -> List[str]:
     """Return human-readable changes the reconciler would apply."""
     desired_models = [_canonical(m) for m in (config.get("models", []) or [])]
     tracked = _tracked_for_context(config, state)
@@ -104,6 +104,9 @@ def diff_ollama_models(config: Dict, state: Dict) -> List[str]:
     managed = set(tracked)
     for model in sorted(desired - installed):
         changes.append(f"  + pull {model}")
+    if update:
+        for model in sorted(desired & managed & installed):
+            changes.append(f"  ~ pull {model} (--update)")
 
     for model in sorted((managed & installed) - desired):
         changes.append(f"  - remove {model}")

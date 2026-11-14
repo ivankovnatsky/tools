@@ -731,12 +731,14 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
                 ("drop", 501),
                 ("install_brew_packages", 501),
                 ("install_brew_packages", 501),
-                ("install_launchd", 501),
                 ("install_defaults", 501),
                 ("install_dock", 501),
                 ("install_launchd", 0),
                 ("install_defaults", 0),
                 ("drop", 501),
+                # Agents after root's system files, which their restartOn may name.
+                ("drop", 501),
+                ("install_launchd", 501),
             ],
         )
         self.assertEqual(
@@ -760,7 +762,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def test_one_prompt_covers_both_diffs(self):
         seen = []
 
-        def show_diff(_cfg, _dir, scope, root=False, only=None):
+        def show_diff(_cfg, _dir, scope, root=False, only=None, update=False):
             seen.append((root, os.geteuid(), tuple(scope)))
             return False
 
@@ -770,9 +772,60 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.prompted.assert_called_once()
         self.assertIn(("install_brew_packages", 501), self.events)
 
+    def test_update_reaches_both_previews(self):
+        seen = []
+
+        def show_diff(_cfg, _dir, _scope, root=False, only=None, update=False):
+            seen.append((root, update))
+            return True
+
+        result = self.run_cli(["deploy", "--update"], show_diff=show_diff)
+        self.assertEqual(result.exit_code, 0, result.output)
+        # Root sections have no --update work; the user preview must show it.
+        self.assertEqual(seen[-1], (False, True))
+
+    def test_agents_run_after_root_writes_system_files(self):
+        result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        steps = self.steps()
+        self.assertLess(steps.index(("install_launchd", 0)), steps.index(("install_launchd", 501)))
+
+    def test_owed_daemon_restart_runs_once_in_the_root_phase(self):
+        save_json(
+            self.user_state,
+            {"version": 2, "restartUnits": {"launchd:d": {"sources": ["t"], "seq": 1}}},
+        )
+        seen = []
+        step = self.step
+
+        def recording(name):
+            run = step(name)
+
+            def wrapped(raw, st, *a, **k):
+                if name == "install_launchd" and os.geteuid() == 0:
+                    seen.append(k["units"])
+                    k["done"].add("d")  # created or updated: started fresh
+                elif name == "install_launchd" and k.get("daemons") is not None:
+                    k["daemons"].append("d")  # the user phase queues what is still owed
+                return run(raw, st, *a, **k)
+
+            return wrapped
+
+        with (
+            mock.patch.object(self, "step", side_effect=recording),
+            mock.patch.object(cli, "restart_daemons") as restart,
+        ):
+            result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(seen, [{"d": ["t"]}])
+        restart.assert_not_called()
+        self.assertNotIn("restartUnits", cli.load_json(self.user_state))
+
     def test_only_user_changes_still_prompt_and_no_means_nothing_runs(self):
         result = self.run_cli(
-            ["deploy"], prompt="no", show_diff=lambda _c, _d, _s, root=False, only=None: root
+            ["deploy"],
+            prompt="no",
+            show_diff=lambda _c, _d, _s, root=False, only=None, update=False: root,
         )
         self.assertEqual(result.exit_code, 1, result.output)
         self.prompted.assert_called_once()
@@ -797,7 +850,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             self.steps(),
-            [("drop", 501), ("install_launchd", 501), ("install_launchd", 0), ("drop", 501)],
+            [("install_launchd", 0), ("drop", 501), ("drop", 501), ("install_launchd", 501)],
         )
 
     def test_only_narrows_both_phases(self):
@@ -825,8 +878,8 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
             [
                 ("install_brew_packages", 501),
                 ("install_brew_packages", 501),
-                ("install_launchd", 501),
                 ("install_launchd", 0),
+                ("install_launchd", 501),
             ],
         )
         for name, _uid, raw in seen:
@@ -866,8 +919,14 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         steps = self.steps()
         self.assertEqual(
             # The first drop saves root's records into the user's state.
-            steps[-4:],
-            [("install_defaults", 0), ("drop", 501), ("drop", 501), ("install_mgmt", 501)],
+            steps[-5:],
+            [
+                ("install_defaults", 0),
+                ("drop", 501),
+                ("drop", 501),
+                ("install_launchd", 501),
+                ("install_mgmt", 501),
+            ],
         )
         self.assertEqual(steps.count(("install_mgmt", 501)), 1)
 
@@ -880,7 +939,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.results[("install_launchd", 0)] = False
         result = self.run_with_mgmt(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("System sections failed; not running mgmt", result.output)
+        self.assertIn("System sections failed; not running launchd, mgmt", result.output)
         self.assertNotIn(("install_mgmt", 501), self.events)
 
     def test_failed_user_phase_stops_before_the_system_phase(self):
@@ -964,7 +1023,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(self.events[-1], ("restart", []))
 
     def test_failed_user_diff_deploys_nothing(self):
-        def show_diff(_c, _d, _s, root=False, only=None):
+        def show_diff(_c, _d, _s, root=False, only=None, update=False):
             if not root:
                 raise SystemExit(1)
             return False
@@ -978,7 +1037,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
     def test_diff_runs_both_phases(self):
         seen = []
 
-        def show_diff(_cfg, _dir, scope, root=False, only=None):
+        def show_diff(_cfg, _dir, scope, root=False, only=None, update=False):
             seen.append((root, os.geteuid()))
             return not root
 

@@ -53,7 +53,10 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
     if not repos and not installed:
         return True
     desired = set(repos.keys())
-    to_install = desired - installed
+    # A tracked checkout deleted by hand is cloned again.
+    to_install = {
+        d for d in desired if d not in installed or not os.path.exists(os.path.expanduser(d))
+    }
     to_remove = installed - desired
     to_update = (
         {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}

@@ -108,7 +108,7 @@ def _remotes_in_use(flatpak: str) -> Set[str]:
     return {line.strip() for line in stdout.splitlines() if line.strip()}
 
 
-def diff_flatpak(config: Dict, state: Dict) -> List[str]:
+def diff_flatpak(config: Dict, state: Dict, update: bool = False) -> List[str]:
     """Return human-readable changes the reconciler would apply."""
     desired_remotes = config.get("remotes", {}) or {}
     desired_apps, errors = _desired_packages(config)
@@ -135,15 +135,22 @@ def diff_flatpak(config: Dict, state: Dict) -> List[str]:
         changes.append(f"  + remote-add {name}")
 
     live_urls = _remote_urls(flatpak)
+    mismatched = set()
     for name in sorted(set(desired_remotes) & remotes):
         live = live_urls.get(name)
         if live and not _urls_match(desired_remotes[name], live):
             changes.append(f"  ! remote {name} points at {live}, config declares its own URL")
+            mismatched.add(name)
 
     for app in sorted(set(desired_apps) - installed):
         changes.append(f"  + install {app}")
 
     managed_apps = set(tracked.get("packages", []))
+    if update:
+        for app in sorted(managed_apps & installed & set(desired_apps)):
+            remote = desired_apps[app]
+            if not (mismatched and (not remote or remote in mismatched)):
+                changes.append(f"  ~ update {app}")
     managed_remotes = set(tracked.get("remotes", []))
 
     for app in sorted((managed_apps & installed) - set(desired_apps)):

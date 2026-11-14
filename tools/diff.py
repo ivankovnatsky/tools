@@ -2,7 +2,8 @@
 
 import os
 import stat
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from tools import privilege, selection
 from tools.config import SECTIONS
@@ -15,6 +16,7 @@ from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
 from tools.user.brew import diff_brew
+from tools.user.cargo import CrateRecordError, _crate_name, _resolve_cargo_bin
 from tools.user.curl_shell import diff_curl_shell
 from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
@@ -27,6 +29,7 @@ from tools.user.fetch import has_work as fetch_has_work
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.git_repos import is_checkout
+from tools.user.go import _installed_path as _go_installed_path
 from tools.user.go import _resolve_go_bin
 from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
@@ -45,8 +48,12 @@ from tools.user.users import has_work as users_has_work
 from tools.util import (
     SKIPPED_ROW,
     format_diff_bytes,
+    get_pkg_post_install,
     get_pkg_source,
+    get_pkg_subpackages,
     looks_like_secret,
+    pkg_install_spec,
+    pkg_unpinned,
     skipped_row,
     version_changed,
 )
@@ -76,21 +83,65 @@ def _notify_rows(pkg_info) -> List[str]:
     return [f"    notify: {u}" for u in units if isinstance(u, str)]
 
 
-def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
-    changes = []
+def _bad_packages(section: str, packages) -> List[str]:
+    """Error rows for package entries that are not mappings; deploy fails the section."""
+    if not isinstance(packages, dict):
+        return []
+    return [
+        f"  ! {section}.packages.{name}: must be a mapping"
+        for name, info in packages.items()
+        if not isinstance(info, dict)
+    ]
+
+
+def _units_error(section: str, pkg: str, pkg_info) -> Optional[str]:
+    """Why deploy skips (re)installing ``pkg``: its restartUnits do not parse."""
+    try:
+        secrets_flow.parse_restart_units(pkg_info.get("restartUnits"), f"{section}.packages.{pkg}")
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def _released(key: str, old, new, tracked, desired) -> List[str]:
+    """Rows for a changed install location: deploy forgets what it tracked there."""
+    rows = [f"  ~ {key} changed ({old} -> {new}); releasing tracked packages"]
+    rows += [f"  ~ forget {pkg} (left in the old location)" for pkg in sorted(tracked - desired)]
+    return rows
+
+
+def _diff_js(section: str, packages: Dict, state: Dict, prefix_key: str, paths: Dict):
+    """bun/npm removal rows and the tracked names deploy still acts on."""
+    changes: List[str] = []
     desired = set(packages.keys())
-    state_packages = set(state.get("bun", {}).get("packages", {}).keys())
+    state_packages = set(state.get(section, {}).get("packages", {}).keys())
+    old = state.get(section, {}).get("prefix", paths.get(prefix_key))
+    if old != paths.get(prefix_key):
+        if state_packages:
+            changes += _released(
+                f"{section} prefix", old, paths.get(prefix_key), state_packages, desired
+            )
+        state_packages = set()
 
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - remove {pkg}")
+    return changes, state_packages
+
+
+def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update: bool = False):
+    changes, state_packages = _diff_js("bun", packages, state, "bunBin", paths)
 
     for pkg, pkg_info in packages.items():
+        row = None
         if pkg not in state_packages:
-            changes.append(f"  + install {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  + install {pkg}"
         elif version_changed(pkg, pkg_info, state, "bun"):
-            changes.append(f"  ~ update {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ update {pkg}"
+        elif update and pkg_unpinned(pkg_info):
+            row = f"  ~ upgrade {pkg}"
+        if row:
+            err = _units_error("bun", pkg, pkg_info)
+            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
 
     bunfig_content = bun_config.get("configFile")
     if bunfig_content and not state.get("bun", {}).get("bunfig_created"):
@@ -100,45 +151,95 @@ def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     return changes
 
 
-def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
-    changes = []
-    desired = set(packages.keys())
-    state_packages = set(state.get("npm", {}).get("packages", {}).keys())
+def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False):
+    changes: List[str] = []
+    npmrc_content = npm_config.get("configFile")
+    if npmrc_content and not state.get("npm", {}).get("npmrc_created"):
+        if not os.path.exists(os.path.expanduser("~/.npmrc")):
+            changes.append("  + create ~/.npmrc")
 
-    for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
+    rows, state_packages = _diff_js("npm", packages, state, "npmBin", paths)
+    changes += rows
+    stored = state.get("npm", {}).get("packages", {}) if state_packages else {}
 
+    npm_bin = paths.get("npmBin")
+    npm_lib = Path(npm_bin).parent / "lib" / "node_modules" if npm_bin else None
     for pkg, pkg_info in packages.items():
+        row = None
         if pkg not in state_packages:
-            changes.append(f"  + install {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  + install {pkg}"
         elif version_changed(pkg, pkg_info, state, "npm"):
-            changes.append(f"  ~ update {pkg}")
-            changes += _notify_rows(pkg_info)
-        elif paths.get("npmBin") and binary_missing(pkg_info, paths["npmBin"]):
-            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ update {pkg}"
+        elif npm_bin and binary_missing(pkg_info, npm_bin):
+            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
+        elif update and pkg_unpinned(pkg_info):
+            row = f"  ~ upgrade {pkg}"
+        installing = False
+        if row:
+            err = _units_error("npm", pkg, pkg_info)
+            installing = not err
+            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
+        if npm_lib is None:
+            continue
+        pkg_dir = npm_lib / pkg
+        present = installing or pkg_dir.exists()
+        entry = stored.get(pkg) if isinstance(stored.get(pkg), dict) else {}
+        post_install = get_pkg_post_install(pkg_info)
+        rerun = installing or post_install != entry.get("postInstall", "")
+        if post_install and present and rerun:
+            changes.append(f"  ~ run postInstall for {pkg}: {post_install}")
+        subpkgs = get_pkg_subpackages(pkg_info)
+        if not subpkgs or not present:
+            continue
+        stored_subs = entry.get("subpackages", {})
+        if not isinstance(stored_subs, dict):
+            stored_subs = {}
+        specs = []
+        for sp_name, sp_info in subpkgs.items():
+            sp_version = sp_info.get("version", "latest")
+            sp_stored = stored_subs.get(sp_name)
+            stored_version = (
+                sp_stored.get("version", "latest") if isinstance(sp_stored, dict) else None
+            )
+            if (
+                installing
+                or not (pkg_dir / "node_modules" / sp_name).exists()
+                or sp_version != stored_version
+            ):
+                specs.append(pkg_install_spec(sp_name, sp_version))
+        if specs:
+            changes.append(f"  + install subpackages for {pkg}: {', '.join(specs)}")
 
     return changes
 
 
-def _diff_uv(packages: Dict, paths: Dict, state: Dict):
+def _diff_uv(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     changes = []
     desired = set(packages.keys())
     state_packages = set(state.get("uv", {}).get("packages", {}).keys())
+    if paths.get("uvBin") and paths.get("uvToolDir"):
+        context = f"{paths['uvBin']}|{paths['uvToolDir']}"
+        old = state.get("uv", {}).get("context", context)
+        if old != context:
+            if state_packages:
+                changes += _released("uv tool dir", old, context, state_packages, desired)
+            state_packages = set()
 
     for pkg, pkg_info in packages.items():
+        row = None
         if pkg not in state_packages:
             source = get_pkg_source(pkg_info)
             spec = source if source else pkg
-            changes.append(f"  + install {spec}")
-            changes += _notify_rows(pkg_info)
+            row = f"  + install {spec}"
         elif version_changed(pkg, pkg_info, state, "uv"):
-            changes.append(f"  ~ update {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ update {pkg}"
         elif paths.get("uvBin") and binary_missing(pkg_info, paths["uvBin"]):
-            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
+        elif update and pkg_unpinned(pkg_info):
+            row = f"  ~ upgrade {pkg}"
+        if row:
+            err = _units_error("uv", pkg, pkg_info)
+            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - remove {pkg}")
@@ -146,52 +247,102 @@ def _diff_uv(packages: Dict, paths: Dict, state: Dict):
     return changes
 
 
-def _diff_go(packages: Dict, paths: Dict, state: Dict):
+def _diff_go(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     changes = []
     desired = set(packages.keys())
-    state_packages = set(state.get("go", {}).get("packages", {}).keys())
+    state_pkgs = state.get("go", {}).get("packages", {})
+    state_packages = set(state_pkgs.keys())
+    context = f"{paths.get('goBin') or ''}|{paths.get('goPath') or ''}"
+    context_changed = state.get("go", {}).get("context", context) != context
     go_bin = None
     if any(pkg_info.get("binary") for pkg_info in packages.values()):
         go_bin = _resolve_go_bin(paths)
 
     for pkg, pkg_info in packages.items():
+        row = None
         if pkg not in state_packages:
             source = get_pkg_source(pkg_info) or pkg
-            changes.append(f"  + install {source}")
-            changes += _notify_rows(pkg_info)
+            row = f"  + install {source}"
+        elif context_changed:
+            row = f"  ~ reinstall {pkg} (go install dir changed)"
         elif version_changed(pkg, pkg_info, state, "go"):
-            changes.append(f"  ~ update {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ update {pkg}"
         elif (
             go_bin
             and pkg_info.get("binary")
             and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
         ):
-            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
+        elif update and pkg_unpinned(pkg_info):
+            row = f"  ~ upgrade {pkg}"
+        if row:
+            err = _units_error("go", pkg, pkg_info)
+            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
 
+    # Same rules as install_go_packages: without a known path, or while another
+    # package still uses the binary, the entry is only forgotten.
+    legacy_bin = None
+    if not context_changed and (paths.get("goBin") or paths.get("goPath")):
+        legacy_bin = _resolve_go_bin(paths)
+    kept_paths = {
+        _go_installed_path(pkg, entry, legacy_bin)
+        for pkg, entry in state_pkgs.items()
+        if pkg in desired and isinstance(entry, dict)
+    }
     for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
+        entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+        path = _go_installed_path(pkg, entry, legacy_bin)
+        if path and path in kept_paths:
+            changes.append(f"  ~ forget {pkg} (binary {path} still in use)")
+        elif not path:
+            changes.append(f"  ~ forget {pkg} (install path unknown, binary not removed)")
+        else:
+            changes.append(f"  - remove {pkg}")
 
     return changes
 
 
-def _diff_cargo(packages: Dict, paths: Dict, state: Dict):
+def _diff_cargo(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     changes = []
     desired = set(packages.keys())
-    state_packages = set(state.get("cargo", {}).get("packages", {}).keys())
+    state_pkgs = state.get("cargo", {}).get("packages", {})
+    state_packages = set(state_pkgs.keys())
+    context = f"{paths.get('cargoRoot') or ''}|{paths.get('cargoHome') or ''}"
+    root = os.path.dirname(_resolve_cargo_bin(paths))
+    context_changed = (
+        state.get("cargo", {}).get("context", context) != context
+        or state.get("cargo", {}).get("root", root) != root
+    )
 
     for pkg, pkg_info in packages.items():
+        row = None
         if pkg not in state_packages:
             source = get_pkg_source(pkg_info) or pkg
-            changes.append(f"  + install {source}")
-            changes += _notify_rows(pkg_info)
+            row = f"  + install {source}"
+        elif context_changed:
+            row = f"  ~ reinstall {pkg} (cargo install dir changed)"
         elif version_changed(pkg, pkg_info, state, "cargo"):
-            changes.append(f"  ~ update {pkg}")
-            changes += _notify_rows(pkg_info)
+            row = f"  ~ update {pkg}"
+        elif update and pkg_unpinned(pkg_info):
+            row = f"  ~ upgrade {pkg}"
+        if row:
+            err = _units_error("cargo", pkg, pkg_info)
+            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
+        if context_changed:
+            changes.append(f"  ~ forget {pkg} (cargo install dir changed; binary left behind)")
+            continue
+        entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+        try:
+            name = _crate_name(pkg, entry, paths, (state_packages | desired) - {pkg})
+        except CrateRecordError as e:
+            changes.append(f"  ! cannot remove {pkg}: {e}")
+            continue
+        if not name:
+            changes.append(f"  ~ forget {pkg} (not in cargo's install record)")
+        else:
+            changes.append(f"  - remove {pkg}")
 
     return changes
 
@@ -254,11 +405,9 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     return changes
 
 
-def _diff_git_repos(git_repos: Dict, state: Dict):
+def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
     changes = []
     installed = set(state.get("gitRepos", {}).get("installed", []))
-    # Pulls of already-tracked checkouts only run on `deploy --update`, so
-    # they are not pending changes.
     for dest, _url in git_repos.items():
         expanded = os.path.expanduser(dest)
         if not os.path.exists(expanded):
@@ -267,11 +416,17 @@ def _diff_git_repos(git_repos: Dict, state: Dict):
             changes.append(f"  ! not a git repo: {dest} (deploy skips it)")
         elif dest not in installed:
             changes.append(f"  + track {dest}")
+        elif update:
+            changes.append(f"  ~ pull {dest}")
     # Removal is an rmtree of the whole checkout, so it must never reach the
     # user as a surprise — this is the one section where a missing preview
     # line costs data rather than a confusing diff.
     for dest in sorted(installed - set(git_repos)):
-        changes.append(f"  - remove {dest} (deletes the checkout)")
+        expanded = os.path.expanduser(dest)
+        if os.path.exists(expanded) and not is_checkout(expanded):
+            changes.append(f"  ~ release {dest} (not a git checkout, left in place)")
+        else:
+            changes.append(f"  - remove {dest} (deletes the checkout)")
     return changes
 
 
@@ -281,6 +436,7 @@ def _diff_files(
     state: Dict,
     conflicts=None,
     system: bool = False,
+    update: bool = False,
 ):
     """Dry-run for the unified `files:` section.
 
@@ -320,16 +476,22 @@ def _diff_files(
     state_files = respell(dict(state.get("files", {}) or {}), declared)
 
     managed_targets = set()
+    on_update: Dict[str, None] = {}
+    held_updates = set()
     for e in _ordered(resolved):
         target, source, desired_mode, secrets = e.target, e.source, e.mode, e.secrets
         managed_targets.add(target)
         reason = _conflict(target, conflicts) or (root_target_error(target) if system else None)
         if reason:
             changes.append(f"  ! refusing {target}: {reason}")
+            if e.on_update:
+                held_updates.add(e.on_update)
             continue
         if e.skip:
             changes.append(skipped_row(target))
             continue
+        if update and e.on_update and not errors:
+            on_update[e.on_update] = None
         before = len(changes)
 
         if e.directory:
@@ -436,6 +598,7 @@ def _diff_files(
         changes.append(f"  ~ run onChange: {command}")
         if command in retried:
             changes += _retried_notify_rows(entries, command)
+    changes += [f"  ~ run onUpdate: {c}" for c in on_update if c not in held_updates]
     return changes
 
 
@@ -467,12 +630,14 @@ def show_diff(
     scope: tuple[str, ...] = (),
     root: bool = False,
     only: "selection.Only | None" = None,
+    update: bool = False,
 ) -> bool:
     """Show what deploy would change. Returns True if no changes needed.
 
     As root (``root``) only system sections are diffed, against root's records in the user's
     state file.
     With ``only``, narrowed sections are diffed exactly as deploy narrows them.
+    With ``update``, also what `deploy --update` upgrades, pulls, refetches and reruns.
     """
     from tools.state import (
         find_state_file,
@@ -521,8 +686,8 @@ def show_diff(
         bun_config = config.get("bun", {})
         bun_packages = bun_config.get("packages", {})
         if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
-            changes = _diff_bun(
-                bun_packages, paths, state, {"configFile": bun_config.get("configFile")}
+            changes = _bad_packages("bun", bun_packages) or _diff_bun(
+                bun_packages, paths, state, {"configFile": bun_config.get("configFile")}, update
             )
             if changes:
                 sections.append(("bun", changes))
@@ -531,35 +696,45 @@ def show_diff(
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
         if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
-            changes = _diff_npm(
-                npm_packages, paths, state, {"configFile": npm_config.get("configFile")}
+            changes = _bad_packages("npm", npm_packages) or _diff_npm(
+                npm_packages, paths, state, {"configFile": npm_config.get("configFile")}, update
             )
             if changes:
                 sections.append(("npm", changes))
 
     if "uv" in active:
         if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
-            changes = _diff_uv(config.get("uv", {}).get("packages", {}), paths, state)
+            uv_packages = config.get("uv", {}).get("packages", {})
+            changes = _bad_packages("uv", uv_packages) or _diff_uv(
+                uv_packages, paths, state, update
+            )
             if changes:
                 sections.append(("uv", changes))
 
     if "go" in active:
         go_state = state.get("go", {})
         if config.get("go", {}).get("packages") or go_state.get("packages"):
-            changes = _diff_go(config.get("go", {}).get("packages", {}), paths, state)
+            go_packages = config.get("go", {}).get("packages", {})
+            changes = _bad_packages("go", go_packages) or _diff_go(
+                go_packages, paths, state, update
+            )
             if changes:
                 sections.append(("go", changes))
 
     if "cargo" in active:
         cargo_state = state.get("cargo", {})
         if config.get("cargo", {}).get("packages") or cargo_state.get("packages"):
-            changes = _diff_cargo(config.get("cargo", {}).get("packages", {}), paths, state)
+            cargo_packages = config.get("cargo", {}).get("packages", {})
+            changes = _bad_packages("cargo", cargo_packages) or _diff_cargo(
+                cargo_packages, paths, state, update
+            )
             if changes:
                 sections.append(("cargo", changes))
 
     if "pi" in active:
         if config.get("pi", {}).get("packages") or state.get("pi", {}).get("packages"):
-            changes = _diff_pi(config.get("pi", {}).get("packages", {}), paths, state)
+            pi_packages = config.get("pi", {}).get("packages", {})
+            changes = _bad_packages("pi", pi_packages) or _diff_pi(pi_packages, paths, state)
             if changes:
                 sections.append(("pi", changes))
 
@@ -649,7 +824,7 @@ def show_diff(
     if "gitRepos" in active and (
         config.get("gitRepos") or state.get("gitRepos", {}).get("installed")
     ):
-        changes = _diff_git_repos(config.get("gitRepos") or {}, state)
+        changes = _diff_git_repos(config.get("gitRepos") or {}, state, update)
         if changes:
             sections.append(("gitRepos", changes))
 
@@ -657,12 +832,14 @@ def show_diff(
         secrets(secrets_flow.LATE, " (after gitRepos)")
 
     if "files" in active:
-        changes = _diff_files(config.get("files", []) or [], config_dir, state, conflicts)
+        changes = _diff_files(
+            config.get("files", []) or [], config_dir, state, conflicts, update=update
+        )
         if changes:
             sections.append(("files", changes))
 
     if "fetch" in active and fetch_has_work(config.get("fetch"), state):
-        changes = diff_fetch(config.get("fetch"), state, conflicts)
+        changes = diff_fetch(config.get("fetch"), state, conflicts, update)
         if changes:
             sections.append(("fetch", changes))
 
@@ -672,7 +849,7 @@ def show_diff(
             sections.append(("env", changes))
 
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
-        changes = diff_skills(config.get("skills") or {}, config_dir, state)
+        changes = diff_skills(config.get("skills") or {}, config_dir, state, update)
         if changes:
             sections.append(("skills", changes))
 
@@ -682,17 +859,17 @@ def show_diff(
             sections.append(("links", changes))
 
     if "brew" in active:
-        brew_subsections = diff_brew(config.get("brew"), state)
+        brew_subsections = diff_brew(config.get("brew"), state, update)
         if brew_subsections:
             sections.append(("brew", brew_subsections))
 
     if "ollamaModels" in active:
-        changes = diff_ollama_models(config.get("ollamaModels", {}) or {}, state)
+        changes = diff_ollama_models(config.get("ollamaModels", {}) or {}, state, update)
         if changes:
             sections.append(("ollamaModels", changes))
 
     if "flatpak" in active:
-        changes = diff_flatpak(config.get("flatpak", {}) or {}, state)
+        changes = diff_flatpak(config.get("flatpak", {}) or {}, state, update)
         if changes:
             sections.append(("flatpak", changes))
 

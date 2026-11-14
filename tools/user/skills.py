@@ -842,7 +842,9 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
 # --------------------------------------------------------------------------
 
 
-def diff_skills(skills_config: Dict, config_dir: str, state: Dict) -> List[str]:
+def diff_skills(
+    skills_config: Dict, config_dir: str, state: Dict, update: bool = False
+) -> List[str]:
     skills_config = skills_config or {}
     changes: List[str] = []
     cached = state.get("skills", {}).get("sources", {}) or {}
@@ -853,8 +855,7 @@ def diff_skills(skills_config: Dict, config_dir: str, state: Dict) -> List[str]:
         else (_git_sources(skills_config))
     )
 
-    # Upstream commits on an unchanged url/ref are only fetched by
-    # `deploy --update`, so they are not pending changes.
+    # Upstream commits on an unchanged url/ref are only fetched by `deploy --update`.
     for name, source in sorted(git_sources.items()):
         path = os.path.join(cache_dir, name)
         if os.path.lexists(path) and not _is_checkout(path):
@@ -863,6 +864,8 @@ def diff_skills(skills_config: Dict, config_dir: str, state: Dict) -> List[str]:
             changes.append(f"  + fetch {name} ({source['url']})")
         elif cached.get(name) != _source_fingerprint(source):
             changes.append(f"  ~ refetch {name} (url, ref or subdir changed)")
+        elif update:
+            changes.append(f"  ~ refetch {name} (--update)")
 
     p = plan(skills_config, config_dir, state)
     changes += [f"  ! {err}" for err in p["errors"]]

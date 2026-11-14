@@ -910,7 +910,7 @@ def install_brew_packages(
     return success
 
 
-def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
+def diff_brew(brew_config, state: Dict, update: bool = False) -> List[Tuple[str, List[str]]]:
     """Dry-run rows for `tools diff`, as (subsection, rows) pairs."""
     if sys.platform != "darwin":
         return []
@@ -924,7 +924,9 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
         return [("errors", [f"    ! {refusal}"])]
     clean = _no_cleanup()
     notes = []
-    if spec.cleanup and (brew := _brew_bin()):
+    brew = _brew_bin()
+    cleanup_planned = False
+    if spec.cleanup and brew:
         live, err = query_installed(brew, _brew_env(brew, spec), spec)
         if err:
             notes.append(f"    ? cannot plan cleanup: {err}")
@@ -932,6 +934,18 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
             notes.append(f"    ? cleanup deferred until tapped: {', '.join(live['deferred'])}")
         else:
             clean = cleanup_targets(spec, prev, plan, live)
+            cleanup_planned = True
+    # Without brew, deploy installs it only when there is install or removal work.
+    bootstrap = []
+    if not brew and any(plan.values()):
+        bootstrap = ["    + install Homebrew (brew not found)"]
+    upgrade = {"brews": [], "casks": [], "mas": []}
+    if update and (brew or bootstrap):
+        upgrade["brews"] = sorted(set(prev.get("brews", [])) & spec.brews)
+        upgrade["casks"] = sorted(set(prev.get("casks", [])) & spec.casks)
+        if brew and _mas_bin_from_env(_brew_env(brew, spec, update)):
+            prev_ids = {str(i) for i in dict(prev.get("masApps", {})).values()}
+            upgrade["mas"] = sorted((n, i) for n, i in spec.mas.items() if str(i) in prev_ids)
 
     unowned = " (not installed by tools)"
     cask_verb = "zap" if spec.cleanup == "zap" else "remove"
@@ -949,6 +963,9 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
     brews += [f"    - remove {f}" for f in plan["brews_remove"]]
     brews += [f"    - remove {f}{unowned}" for f in clean["brews"]]
     brews += [f"    - remove {f} (dependency nothing else needs)" for f in clean["orphans"]]
+    if (plan["brews_remove"] or plan["casks_remove"]) and not cleanup_planned:
+        brews.append("    - autoremove dependencies nothing else needs")
+    brews += [f"    ~ upgrade {f}" for f in upgrade["brews"]]
     casks = [
         row
         for c in plan["casks_install"]
@@ -957,13 +974,16 @@ def diff_brew(brew_config, state: Dict) -> List[Tuple[str, List[str]]]:
     ]
     casks += [f"    - {cask_verb} {c}" for c in plan["casks_remove"]]
     casks += [f"    - {cask_verb} {c}{unowned}" for c in clean["casks"]]
+    casks += [f"    ~ upgrade {c}" for c in upgrade["casks"]]
     # Mac App Store apps are reconciled by deploy, so they have to appear here
     # too — otherwise a MAS-only difference short-circuits and its uninstalls
     # never show up in the approval preview.
     mas = [f"    + install {n} ({i})" for n, i in plan["mas_install"]]
     mas += [f"    - remove {n} ({i})" for n, i in plan["mas_remove"]]
+    mas += [f"    ~ upgrade {n} ({i})" for n, i in upgrade["mas"]]
 
     rows = (
+        ("homebrew", bootstrap),
         ("taps", taps),
         ("trust", trust),
         ("brews", brews),

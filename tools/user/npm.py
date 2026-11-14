@@ -139,7 +139,7 @@ def install_npm_packages(
     # 3. POST-INSTALL: Run postInstall commands for packages that need them
     # npm global prefix layout: <prefix>/lib/node_modules/<pkg>
     post_install_failed: set = set()
-    npm_lib = Path(paths["npmBin"]).parent / "lib" / "node_modules"
+    npm_lib = Path(paths.get("npmBin") or "").parent / "lib" / "node_modules"
     for pkg, pkg_info in packages.items():
         post_install = get_pkg_post_install(pkg_info)
         if not post_install:
