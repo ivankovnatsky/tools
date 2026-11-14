@@ -93,48 +93,92 @@ class McpOwnershipTest(unittest.TestCase):
         self.assertNotIn("manual", fake.installed)
         self.assertIn("other", fake.installed)
 
-    def _other_scope(self, listed: bool) -> FakeClaude:
-        """`manual` lives in another scope: removing it from the configured one fails,
-        and adding it again reports it exists."""
+    def _other_scope(self, listed: bool, remove_err=None) -> FakeClaude:
+        """`manual` lives in another scope: removing it from the configured one fails
+        (with the claude CLI's wording unless `remove_err`), and adding it again
+        reports it exists."""
         fake = FakeClaude(installed=["manual"] if listed else [])
 
         def run(cmd, env=None, cwd=None):
             verb = cmd[2] if len(cmd) > 2 else ""
-            if verb in ("remove", "add"):
+            if verb == "remove":
                 fake.commands.append(cmd)
-                err = "No user-scoped MCP server" if verb == "remove" else "already exists"
-                return 1, "", f"{err} named manual"
+                return 1, "", remove_err or 'No MCP server named "manual" in user scope'
+            if verb == "add":
+                fake.commands.append(cmd)
+                return 1, "", "MCP server manual already exists in local config"
             return FakeClaude.run(fake, cmd, env, cwd)
 
         fake.run = run
         return fake
 
-    def test_server_in_another_scope_is_left_alone_not_retried(self):
+    def test_server_in_another_scope_is_left_alone_while_listed(self):
+        fake = self._other_scope(listed=True)
+        state = {"mcp": {"servers": {}}}
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertNotIn("manual", state["mcp"]["servers"])
+        self.assertEqual(state["mcp"]["foreign"], {"manual": {"scope": "user", "listed": True}})
+        self.assertEqual([c for c in fake.commands if c[2] == "add"], [])
+
+        # Remembered: no more attempts, and the preview has nothing to apply.
+        fake.commands.clear()
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertEqual([c for c in fake.commands if c[2] != "list"], [])
+        rows = self._diff(_server("manual"), state, fake)
+        self.assertEqual(
+            rows, ["  = skip manual (registered outside tools, not in scope user; left alone)"]
+        )
+        self.assertTrue(diff_mod._print_sections([("mcp", rows)]))
+
+        # A different configured scope tries again.
+        other = {"manual": {**_server("manual")["manual"], "scope": "local"}}
+        self.assertEqual(len(self._diff(other, state, fake)), 1)
+        self.assertNotIn("= skip", self._diff(other, state, fake)[0])
+
+    def test_unlisted_server_in_another_scope_is_left_alone(self):
+        fake = self._other_scope(listed=False)
+        state = {"mcp": {"servers": {}}}
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertNotIn("manual", state["mcp"]["servers"])
+        self.assertEqual(len([c for c in fake.commands if c[2] == "add"]), 1)
+        self.assertEqual(state["mcp"]["foreign"], {"manual": {"scope": "user", "listed": False}})
+
+        # Not shown by `claude mcp list`, so it is remembered: no more attempts.
+        fake.commands.clear()
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertEqual([c for c in fake.commands if c[2] != "list"], [])
+        rows = self._diff(_server("manual"), state, fake)
+        self.assertEqual(
+            rows, ["  = skip manual (registered outside tools, not in scope user; left alone)"]
+        )
+        self.assertTrue(diff_mod._print_sections([("mcp", rows)]))
+
+    def test_foreign_entry_is_dropped_once_the_outside_server_is_gone(self):
+        fake = self._other_scope(listed=True)
+        state = {"mcp": {"servers": {}}}
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertIn("manual", state["mcp"]["foreign"])
+
+        fake = FakeClaude()  # removed by hand
+        self.assertEqual(self._diff(_server("manual"), state, fake), ["  + install manual"])
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertIn("manual", fake.installed)
+        self.assertIn("manual", state["mcp"]["servers"])
+        self.assertNotIn("foreign", state["mcp"])
+
+    def test_other_adoption_failures_are_errors_retried_next_run(self):
         for listed in (True, False):
             with self.subTest(listed=listed):
-                fake = self._other_scope(listed)
+                fake = self._other_scope(listed, remove_err="EACCES: permission denied")
                 state = {"mcp": {"servers": {}}}
-                self.assertTrue(self._reconcile(_server("manual"), state, fake))
+                self.assertFalse(self._reconcile(_server("manual"), state, fake))
                 self.assertNotIn("manual", state["mcp"]["servers"])
-                self.assertEqual(state["mcp"]["foreign"], {"manual": "user"})
+                self.assertNotIn("foreign", state["mcp"])
                 adds = [c for c in fake.commands if c[2] == "add"]
                 self.assertEqual(len(adds), 0 if listed else 1)
-
-                # Remembered: no more attempts, and the preview has nothing to apply.
                 fake.commands.clear()
-                self.assertTrue(self._reconcile(_server("manual"), state, fake))
-                self.assertEqual([c for c in fake.commands if c[2] != "list"], [])
-                rows = self._diff(_server("manual"), state, fake)
-                self.assertEqual(
-                    rows,
-                    ["  = skip manual (registered outside tools, not in scope user; left alone)"],
-                )
-                self.assertTrue(diff_mod._print_sections([("mcp", rows)]))
-
-                # A different configured scope tries again.
-                other = {"manual": {**_server("manual")["manual"], "scope": "local"}}
-                self.assertEqual(len(self._diff(other, state, fake)), 1)
-                self.assertNotIn("= skip", self._diff(other, state, fake)[0])
+                self.assertFalse(self._reconcile(_server("manual"), state, fake))
+                self.assertIn("remove", [c[2] for c in fake.commands])
 
     def test_already_exists_on_add_adopts_in_the_configured_scope(self):
         fake = FakeClaude()

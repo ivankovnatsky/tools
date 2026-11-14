@@ -82,17 +82,38 @@ def config_scope(config: Dict) -> str:
     return (config or {}).get("scope") or "user"
 
 
-def foreign_servers(servers: Dict, state: Dict) -> Dict[str, str]:
+def foreign_records(servers: Dict, state: Dict, current: Set[str]) -> Dict[str, Dict]:
     """Configured names registered outside tools in a scope other than the configured
-    one (name -> configured scope): left alone until that scope changes."""
+    one: name -> {"scope": configured scope, "listed": shown by `claude mcp list`}.
+    Left alone until the configured scope changes; a listed one also until `claude mcp
+    list` stops showing it. An unlisted one cannot be seen leaving."""
     recorded = state.get("mcp", {}).get("foreign") or {}
     if not isinstance(recorded, dict):
         return {}
-    return {
-        name: scope
-        for name, scope in recorded.items()
-        if name in servers and scope == config_scope(servers[name])
-    }
+    kept = {}
+    for name, record in recorded.items():
+        if isinstance(record, str):
+            record = {"scope": record, "listed": True}
+        if not isinstance(record, dict) or name not in servers:
+            continue
+        if record.get("scope") != config_scope(servers[name]):
+            continue
+        listed = record.get("listed") is not False
+        if listed and name not in current:
+            continue
+        kept[name] = {"scope": record["scope"], "listed": listed}
+    return kept
+
+
+def foreign_servers(servers: Dict, state: Dict, current: Set[str]) -> Dict[str, str]:
+    """`foreign_records` as name -> configured scope."""
+    return {n: r["scope"] for n, r in foreign_records(servers, state, current).items()}
+
+
+def not_in_scope(name: str, output: str) -> bool:
+    """`claude mcp remove -s SCOPE NAME` failed because NAME is not registered there:
+    `No MCP server named "NAME" in user scope` (`in .mcp.json` for project)."""
+    return f'No MCP server named "{name}" in ' in output
 
 
 def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
@@ -122,7 +143,8 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     # Registered outside tools under a configured name: tools owns it now. Its live
     # definition is never read, so it is re-registered from config once. Only one
     # registered in the configured scope is adopted: removing it there must succeed.
-    foreign = foreign_servers(servers, state)
+    foreign_recs = foreign_records(servers, state, current)
+    foreign = {n: r["scope"] for n, r in foreign_recs.items()}
     adopted = (desired & current) - tracked - set(foreign)
     for name in sorted(adopted):
         log(f"Adopting {name}, registered outside tools", Color.YELLOW)
@@ -136,13 +158,14 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     failed: set = set()
     failed_removals: set = set()
 
-    def leave_foreign(name: str) -> None:
+    def leave_foreign(name: str, listed: bool) -> None:
         scope = config_scope(servers[name])
         log(
             f"{name} is registered outside tools, not in scope {scope}; left alone",
             Color.YELLOW,
         )
         foreign[name] = scope
+        foreign_recs[name] = {"scope": scope, "listed": listed}
 
     if to_remove:
         log(f"Removing MCP servers: {', '.join(to_remove)}", Color.RED)
@@ -150,11 +173,17 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
             # Remove from the scope the server was registered under — a
             # hardcoded `-s user` can never remove local/project servers.
             scope = config_scope(tracked_cfg.get(server_name) or servers.get(server_name))
-            returncode, _, stderr = run_command(
+            returncode, stdout, stderr = run_command(
                 [claude_cli, "mcp", "remove", server_name, "-s", scope], env
             )
             if returncode != 0 and server_name in adopted:
-                leave_foreign(server_name)
+                if not_in_scope(server_name, stderr + stdout):
+                    leave_foreign(server_name, True)
+                else:
+                    # Not adopted this run: neither recorded nor added; retried next run.
+                    log(f"Failed to adopt {server_name}: {stderr}", Color.RED)
+                    success = False
+                    failed.add(server_name)
             elif returncode != 0:
                 log(f"Failed to remove {server_name}: {stderr}", Color.RED)
                 success = False
@@ -166,7 +195,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     if to_install:
         log(f"Installing MCP servers: {', '.join(to_install)}", Color.GREEN)
         for server_name in sorted(to_install):
-            if server_name in foreign:
+            if server_name in foreign or server_name in failed:
                 continue
             server_config = servers[server_name]
 
@@ -232,9 +261,16 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                 # Registered without showing in `mcp list`: adopt it the same way.
                 log(f"Adopting {server_name}, registered outside tools", Color.YELLOW)
                 scope = config_scope(server_config)
-                rc, _, _ = run_command([claude_cli, "mcp", "remove", server_name, "-s", scope], env)
+                rc, out, err = run_command(
+                    [claude_cli, "mcp", "remove", server_name, "-s", scope], env
+                )
+                if rc != 0 and not_in_scope(server_name, err + out):
+                    leave_foreign(server_name, server_name in current)
+                    continue
                 if rc != 0:
-                    leave_foreign(server_name)
+                    log(f"Failed to adopt {server_name}: {err}", Color.RED)
+                    success = False
+                    failed.add(server_name)
                     continue
                 returncode, _, stderr = run_command(cmd, env)
             if returncode != 0:
@@ -249,8 +285,8 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     if not to_install and not to_remove:
         debug("All MCP servers already installed", Color.BLUE)
 
-    if foreign:
-        state.setdefault("mcp", {})["foreign"] = foreign
+    if foreign_recs:
+        state.setdefault("mcp", {})["foreign"] = foreign_recs
     else:
         state.get("mcp", {}).pop("foreign", None)
     tracked_now = set(state.get("mcp", {}).get("servers", {}).keys())

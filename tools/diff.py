@@ -389,7 +389,7 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     if current is None:
         return ["  ? failed to list MCP servers, cannot diff"]
     tracked_cfg = state.get("mcp", {}).get("servers", {})
-    foreign = foreign_servers(servers, state)
+    foreign = foreign_servers(servers, state, current)
     for name in sorted(foreign):
         changes.append(
             f"{SKIPPED_ROW}{name} (registered outside tools, not in scope {foreign[name]}; "
