@@ -104,6 +104,16 @@ class FlatpakTest(unittest.TestCase):
         install = next(cmd for cmd in fake.commands if cmd[2] == "install")
         self.assertEqual(install[-2:], ["flathub", "org.example.App"])
 
+    def test_malformed_package_entry_fails_the_section(self):
+        fake = FakeFlatpak(remotes=["flathub"], installed=["org.example.Old"])
+        state = {"flatpak": {"packages": ["org.example.Old"], "remotes": []}}
+        config = {"packages": {"org.example.App": "flathub"}}
+
+        self.assertFalse(self._reconcile(config, state, fake))
+        self.assertEqual(fake.commands, [])
+        self.assertEqual(state["flatpak"]["packages"], ["org.example.Old"])
+        self.assertTrue(self._diff(config, state, fake)[0].startswith("  ! "))
+
     def test_tracked_app_dropped_from_config_is_removed(self):
         state = {"flatpak": {"packages": ["org.example.Old"], "remotes": []}}
         fake = FakeFlatpak(installed=["org.example.Old"])

@@ -6,7 +6,7 @@ are removed; anything installed out-of-band is never touched.
 """
 
 import shutil
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from tools.log import Color, debug, log
 from tools.util import run_command
@@ -18,17 +18,34 @@ def _find_flatpak() -> Optional[str]:
     return shutil.which("flatpak")
 
 
-def _desired_packages(config: Dict) -> Dict[str, str]:
-    """Normalize `packages` to {app_id: remote}.
+def _desired_packages(config: Dict) -> Tuple[Dict[str, str], List[str]]:
+    """Normalize `packages` to {app_id: remote}, plus config errors.
 
     Accepts a plain list of app IDs, or a dict mapping app ID to a
     per-app `{remote: ...}` override for when several remotes carry the
     same ID and flatpak would otherwise refuse to guess.
     """
     packages = config.get("packages", []) or []
+    errors: List[str] = []
+    apps: Dict[str, str] = {}
     if isinstance(packages, dict):
-        return {app: (info or {}).get("remote", "") for app, info in packages.items()}
-    return {app: "" for app in packages}
+        for app, info in packages.items():
+            info = info or {}
+            remote = (info.get("remote") or "") if isinstance(info, dict) else None
+            if not isinstance(remote, str):
+                errors.append(f"flatpak.packages.{app} must be a mapping with an optional remote")
+                continue
+            apps[app] = remote
+    elif isinstance(packages, list):
+        for app in packages:
+            if not isinstance(app, str) or not app:
+                errors.append(f"flatpak.packages: {app!r} must be a non-empty app id")
+                continue
+            apps[app] = ""
+    else:
+        kind = type(packages).__name__
+        errors.append(f"flatpak.packages must be a list or a mapping, got {kind}")
+    return apps, errors
 
 
 def _list_remotes(flatpak: str) -> Optional[Set[str]]:
@@ -94,7 +111,9 @@ def _remotes_in_use(flatpak: str) -> Set[str]:
 def diff_flatpak(config: Dict, state: Dict) -> List[str]:
     """Return human-readable changes the reconciler would apply."""
     desired_remotes = config.get("remotes", {}) or {}
-    desired_apps = _desired_packages(config)
+    desired_apps, errors = _desired_packages(config)
+    if errors:
+        return [f"  ! {err}" for err in errors]
     tracked = state.get("flatpak", {})
     # Empty tracked lists must read as "nothing tracked", or an emptied
     # section keeps shelling out to flatpak (and erroring) forever.
@@ -152,7 +171,11 @@ def install_flatpak_packages(config: Dict, state: Dict, update: bool = False) ->
     tracked ones.
     """
     desired_remotes = config.get("remotes", {}) or {}
-    desired_apps = _desired_packages(config)
+    desired_apps, errors = _desired_packages(config)
+    if errors:
+        for err in errors:
+            log(err, Color.RED)
+        return False
     tracked = state.get("flatpak", {})
     tracked_any = tracked.get("packages") or tracked.get("remotes")
     if not desired_remotes and not desired_apps and not tracked_any:

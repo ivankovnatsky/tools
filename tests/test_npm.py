@@ -70,6 +70,37 @@ class NpmPartialFailureTest(unittest.TestCase):
         self.assertNotIn("old", state["npm"]["packages"])
         self.assertNotIn("new", state["npm"]["packages"])
 
+    def test_failed_subpackage_bump_is_retried(self):
+        def fake_run(cmd, env=None, cwd=None):
+            return (1, "", "boom") if cmd[1:3] == ["install", "--save=false"] else (0, "", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            (Path(temp_dir) / "lib" / "node_modules" / "pkg" / "node_modules" / "sub").mkdir(
+                parents=True
+            )
+            paths = {"nodejs": "/n", "npmBin": str(bin_dir)}
+            old = {"sub": {"version": "1.0"}}
+            state = {
+                "npm": {
+                    "prefix": str(bin_dir),
+                    "packages": {
+                        "pkg": {
+                            "installed": True,
+                            "version": "latest",
+                            "subpackages": old,
+                            "postInstall": "",
+                        }
+                    },
+                }
+            }
+            packages = {"pkg": {"subpackages": {"sub": {"version": "2.0"}}}}
+
+            with mock.patch.object(npm_mod, "run_command", fake_run):
+                self.assertFalse(install_npm_packages(packages, paths, state, {}))
+
+        self.assertEqual(state["npm"]["packages"]["pkg"]["subpackages"], old)
+
     def test_missing_paths_fail_cleanly(self):
         state = {"npm": {"packages": {"x": {"installed": True}}}}
 

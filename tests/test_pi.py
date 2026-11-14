@@ -75,6 +75,39 @@ class PiInstallTest(unittest.TestCase):
             self.assertEqual(commands_run, [[str(pi_bin), "remove", "npm:old-pkg"]])
             self.assertNotIn("npm:old-pkg", state["pi"]["packages"])
 
+    def test_remove_uses_recorded_source(self):
+        commands_run = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            commands_run.append(cmd)
+            return 0, "", ""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pi_bin = Path(temp_dir) / "pi"
+            pi_bin.touch()
+            state = {
+                "pi": {
+                    "packages": {
+                        "mine": {"installed": True, "version": "latest", "source": "git:x/y"},
+                    }
+                }
+            }
+            with mock.patch.object(pi_mod, "run_command", fake_run):
+                self.assertTrue(install_pi_packages({}, {"piCli": str(pi_bin)}, state))
+
+        self.assertEqual(commands_run, [[str(pi_bin), "remove", "git:x/y"]])
+
+    def test_malformed_entry_fails_without_running_pi(self):
+        def fake_run(cmd, env=None, cwd=None):
+            raise AssertionError(f"ran {cmd}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pi_bin = Path(temp_dir) / "pi"
+            pi_bin.touch()
+            with mock.patch.object(pi_mod, "run_command", fake_run):
+                result = install_pi_packages({"npm:pkg": "1.0"}, {"piCli": str(pi_bin)}, {})
+        self.assertFalse(result)
+
     def test_version_changed_reinstalls(self):
         commands_run = []
 

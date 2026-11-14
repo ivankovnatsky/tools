@@ -41,6 +41,9 @@ TOP_LEVEL_KEYS = frozenset(SECTIONS + SETTINGS_KEYS)
 _RENAMED_KEYS = {"services": "mgmt"}
 
 
+_PACKAGE_SECTIONS = ("bun", "npm", "uv", "go", "cargo", "pi")
+
+
 class ConfigError(Exception):
     """Raised when the config cannot be resolved into a usable desired state."""
 
@@ -370,4 +373,10 @@ def resolve_config(
             out["vars"] = resolver.vars()
     except PlaceholderError as exc:
         raise ConfigError(str(exc)) from None
+    for section in _PACKAGE_SECTIONS:
+        section_config = out.get(section)
+        packages = section_config.get("packages") if isinstance(section_config, dict) else None
+        if isinstance(packages, dict):
+            # A bare key (`ruff:`) installs with defaults, same as `ruff: {}`.
+            out[section]["packages"] = {k: {} if v is None else v for k, v in packages.items()}
     return out

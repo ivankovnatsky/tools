@@ -68,6 +68,17 @@ class McpOwnershipTest(unittest.TestCase):
         self.assertIn("manual", fake.installed)
         self.assertEqual(fake.removed(), [])
 
+    def test_hand_registered_server_under_configured_name_is_not_adopted(self):
+        fake = FakeClaude(installed=["manual"])
+        state = {"mcp": {"servers": {}}}
+
+        self.assertTrue(self._reconcile(_server("manual"), state, fake))
+        self.assertNotIn("manual", state["mcp"]["servers"])
+
+        self._reconcile({}, state, fake)
+        self.assertIn("manual", fake.installed)
+        self.assertEqual(fake.removed(), [])
+
     def test_tracked_server_dropped_from_config_is_removed(self):
         fake = FakeClaude(installed=["ours"])
         state = {"mcp": {"servers": {"ours": {"installed": True}}}}

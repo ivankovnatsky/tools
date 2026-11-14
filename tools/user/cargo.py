@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
+    checked_packages,
     get_pkg_commit,
     get_pkg_source,
     get_pkg_version,
@@ -64,6 +65,9 @@ def _cargo_entry(pkg_info: Dict) -> Dict:
 
 
 def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
+    packages, ok = checked_packages("cargo", packages)
+    if not ok:
+        return False
     desired = set(packages.keys())
 
     # Unchanged packages still need reinstalling into a changed install dir.

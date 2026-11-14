@@ -146,6 +146,38 @@ class BrewReconcileTest(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(state["brew"]["brews"], [])
 
+    def test_partial_batch_matches_tap_qualified_names(self):
+        # `brew list -1` prints short names; config names may be `user/tap/tool`.
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1] in ("install", "uninstall"):
+                return 1, "", "boom"
+            if cmd[1] == "list":
+                return 0, "tool\napp\n", ""
+            return 0, "", ""
+
+        state = {}
+        config = {"brews": ["u/t/tool", "u/t/other"], "casks": ["u/t/app"]}
+        self.assertFalse(self._reconcile(config, state, fake_run))
+        self.assertEqual(state["brew"]["brews"], ["u/t/tool"])
+        self.assertEqual(state["brew"]["casks"], ["u/t/app"])
+
+        self.assertFalse(self._reconcile({}, state, fake_run))
+        self.assertEqual(state["brew"]["brews"], ["u/t/tool"])
+        self.assertEqual(state["brew"]["casks"], ["u/t/app"])
+
+    def test_failed_mas_uninstall_on_id_swap_keeps_old_record(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            return (1, "", "boom") if cmd[1] == "uninstall" else (0, "", "")
+
+        state = {"version": 2, "brew": {"brews": [], "casks": [], "taps": [], "masApps": {"A": 1}}}
+        with mock.patch.object(brew, "_mas_bin_from_env", return_value="/mas"):
+            self.assertFalse(self._reconcile({"masApps": {"A": 2}}, state, fake_run))
+        self.assertNotIn(["/mas", "install", "2"], calls)
+        self.assertEqual(state["brew"]["masApps"], {"A": 1})
+
     def test_mas_rename_under_same_id_updates_state(self):
         # Same app id under a new name produces no install/remove work, but
         # state must adopt the new name instead of keeping the stale key.

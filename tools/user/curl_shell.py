@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from collections.abc import Mapping
 from typing import Dict, List, Optional, Tuple
@@ -54,6 +55,12 @@ def _env() -> Dict[str, str]:
     return env
 
 
+def _shell_path(shell: str, env: Dict[str, str]) -> Optional[str]:
+    if shell == "bash":
+        return f"{system_dir('bash')}/bash"
+    return shutil.which(shell, path=env.get("PATH"))
+
+
 def install_curl_shell_scripts(raw: Dict, state: Dict):
     """Install scripts via curl piped to shell interpreter."""
     section = state.get("curlShell", {})
@@ -73,6 +80,12 @@ def install_curl_shell_scripts(raw: Dict, state: Dict):
     stale = sorted(installed - desired)
     success = True
     env = _env() if to_install or any(url in recorded for url in stale) else None
+    shells = {url: _shell_path(scripts[url][0], env) for url in to_install}
+    unknown = [url for url, path in shells.items() if not path]
+    if unknown:
+        for url in unknown:
+            log(f"curlShell.{url}: shell {scripts[url][0]!r} not found", Color.RED)
+        return False
 
     # A dropped url with no recorded uninstall can only be released from
     # state — otherwise re-adding it later would never re-run.
@@ -99,7 +112,6 @@ def install_curl_shell_scripts(raw: Dict, state: Dict):
 
     if to_install:
         curl_bin = system_bin("curl")
-        bash_dir = system_dir("bash")
     elif not stale:
         debug("All curl shell scripts already installed", Color.BLUE)
 
@@ -107,15 +119,13 @@ def install_curl_shell_scripts(raw: Dict, state: Dict):
         shell, uninstall = scripts[url]
         log(f"Running: curl -fsSL {url} | {shell}", Color.GREEN)
 
-        shell_path = f"{bash_dir}/{shell}" if shell == "bash" else shell
-
         curl_cmd = [curl_bin, "-fsSL", url]
         curl_proc = subprocess.Popen(
             curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
         )
 
         shell_proc = subprocess.Popen(
-            [shell_path],
+            [shells[url]],
             stdin=curl_proc.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -62,6 +62,10 @@ class OllamaModelsTest(unittest.TestCase):
 
         self.assertEqual(self._diff({"models": ["llama3"]}, state, fake), [])
 
+    def test_registry_port_is_not_a_tag(self):
+        self.assertEqual(ollama_models._canonical("host:5000/foo"), "host:5000/foo:latest")
+        self.assertEqual(ollama_models._canonical("host:5000/foo:1b"), "host:5000/foo:1b")
+
     def test_preinstalled_model_is_not_adopted(self):
         # Pulled by hand: we did not put it there, so it never enters state and
         # config can never remove it.

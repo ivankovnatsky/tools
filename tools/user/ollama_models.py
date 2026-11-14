@@ -25,7 +25,8 @@ def _canonical(model: str) -> str:
     any ref that lacks an explicit tag, both before comparing against
     the live list and before persisting to state.
     """
-    return model if ":" in model else f"{model}:latest"
+    # Only the last path element carries a tag; `host:5000/foo` has a port.
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 def _find_ollama() -> Optional[str]:

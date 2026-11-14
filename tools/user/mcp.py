@@ -105,6 +105,11 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     # Only servers we installed are ours to remove. `current - desired` would
     # take anything registered by hand or by another tool.
     to_remove = ((tracked & current) - desired) | changed_cfg
+    # Registered outside tools under a configured name: not ours to record,
+    # re-register or remove.
+    unowned = (desired & current) - tracked
+    for name in sorted(unowned):
+        log(f"{name} is registered outside tools, leaving it alone", Color.YELLOW)
 
     state_changed = False
     success = True
@@ -209,12 +214,12 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     if not to_install and not to_remove:
         debug("All MCP servers already installed", Color.BLUE)
 
-    if state_changed or set(state.get("mcp", {}).get("servers", {}).keys()) != desired:
+    if state_changed or set(state.get("mcp", {}).get("servers", {}).keys()) != desired - unowned:
         # A server whose `mcp add` failed is not installed; recording it as
         # such would hide the failure from the next run's diff.
         new_servers = {}
         for name, config in servers.items():
-            if name in failed:
+            if name in failed or name in unowned:
                 continue
             if name in failed_removals and name in tracked_cfg:
                 # Re-register whose removal failed: the old registration is

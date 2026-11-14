@@ -5,6 +5,7 @@ from typing import Dict
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
+    checked_packages,
     get_pkg_post_install,
     get_pkg_subpackages,
     pkg_install_spec,
@@ -28,6 +29,9 @@ def install_npm_packages(
 
     Ensures all declared packages exist in ~/.npm/bin at the declared version.
     """
+    packages, ok = checked_packages("npm", packages)
+    if not ok:
+        return False
     # Handle .npmrc creation
     npmrc_content = npm_config.get("configFile")
     if npmrc_content and not state.get("npm", {}).get("npmrc_created"):
@@ -164,7 +168,9 @@ def install_npm_packages(
                 state_changed = True
 
     # 4. SUBPACKAGES: Install additional deps inside package's node_modules
-    subpkg_failed = False
+    # pkg -> its previously recorded subpackages, kept when an install fails so
+    # the next run still sees the mismatch and retries.
+    subpkg_failed: Dict[str, Dict] = {}
     for pkg, pkg_info in packages.items():
         subpkgs = get_pkg_subpackages(pkg_info)
         if not subpkgs:
@@ -201,7 +207,7 @@ def install_npm_packages(
         returncode, stdout, stderr = run_command(cmd, env, cwd=str(pkg_dir))
         if returncode != 0:
             log(f"Failed to install subpackages for {pkg}: {stderr}", Color.RED)
-            subpkg_failed = True
+            subpkg_failed[pkg] = stored_subpkgs
         else:
             log(f"Installed subpackages for {pkg}", Color.GREEN)
             state_changed = True
@@ -221,7 +227,7 @@ def install_npm_packages(
             continue
         npm_state[pkg] = {
             **pkg_state_entry(pkg_info),
-            "subpackages": get_pkg_subpackages(pkg_info),
+            "subpackages": subpkg_failed.get(pkg, get_pkg_subpackages(pkg_info)),
             # A failed hook records the empty "never ran" marker, so the next
             # run still sees a mismatch and retries it — keeping the old
             # command would mask a failure of an *unchanged* hook after a

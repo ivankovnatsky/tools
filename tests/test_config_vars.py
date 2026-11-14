@@ -263,5 +263,12 @@ class ConfigVarsTest(unittest.TestCase):
         self.assertEqual(resolve_config(config, env={}), config)
 
 
+class BarePackageKeyTest(unittest.TestCase):
+    def test_bare_package_key_resolves_to_defaults(self):
+        out = resolve_config({"uv": {"packages": {"ruff": None}}, "pi": {"packages": None}}, env={})
+        self.assertEqual(out["uv"]["packages"], {"ruff": {}})
+        self.assertIsNone(out["pi"]["packages"])
+
+
 if __name__ == "__main__":
     unittest.main()

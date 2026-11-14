@@ -122,6 +122,32 @@ def skipped_row(target: str) -> str:
     return f"{SKIPPED_ROW}{target} (skip: true; not written)"
 
 
+def package_entries(section: str, packages) -> tuple[Dict[str, Dict], List[str]]:
+    """`<section>.packages` with bare keys (None) as {}, plus config errors."""
+    if packages is None:
+        return {}, []
+    if not isinstance(packages, dict):
+        return {}, [f"{section}.packages must be a mapping, got {type(packages).__name__}"]
+    entries: Dict[str, Dict] = {}
+    errors: List[str] = []
+    for name, info in packages.items():
+        if info is None:
+            info = {}
+        if not isinstance(info, dict):
+            errors.append(f"{section}.packages.{name} must be a mapping, got {type(info).__name__}")
+            continue
+        entries[name] = info
+    return entries, errors
+
+
+def checked_packages(section: str, packages) -> tuple[Dict[str, Dict], bool]:
+    """package_entries with its errors logged; False means the section must not run."""
+    entries, errors = package_entries(section, packages)
+    for err in errors:
+        log(err, Color.RED)
+    return entries, not errors
+
+
 def get_pkg_version(pkg_info: Dict) -> str:
     """Extract version from package info dict."""
     return pkg_info.get("version", "latest")

@@ -155,6 +155,24 @@ class CurlShellTest(unittest.TestCase):
         self.assertEqual(self.uninstalls, [])
         self.assertEqual(state["curlShell"]["installed"], ["https://example/x.sh"])
 
+    def test_unknown_shell_refuses_section(self):
+        state = {"curlShell": {"installed": ["https://example/old.sh"]}}
+        popen = mock.Mock(side_effect=FileNotFoundError(2, "No such file", "nosuchshell"))
+        with (
+            mock.patch.object(curl_shell, "system_bin", return_value="/usr/bin/curl"),
+            mock.patch.object(curl_shell, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(curl_shell, "system_dir_optional", return_value=None),
+            mock.patch.object(curl_shell.shutil, "which", return_value=None),
+            mock.patch.object(curl_shell.subprocess, "Popen", popen),
+        ):
+            result = curl_shell.install_curl_shell_scripts(
+                {"https://example/x.sh": "nosuchshell"}, state
+            )
+
+        self.assertFalse(result)
+        popen.assert_not_called()
+        self.assertEqual(state["curlShell"]["installed"], ["https://example/old.sh"])
+
     def test_non_mapping_section_refuses_and_keeps_state(self):
         for raw in ([], False, "x"):
             with self.subTest(raw=raw):

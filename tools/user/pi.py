@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 from tools.log import Color, debug, log
 from tools.util import (
+    checked_packages,
     get_pkg_source,
     get_pkg_version,
     pkg_install_spec,
@@ -43,6 +44,9 @@ def install_pi_packages(packages: Dict, paths: Dict, state: Dict) -> bool:
 
     Ensures all declared packages are installed via `pi install`.
     """
+    packages, ok = checked_packages("pi", packages)
+    if not ok:
+        return False
     desired = set(packages.keys())
     state_pkgs = state.get("pi", {}).get("packages", {})
     state_packages = set(state_pkgs.keys())
@@ -64,7 +68,10 @@ def install_pi_packages(packages: Dict, paths: Dict, state: Dict) -> bool:
     if to_remove:
         log(f"Removing Pi packages: {', '.join(to_remove)}", Color.RED)
         for pkg in to_remove:
-            cmd = [pi_cli, "remove", pkg]
+            # pi matches removals against the source it installed, not our key.
+            entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+            spec = pkg_install_spec(pkg, get_pkg_version(entry), get_pkg_source(entry))
+            cmd = [pi_cli, "remove", spec]
             returncode, _, stderr = run_command(cmd, env)
             if returncode != 0:
                 log(f"Failed to remove Pi package {pkg}: {stderr}", Color.RED)

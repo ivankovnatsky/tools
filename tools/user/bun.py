@@ -4,6 +4,7 @@ from typing import Dict
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
+    checked_packages,
     pkg_spec_full,
     pkg_state_entry,
     pkg_unpinned,
@@ -19,6 +20,9 @@ def install_bun_packages(
 
     Ensures all declared packages exist in ~/.bun/bin at the declared version.
     """
+    packages, ok = checked_packages("bun", packages)
+    if not ok:
+        return False
     # Handle .bunfig.toml creation (only if bun.configFile is set)
     bunfig_content = bun_config.get("configFile")
     if bunfig_content and not state.get("bun", {}).get("bunfig_created"):

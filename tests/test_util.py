@@ -46,3 +46,34 @@ class RunCommandTest(unittest.TestCase):
         rc, out, err = run_command(["/nonexistent/tools-test/npm", "-v"])
         self.assertEqual((rc, out), (127, ""))
         self.assertEqual(err, "/nonexistent/tools-test/npm: No such file or directory")
+
+
+class PackageEntriesTest(unittest.TestCase):
+    def test_bare_key_means_defaults(self):
+        from tools.util import package_entries
+
+        self.assertEqual(package_entries("uv", {"ruff": None}), ({"ruff": {}}, []))
+
+    def test_malformed_entry_fails_each_section_before_running_anything(self):
+        from unittest import mock
+
+        from tools.user import bun, cargo, go, npm, pi, uv
+
+        def fake_run(cmd, env=None, cwd=None):
+            raise AssertionError(f"ran {cmd}")
+
+        calls = {
+            "bun": lambda p: bun.install_bun_packages(p, {"bun": "/b", "nodejs": "/n"}, {}, {}),
+            "npm": lambda p: npm.install_npm_packages(p, {"nodejs": "/n", "npmBin": "/nb"}, {}, {}),
+            "uv": lambda p: uv.install_uv_packages(
+                p, {"uv": "/u", "uvBin": "/ub", "uvToolDir": "/ut"}, {}
+            ),
+            "go": lambda p: go.install_go_packages(p, {}, {}),
+            "cargo": lambda p: cargo.install_cargo_packages(p, {}, {}),
+            "pi": lambda p: pi.install_pi_packages(p, {}, {}),
+        }
+        modules = {"bun": bun, "npm": npm, "uv": uv, "go": go, "cargo": cargo, "pi": pi}
+        for name, call in calls.items():
+            with self.subTest(section=name):
+                with mock.patch.object(modules[name], "run_command", fake_run):
+                    self.assertFalse(call({"tool": "1.0"}))

@@ -121,8 +121,9 @@ def _installed_subset(brew: str, env: dict, candidates: list[str], kind: str) ->
     rc, stdout, _ = run_command([brew, "list", kind, "-1"], env)
     if rc != 0:
         return None
+    # `brew list -1` prints short names; config may name `user/tap/tool`.
     present = {line.strip() for line in stdout.splitlines() if line.strip()}
-    return present & set(candidates)
+    return {c for c in candidates if _variants([c]) & present}
 
 
 _KEYS = {"brews", "casks", "taps", "masApps", "environment", "caskArgs", "onActivation", "trust"}
@@ -856,15 +857,21 @@ def install_brew_packages(
         # queues both a remove (old id) and an install (new id) under one name.
         # Installing first then popping the name would drop the fresh entry from
         # state, so reconcile removals before installs.
+        blocked = set()
         for name, app_id in mas_to_remove:
             log(f"Removing Mac App Store app: {name} ({app_id})", Color.RED)
             rc, _, stderr = run_command([mas, "uninstall", str(app_id)], env)
             if rc != 0:
                 log(f"Failed to remove {name}: {stderr}", Color.RED)
                 success = False
+                blocked.add(name)
             else:
                 inst_mas.pop(name, None)
         for name, app_id in mas_to_install:
+            if name in blocked:
+                # Installing would overwrite the record of the old id still on disk.
+                log(f"Not installing {name} ({app_id}): removing its old id failed", Color.YELLOW)
+                continue
             log(f"Installing Mac App Store app: {name} ({app_id})", Color.GREEN)
             rc, _, stderr = run_command([mas, "install", str(app_id)], env)
             if rc != 0:

@@ -6,6 +6,7 @@ from typing import Dict, Optional
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
+    checked_packages,
     get_pkg_commit,
     get_pkg_source,
     get_pkg_version,
@@ -104,6 +105,9 @@ def _installed_path(pkg: str, entry: Dict, go_bin: Optional[str]) -> Optional[st
 
 
 def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
+    packages, ok = checked_packages("go", packages)
+    if not ok:
+        return False
     desired = set(packages.keys())
 
     # Go has no uninstall, so a changed install dir cannot "release" anything

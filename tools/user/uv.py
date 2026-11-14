@@ -4,6 +4,7 @@ from typing import Dict
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
+    checked_packages,
     get_pkg_commit,
     get_pkg_source,
     get_pkg_version,
@@ -38,6 +39,9 @@ def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
 
 
 def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
+    packages, ok = checked_packages("uv", packages)
+    if not ok:
+        return False
     desired = set(packages.keys())
 
     # Fail with a clear message instead of a KeyError traceback when the
