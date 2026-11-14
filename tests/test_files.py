@@ -439,6 +439,40 @@ class OnChangeTest(unittest.TestCase):
         self.assertEqual(self.runs(), 1)
         self.assertEqual(state["restartUnits"][unit]["sources"], [f"files/{target}"])
 
+    def test_diff_lists_restart_units_under_changed_entry(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        unit = "launchd:org.example.caddy"
+        entries = [{"source": "src/a.conf", "target": target, "restartUnits": [unit]}]
+        state = {}
+        self.assertEqual(
+            _diff_files(entries, self.d, state), [f"  + create {target}", f"    notify: {unit}"]
+        )
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+
+    def test_diff_lists_restart_units_under_retried_hook(self):
+        from tools.diff import _diff_files
+
+        _write(os.path.join(self.d, "src", "a.conf"), "one\n")
+        target = os.path.join(self.d, "a.conf")
+        flag = os.path.join(self.d, "flag")
+        hook = f"if [ -e {flag} ]; then {self.hook}; else touch {flag}; exit 3; fi"
+        unit = "launchd:org.example.caddy"
+        entries = [
+            {"source": "src/a.conf", "target": target, "onChange": hook, "restartUnits": [unit]}
+        ]
+        state = {}
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(
+            _diff_files(entries, self.d, state),
+            [f"  ~ run onChange: {hook}", f"    notify: {unit}"],
+        )
+        _quiet(files.install_files, entries, self.d, state)
+        self.assertEqual(_diff_files(entries, self.d, state), [])
+
     def test_restart_units_without_hook_and_invalid_value(self):
         _write(os.path.join(self.d, "src", "a.conf"), "one\n")
         target = os.path.join(self.d, "a.conf")

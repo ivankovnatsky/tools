@@ -109,3 +109,57 @@ class NpmMissingRuntimeTest(unittest.TestCase):
                 self.assertFalse(install_npm_packages({"a": {}}, paths, state, {}))
             self.assertIn("none/npm: No such file or directory", str(log.call_args_list))
             self.assertNotIn("a", state.get("npm", {}).get("packages", {}))
+
+
+class NpmRestartUnitsTest(unittest.TestCase):
+    UNIT = "launchd:org.example.svc"
+    PATHS = {"nodejs": "/nonexistent/node", "npmBin": "/nonexistent/npm/bin"}
+
+    def owed(self, state):
+        return state.get("restartUnits", {}).get(self.UNIT)
+
+    def run_install(self, state, packages, returncode=0, update=False):
+        with mock.patch("tools.user.npm.run_command", return_value=(returncode, "", "err")) as run:
+            ok = install_npm_packages(packages, self.PATHS, state, {}, update)
+        return ok, run
+
+    def test_install_owes_and_unchanged_does_not(self):
+        state = {}
+        packages = {"svc": {"restartUnits": [self.UNIT]}, "other": {}}
+        self.assertTrue(self.run_install(state, packages)[0])
+        self.assertEqual((self.owed(state)["sources"], self.owed(state)["seq"]), (["npm/svc"], 1))
+        self.assertNotIn("restartUnits", state["npm"]["packages"]["svc"])
+        ok, run = self.run_install(state, packages)
+        self.assertTrue(ok)
+        run.assert_not_called()
+        self.assertEqual(self.owed(state)["seq"], 1)
+
+    def test_update_reinstall_owes(self):
+        state = {}
+        packages = {"svc": {"restartUnits": [self.UNIT]}}
+        self.run_install(state, packages)
+        self.run_install(state, packages, update=True)
+        self.assertEqual(self.owed(state)["seq"], 2)
+
+    def test_pinned_package_on_update_owes_nothing(self):
+        state = {}
+        packages = {"svc": {"version": "1.0.0", "restartUnits": [self.UNIT]}}
+        self.run_install(state, packages)
+        self.run_install(state, packages, update=True)
+        self.assertEqual(self.owed(state)["seq"], 1)
+
+    def test_failed_install_owes_nothing(self):
+        state = {}
+        packages = {"svc": {"restartUnits": [self.UNIT]}}
+        self.assertFalse(self.run_install(state, packages, returncode=1)[0])
+        self.assertIsNone(self.owed(state))
+
+    def test_invalid_restart_units_is_an_error_and_skips_only_that_entry(self):
+        state = {}
+        packages = {"bad": {"restartUnits": "launchd:x"}, "good": {}}
+        ok, run = self.run_install(state, packages)
+        self.assertFalse(ok)
+        self.assertNotIn("bad", run.call_args[0][0])
+        self.assertIn("good", run.call_args[0][0])
+        self.assertNotIn("restartUnits", state)
+        self.assertEqual(set(state["npm"]["packages"]), {"good"})

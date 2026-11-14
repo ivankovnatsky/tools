@@ -2,6 +2,7 @@ import os
 from typing import Dict
 
 from tools.log import Color, debug, log
+from tools.user import secrets_flow
 from tools.util import (
     pkg_spec_full,
     pkg_state_entry,
@@ -77,18 +78,29 @@ def install_bun_packages(
             success = False
         state_changed = True
 
+    units: Dict[str, list] = {}
+    for pkg, pkg_info in packages.items():
+        try:
+            units[pkg] = secrets_flow.parse_restart_units(
+                pkg_info.get("restartUnits"), f"bun.packages.{pkg}"
+            )
+        except ValueError as e:
+            log(str(e), Color.RED)
+            success = False
+
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
     to_install_names = []
     for pkg, pkg_info in packages.items():
-        if (
+        if pkg in units and (
             pkg not in state_packages
             or version_changed(pkg, pkg_info, state, "bun")
             or (update and pkg_unpinned(pkg_info))
         ):
             to_install.append(pkg_spec_full(pkg, pkg_info))
             to_install_names.append(pkg)
-    install_failed: set = set()
+    # Entries with invalid restartUnits are not (re)installed: keep their old state.
+    install_failed = {pkg for pkg in packages if pkg not in units}
     if to_install:
         log(f"Installing bun packages: {', '.join(to_install)}", Color.GREEN)
         cmd = [f"{paths['bun']}/bun", "install", "-g"] + to_install
@@ -99,7 +111,10 @@ def install_bun_packages(
             # so state must still be rewritten below or the next run retries
             # `bun remove -g` on packages that are already gone — forever.
             success = False
-            install_failed = set(to_install_names)
+            install_failed |= set(to_install_names)
+        else:
+            for pkg in to_install_names:
+                secrets_flow.owe_restarts(state, units[pkg], f"bun/{pkg}")
         state_changed = True
 
     if not to_remove and not to_install:

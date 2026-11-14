@@ -3,6 +3,7 @@ import shutil
 from typing import Dict, List, Optional
 
 from tools.log import Color, debug, log
+from tools.user import secrets_flow
 from tools.util import (
     get_pkg_commit,
     get_pkg_source,
@@ -91,6 +92,16 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
         for pkg in orphaned:
             tracked.pop(pkg, None)
 
+    units: Dict[str, list] = {}
+    for pkg, pkg_info in packages.items():
+        try:
+            units[pkg] = secrets_flow.parse_restart_units(
+                pkg_info.get("restartUnits"), f"cargo.packages.{pkg}"
+            )
+        except ValueError as e:
+            log(str(e), Color.RED)
+            success = False
+
     to_install = [
         pkg
         for pkg, pkg_info in packages.items()
@@ -108,6 +119,8 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
         cargo_env = _cargo_env(paths)
         log(f"Installing cargo packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
+            if pkg not in units:
+                continue
             args = _install_args(pkg, packages[pkg])
             cmd = [cargo_cmd, "install", *args]
             returncode, _, stderr = run_command(cmd, env=cargo_env)
@@ -117,6 +130,7 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
                 continue
             log(f"Installed: {' '.join(args)}", Color.GREEN)
             tracked[pkg] = _cargo_entry(packages[pkg])
+            secrets_flow.owe_restarts(state, units[pkg], f"cargo/{pkg}")
     elif not orphaned:
         debug("All cargo packages already installed", Color.BLUE)
 

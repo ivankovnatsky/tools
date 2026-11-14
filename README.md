@@ -260,7 +260,9 @@ Notable keys:
 - `restartUnits: [launchd:<label>]` (on user `files:` entries) restarts that
   launchd job whenever the entry's `onChange` would run, once that `onChange`
   (if any) succeeded, including a retry of one that failed earlier. Use it for
-  a binary an `onChange` builds. See "restartUnits" under launchd.
+  a binary an `onChange` builds. `tools diff` shows the units under the
+  entry's change row as `notify: <unit>`, and under the `~ run onChange` row
+  of a retried `onChange`. See "restartUnits" under launchd.
 
   ```yaml
   files:
@@ -781,7 +783,7 @@ Behaviour:
 
 ### restartUnits
 
-`sops`/`templates`/`fetch` entries, user `files:` entries, `uv`/`go` packages and `brew` formulae and casks name the jobs that read or run them, as sops-nix's `restartUnits`:
+`sops`/`templates`/`fetch` entries, user `files:` entries, `uv`/`go`/`cargo`/`npm`/`bun` packages and `brew` formulae and casks name the jobs that read or run them, as sops-nix's `restartUnits`:
 
 ```yaml
 templates:
@@ -792,7 +794,8 @@ templates:
 ```
 
 - A create, update or replace of the file (not a chmod) records the label as owed in the user's state; the launchd section then pays it. Content is compared in memory, so no hash of a secret is stored.
-- `uv`/`go` packages owe it after each successful `uv tool install`/`go install` (a new package, a changed version, source or commit, and with `--update` a reinstall of an unpinned go package) and each successful `uv tool upgrade` under `--update`; neither tells whether the upgrade changed anything, so an unpinned package restarts its jobs on every `--update`.
+- `uv`/`go` packages owe it after each successful `uv tool install`/`go install` (a new package, a changed version, source or commit, and with `--update` a reinstall of an unpinned go package) and each successful `uv tool upgrade` under `--update`; neither tells whether the upgrade changed anything, so an unpinned package restarts its jobs on every `--update`. `tools diff` shows the units under each `+ install`/`~ update` row as `notify: <unit>`.
+- `cargo` packages owe it after each successful `cargo install` and `npm`/`bun` packages after a successful `npm install -g`/`bun install -g` batch (a new package, a changed version, source or commit, and with `--update` a reinstall of an unpinned package, so those restart their jobs on every `--update`); a failed batch owes nothing. `tools diff` shows the units under each `+ install`/`~ update` row as `notify: <unit>`.
 
 ```yaml
 uv:

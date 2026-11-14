@@ -141,3 +141,46 @@ class CargoUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CargoRestartUnitsTest(unittest.TestCase):
+    UNIT = "launchd:org.example.svc"
+    PACKAGES = {"svc": {"restartUnits": [UNIT]}}
+
+    def owed(self, state):
+        return state.get("restartUnits", {}).get(self.UNIT)
+
+    def run_install(self, state, returncode=0, update=False, packages=None):
+        with (
+            mock.patch("tools.user.cargo.shutil.which", return_value="/cargo"),
+            mock.patch("tools.user.cargo.run_command", return_value=(returncode, "", "err")) as run,
+        ):
+            ok = install_cargo_packages(packages or self.PACKAGES, {}, state, update)
+        return ok, run
+
+    def test_install_owes_and_unchanged_does_not(self):
+        state = {}
+        self.assertTrue(self.run_install(state)[0])
+        self.assertEqual((self.owed(state)["sources"], self.owed(state)["seq"]), (["cargo/svc"], 1))
+        self.assertNotIn("restartUnits", state["cargo"]["packages"]["svc"])
+        self.assertTrue(self.run_install(state)[0])
+        self.assertEqual(self.owed(state)["seq"], 1)
+
+    def test_update_reinstall_owes(self):
+        state = {}
+        self.run_install(state)
+        self.run_install(state, update=True)
+        self.assertEqual(self.owed(state)["seq"], 2)
+
+    def test_failed_install_owes_nothing(self):
+        state = {}
+        self.assertFalse(self.run_install(state, returncode=1)[0])
+        self.assertIsNone(self.owed(state))
+
+    def test_invalid_restart_units_is_an_error(self):
+        state = {}
+        ok, run = self.run_install(state, packages={"svc": {"restartUnits": "launchd:x"}})
+        self.assertFalse(ok)
+        run.assert_not_called()
+        self.assertNotIn("restartUnits", state)
+        self.assertNotIn("svc", state["cargo"].get("packages", {}))

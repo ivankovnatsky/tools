@@ -701,3 +701,10 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NpmRestartUnitsSelectionTest(unittest.TestCase):
+    def test_narrowed_config_keeps_restart_units(self):
+        config = {"npm": {"packages": {"a": {"restartUnits": ["launchd:x.y"]}, "b": {}}}}
+        view = selection.View({"npm": frozenset({"a"})}, config, "/tmp")
+        self.assertEqual(view.config["npm"]["packages"], {"a": {"restartUnits": ["launchd:x.y"]}})

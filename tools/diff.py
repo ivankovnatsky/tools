@@ -66,6 +66,13 @@ def _emit_change(item: str) -> None:
         log(item, Color.YELLOW)
 
 
+def _notify_rows(pkg_info) -> List[str]:
+    units = pkg_info.get("restartUnits") if isinstance(pkg_info, dict) else None
+    if not isinstance(units, list):
+        return []
+    return [f"    notify: {u}" for u in units if isinstance(u, str)]
+
+
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     changes = []
     desired = set(packages.keys())
@@ -77,8 +84,10 @@ def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict):
     for pkg, pkg_info in packages.items():
         if pkg not in state_packages:
             changes.append(f"  + install {pkg}")
+            changes += _notify_rows(pkg_info)
         elif version_changed(pkg, pkg_info, state, "bun"):
             changes.append(f"  ~ update {pkg}")
+            changes += _notify_rows(pkg_info)
 
     bunfig_content = bun_config.get("configFile")
     if bunfig_content and not state.get("bun", {}).get("bunfig_created"):
@@ -99,8 +108,10 @@ def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
     for pkg, pkg_info in packages.items():
         if pkg not in state_packages:
             changes.append(f"  + install {pkg}")
+            changes += _notify_rows(pkg_info)
         elif version_changed(pkg, pkg_info, state, "npm"):
             changes.append(f"  ~ update {pkg}")
+            changes += _notify_rows(pkg_info)
 
     return changes
 
@@ -115,8 +126,10 @@ def _diff_uv(packages: Dict, paths: Dict, state: Dict):
             source = get_pkg_source(pkg_info)
             spec = source if source else pkg
             changes.append(f"  + install {spec}")
+            changes += _notify_rows(pkg_info)
         elif version_changed(pkg, pkg_info, state, "uv"):
             changes.append(f"  ~ update {pkg}")
+            changes += _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - remove {pkg}")
@@ -133,8 +146,10 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
         if pkg not in state_packages:
             source = get_pkg_source(pkg_info) or pkg
             changes.append(f"  + install {source}")
+            changes += _notify_rows(pkg_info)
         elif version_changed(pkg, pkg_info, state, "go"):
             changes.append(f"  ~ update {pkg}")
+            changes += _notify_rows(pkg_info)
 
     # Go has no uninstall; dropping a package leaves its binary in $GOBIN.
     for pkg in sorted(state_packages - desired):
@@ -152,8 +167,10 @@ def _diff_cargo(packages: Dict, paths: Dict, state: Dict):
         if pkg not in state_packages:
             source = get_pkg_source(pkg_info) or pkg
             changes.append(f"  + install {source}")
+            changes += _notify_rows(pkg_info)
         elif version_changed(pkg, pkg_info, state, "cargo"):
             changes.append(f"  ~ update {pkg}")
+            changes += _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - drop {pkg} (binary remains in $CARGO_HOME/bin)")
@@ -363,8 +380,10 @@ def _diff_files(
             elif fp.action == "chmod":
                 changes.append(f"  ~ chmod {target} -> {oct(effective_mode)}")
 
-        if e.on_change and len(changes) > before:
-            hooks[e.on_change] = None
+        if len(changes) > before:
+            changes += [f"    notify: {u}" for u in e.restart_units]
+            if e.on_change:
+                hooks[e.on_change] = None
 
     # Deploy holds removals on config errors; a refused target stays tracked.
     removed = set()
@@ -405,10 +424,27 @@ def _diff_files(
                 changes.append(f"  - remove {target}")
                 removed.add(target)
 
-    for command in pending_hooks(state, "files", declared_hooks(entries)):
+    retried = pending_hooks(state, "files", declared_hooks(entries))
+    for command in retried:
         hooks[command] = None
-    changes += [f"  ~ run onChange: {command}" for command in hooks]
+    for command in hooks:
+        changes.append(f"  ~ run onChange: {command}")
+        if command in retried:
+            changes += _retried_notify_rows(entries, command)
     return changes
+
+
+def _retried_notify_rows(entries, command: str) -> List[str]:
+    """restartUnits a retried onChange owes once it succeeds, as `files._owe_restarts`."""
+    units: List[str] = []
+    for raw in entries if isinstance(entries, list) else []:
+        if not isinstance(raw, dict) or raw.get("skip") is True or raw.get("onChange") != command:
+            continue
+        try:
+            units += secrets_flow.parse_restart_units(raw.get("restartUnits"), "files")
+        except ValueError:
+            continue
+    return _notify_rows({"restartUnits": list(dict.fromkeys(units))})
 
 
 def _empty_after(directory: str, removed) -> bool:
