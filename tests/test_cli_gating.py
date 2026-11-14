@@ -695,7 +695,11 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         with (
             mock.patch.object(privilege, "run_as_user", side_effect=self.fake_run_as_user),
             mock.patch.object(cli, "_load_merged_config", side_effect=self.load),
-            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(
+                cli,
+                "migrate_state_file",
+                side_effect=lambda _f: self.events.append(("migrate", os.geteuid())),
+            ),
             mock.patch.object(
                 cli, "run_restarts", side_effect=lambda r: self.events.append(("restart", r))
             ),
@@ -712,7 +716,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         return result
 
     def steps(self):
-        return [e for e in self.events if e[0] not in ("load", "restart")]
+        return [e for e in self.events if e[0] not in ("load", "restart", "migrate")]
 
     def test_machine_is_pinned_before_either_phase_loads_config(self):
         with mock.patch.object(
@@ -728,6 +732,7 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(
             self.steps(),
             [
+                ("drop", 501),  # state migration
                 ("drop", 501),
                 ("install_brew_packages", 501),
                 ("install_brew_packages", 501),
@@ -850,8 +855,17 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             self.steps(),
-            [("install_launchd", 0), ("drop", 501), ("drop", 501), ("install_launchd", 501)],
+            [
+                ("drop", 501),
+                ("install_launchd", 0),
+                ("drop", 501),
+                ("drop", 501),
+                ("install_launchd", 501),
+            ],
         )
+        # Root goes first here: the user's state is migrated, as the user, before it.
+        migrations = [e for e in self.events if e[0] in ("migrate", "install_launchd")]
+        self.assertEqual(migrations[:2], [("migrate", 501), ("install_launchd", 0)])
 
     def test_only_narrows_both_phases(self):
         self.config["launchd"]["labelPrefix"] = "org.x"
@@ -939,16 +953,27 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.results[("install_launchd", 0)] = False
         result = self.run_with_mgmt(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("System sections failed; not running launchd, mgmt", result.output)
+        self.assertIn("System sections failed; not running mgmt", result.output)
         self.assertNotIn(("install_mgmt", 501), self.events)
+        # Agents still converge and their owed restarts still run.
+        self.assertEqual(self.steps()[-1], ("install_launchd", 501))
 
     def test_failed_user_phase_stops_before_the_system_phase(self):
         self.results[("install_brew_packages", 501)] = False
         result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("Deploy as me failed; not running the later phases", result.output)
+        self.assertIn("Deploy as me failed; not running system sections", result.output)
         self.assertIn(("install_dock", 501), self.events)
         self.assertFalse([e for e in self.steps() if e[1] == 0])
+        self.assertEqual(self.steps()[-1], ("install_launchd", 501))
+
+    def test_failed_user_phase_still_runs_agents_but_not_mgmt(self):
+        self.results[("install_brew_packages", 501)] = False
+        result = self.run_with_mgmt(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("not running system sections, mgmt", result.output)
+        self.assertIn(("install_launchd", 501), self.events)
+        self.assertNotIn(("install_mgmt", 501), self.events)
 
     def test_failed_system_phase_fails_the_run(self):
         self.results[("install_launchd", 0)] = False
@@ -999,9 +1024,14 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
         self.queues = {"install_defaults": ["Dock"], "install_dock": ["Finder"]}
         run_as_user = self.fake_run_as_user
 
+        calls = []
+
         def interrupted(inv, fn):
-            run_as_user(inv, fn)
-            raise KeyboardInterrupt
+            rc = run_as_user(inv, fn)
+            calls.append(fn)
+            if len(calls) == 2:  # the user phase, after the state migration
+                raise KeyboardInterrupt
+            return rc
 
         with mock.patch.object(self, "fake_run_as_user", side_effect=interrupted):
             result = self.run_cli(["deploy", "--approve"])
@@ -1010,17 +1040,33 @@ class SudoDeployTest(RootInvocation, unittest.TestCase):
 
     def test_crashed_user_child_skips_the_system_phase(self):
         root_load = self.load
+        user_loads = []
 
         def load(paths):
             if os.geteuid() != 0:
-                raise RuntimeError("boom")
+                user_loads.append(paths)
+                if len(user_loads) > 1:  # past the state migration
+                    raise RuntimeError("boom")
             return root_load(paths)
 
         with mock.patch.object(self, "load", side_effect=load):
             result = self.run_cli(["deploy", "--approve"])
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertEqual(self.steps(), [("drop", 501)])
+        # Migration, the crashed user phase, then the agents' phase (crashing too).
+        self.assertEqual(self.steps(), [("drop", 501), ("drop", 501), ("drop", 501)])
         self.assertEqual(self.events[-1], ("restart", []))
+
+    def test_failed_state_migration_deploys_nothing(self):
+        def load(paths):
+            if os.geteuid() != 0:
+                raise RuntimeError("boom")
+            return self.config
+
+        with mock.patch.object(self, "load", side_effect=load):
+            result = self.run_cli(["deploy", "--approve"])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("Could not migrate me's state file; nothing deployed", result.output)
+        self.assertEqual(self.steps(), [("drop", 501)])
 
     def test_failed_user_diff_deploys_nothing(self):
         def show_diff(_c, _d, _s, root=False, only=None, update=False):

@@ -297,9 +297,9 @@ def _sudo_deploy(
     """User sections in a child dropped to the user, then system sections as root
     (daemons and host settings run what the user phase installs), then `launchd` and
     `mgmt` in another user child (agents' restartOn may name system files root just
-    wrote; mgmt services may be daemons root just started). One prompt covers all; a
-    failed phase stops the ones after it. Process restarts from every phase run once,
-    at the end."""
+    wrote; mgmt services may be daemons root just started). One prompt covers all. A
+    failed phase stops the system phase and mgmt after it; `launchd` still runs, as it
+    would in a plain deploy. Process restarts from every phase run once, at the end."""
     pin_hostname()
     if only:
         # Both phases' --only checks before either runs anything.
@@ -320,28 +320,49 @@ def _sudo_deploy(
         )
         if late:
             user = tuple(s for s in (scope or ALL_SECTIONS) if s not in late)
+    if system and privilege.run_as_user(inv, lambda: _migrate_state(config_paths)) != 0:
+        # Root may write the state file first; a legacy one must be moved before that.
+        log(f"Could not migrate {inv.login}'s state file; nothing deployed", Color.RED)
+        sys.exit(1)
     restarts: list = []
     daemons: list = []
+    failed = False
     try:
         if user or not scope:
-            rc = _user_phase(inv, config_paths, user, update, only, restarts, daemons)
-            if rc != 0:
-                if system or late:
-                    log(f"Deploy as {inv.login} failed; not running the later phases", Color.RED)
-                sys.exit(1)
-        if system:
+            if _user_phase(inv, config_paths, user, update, only, restarts, daemons) != 0:
+                failed = True
+                skipped = [
+                    s for s in (("system sections",) if system else ()) + late if s != "launchd"
+                ]
+                if skipped:
+                    log(
+                        f"Deploy as {inv.login} failed; not running {', '.join(skipped)}",
+                        Color.RED,
+                    )
+        if system and not failed:
             merged = _load_merged_config(config_paths)
             config_dir = _resolve_config_dir(config_paths)
             if not _deploy(merged, config_dir, system, update, True, restarts, only, inv=inv):
-                if late:
-                    log(f"System sections failed; not running {', '.join(late)}", Color.RED)
-                sys.exit(1)
-        if late and _user_phase(inv, config_paths, late, update, only, restarts, daemons) != 0:
+                failed = True
+                if "mgmt" in late:
+                    log("System sections failed; not running mgmt", Color.RED)
+        phase = tuple(s for s in late if s == "launchd" or not failed)
+        if phase and _user_phase(inv, config_paths, phase, update, only, restarts, daemons) != 0:
+            failed = True
+        if failed:
             sys.exit(1)
     finally:
         run_restarts(list(dict.fromkeys(restarts)))
         if daemons and not _restart_daemons(inv, config_paths, daemons):
             sys.exit(1)
+
+
+def _migrate_state(config_paths: list[str]) -> int:
+    """As the user: move a legacy state file into place, as a user deploy does first."""
+    state_file = state_file_path(_load_merged_config(config_paths))
+    with state_lock(state_file):
+        migrate_state_file(state_file)
+    return 0
 
 
 def _user_phase(

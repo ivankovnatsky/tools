@@ -52,6 +52,7 @@ from tools.util import (
     get_pkg_source,
     get_pkg_subpackages,
     looks_like_secret,
+    package_entries,
     pkg_install_spec,
     pkg_unpinned,
     skipped_row,
@@ -84,14 +85,8 @@ def _notify_rows(pkg_info) -> List[str]:
 
 
 def _bad_packages(section: str, packages) -> List[str]:
-    """Error rows for package entries that are not mappings; deploy fails the section."""
-    if not isinstance(packages, dict):
-        return []
-    return [
-        f"  ! {section}.packages.{name}: must be a mapping"
-        for name, info in packages.items()
-        if not isinstance(info, dict)
-    ]
+    """Config error rows for `<section>.packages`; deploy then runs nothing in the section."""
+    return [f"  ! {err}" for err in package_entries(section, packages)[1]]
 
 
 def _units_error(section: str, pkg: str, pkg_info) -> Optional[str]:
@@ -369,6 +364,8 @@ def _diff_pi(packages: Dict, paths: Dict, state: Dict):
 def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     from tools.user.mcp import (
         build_mcp_env,
+        config_scope,
+        foreign_servers,
         get_installed_mcp_servers,
         resolve_claude_cli,
         server_fingerprint,
@@ -392,17 +389,42 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     if current is None:
         return ["  ? failed to list MCP servers, cannot diff"]
     tracked_cfg = state.get("mcp", {}).get("servers", {})
-    for name in sorted(desired - current):
+    foreign = foreign_servers(servers, state)
+    for name in sorted(foreign):
+        changes.append(
+            f"{SKIPPED_ROW}{name} (registered outside tools, not in scope {foreign[name]}; "
+            "left alone)"
+        )
+    for name in sorted(desired - current - set(foreign)):
         changes.append(f"  + install {name}")
     for name in sorted(desired & managed & current):
         if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name]):
             changes.append(f"  ~ re-register {name}")
+    for name in sorted((desired & current) - managed - set(foreign)):
+        changes.append(
+            f"  ~ re-register {name} (registered outside tools; adopted if it is in scope "
+            f"{config_scope(servers[name])}, otherwise left alone)"
+        )
     for name in sorted((managed & current) - desired):
         changes.append(f"  - remove {name}")
     for name in sorted(managed - current - desired):
         changes.append(f"  ~ forget {name}")
 
     return changes
+
+
+def _git_local_work(path: str) -> bool:
+    """Read-only git queries deploy runs before an rmtree; any failure keeps the checkout."""
+    from tools.system_paths import system_bin, system_dir
+    from tools.user.git_repos import _has_local_work
+
+    try:
+        git_bin = system_bin("git")
+    except (KeyError, FileNotFoundError):
+        return True
+    env = os.environ.copy()
+    env["PATH"] = f"{system_dir('git')}:{env.get('PATH', '')}"
+    return _has_local_work(git_bin, path, env)
 
 
 def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
@@ -425,6 +447,11 @@ def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
         expanded = os.path.expanduser(dest)
         if os.path.exists(expanded) and not is_checkout(expanded):
             changes.append(f"  ~ release {dest} (not a git checkout, left in place)")
+        elif os.path.exists(expanded) and _git_local_work(expanded):
+            changes.append(
+                f"  ~ keep {dest} (uncommitted or unpushed work, or git cannot read it; "
+                "not removed)"
+            )
         else:
             changes.append(f"  - remove {dest} (deletes the checkout)")
     return changes
@@ -687,7 +714,11 @@ def show_diff(
         bun_packages = bun_config.get("packages", {})
         if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
             changes = _bad_packages("bun", bun_packages) or _diff_bun(
-                bun_packages, paths, state, {"configFile": bun_config.get("configFile")}, update
+                package_entries("bun", bun_packages)[0],
+                paths,
+                state,
+                {"configFile": bun_config.get("configFile")},
+                update,
             )
             if changes:
                 sections.append(("bun", changes))
@@ -697,7 +728,11 @@ def show_diff(
         npm_packages = npm_config.get("packages", {})
         if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
             changes = _bad_packages("npm", npm_packages) or _diff_npm(
-                npm_packages, paths, state, {"configFile": npm_config.get("configFile")}, update
+                package_entries("npm", npm_packages)[0],
+                paths,
+                state,
+                {"configFile": npm_config.get("configFile")},
+                update,
             )
             if changes:
                 sections.append(("npm", changes))
@@ -706,7 +741,7 @@ def show_diff(
         if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
             uv_packages = config.get("uv", {}).get("packages", {})
             changes = _bad_packages("uv", uv_packages) or _diff_uv(
-                uv_packages, paths, state, update
+                package_entries("uv", uv_packages)[0], paths, state, update
             )
             if changes:
                 sections.append(("uv", changes))
@@ -716,7 +751,7 @@ def show_diff(
         if config.get("go", {}).get("packages") or go_state.get("packages"):
             go_packages = config.get("go", {}).get("packages", {})
             changes = _bad_packages("go", go_packages) or _diff_go(
-                go_packages, paths, state, update
+                package_entries("go", go_packages)[0], paths, state, update
             )
             if changes:
                 sections.append(("go", changes))
@@ -726,7 +761,7 @@ def show_diff(
         if config.get("cargo", {}).get("packages") or cargo_state.get("packages"):
             cargo_packages = config.get("cargo", {}).get("packages", {})
             changes = _bad_packages("cargo", cargo_packages) or _diff_cargo(
-                cargo_packages, paths, state, update
+                package_entries("cargo", cargo_packages)[0], paths, state, update
             )
             if changes:
                 sections.append(("cargo", changes))
@@ -734,7 +769,9 @@ def show_diff(
     if "pi" in active:
         if config.get("pi", {}).get("packages") or state.get("pi", {}).get("packages"):
             pi_packages = config.get("pi", {}).get("packages", {})
-            changes = _bad_packages("pi", pi_packages) or _diff_pi(pi_packages, paths, state)
+            changes = _bad_packages("pi", pi_packages) or _diff_pi(
+                package_entries("pi", pi_packages)[0], paths, state
+            )
             if changes:
                 sections.append(("pi", changes))
 

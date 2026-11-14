@@ -77,6 +77,24 @@ def build_mcp_env(paths: Dict) -> Dict[str, str]:
     return env
 
 
+def config_scope(config: Dict) -> str:
+    """The scope a configured server is registered in, and removed from."""
+    return (config or {}).get("scope") or "user"
+
+
+def foreign_servers(servers: Dict, state: Dict) -> Dict[str, str]:
+    """Configured names registered outside tools in a scope other than the configured
+    one (name -> configured scope): left alone until that scope changes."""
+    recorded = state.get("mcp", {}).get("foreign") or {}
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        name: scope
+        for name, scope in recorded.items()
+        if name in servers and scope == config_scope(servers[name])
+    }
+
+
 def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     claude_cli = resolve_claude_cli(paths)
 
@@ -101,31 +119,43 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
         for name in desired & tracked & current
         if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name])
     }
+    # Registered outside tools under a configured name: tools owns it now. Its live
+    # definition is never read, so it is re-registered from config once. Only one
+    # registered in the configured scope is adopted: removing it there must succeed.
+    foreign = foreign_servers(servers, state)
+    adopted = (desired & current) - tracked - set(foreign)
+    for name in sorted(adopted):
+        log(f"Adopting {name}, registered outside tools", Color.YELLOW)
+    changed_cfg |= adopted
     to_install = (desired - current) | changed_cfg
     # Only servers we installed are ours to remove. `current - desired` would
     # take anything registered by hand or by another tool.
     to_remove = ((tracked & current) - desired) | changed_cfg
-    # Registered outside tools under a configured name: not ours to record,
-    # re-register or remove.
-    unowned = (desired & current) - tracked
-    for name in sorted(unowned):
-        log(f"{name} is registered outside tools, leaving it alone", Color.YELLOW)
-
     state_changed = False
     success = True
     failed: set = set()
     failed_removals: set = set()
+
+    def leave_foreign(name: str) -> None:
+        scope = config_scope(servers[name])
+        log(
+            f"{name} is registered outside tools, not in scope {scope}; left alone",
+            Color.YELLOW,
+        )
+        foreign[name] = scope
 
     if to_remove:
         log(f"Removing MCP servers: {', '.join(to_remove)}", Color.RED)
         for server_name in to_remove:
             # Remove from the scope the server was registered under — a
             # hardcoded `-s user` can never remove local/project servers.
-            scope = (tracked_cfg.get(server_name) or {}).get("scope") or "user"
+            scope = config_scope(tracked_cfg.get(server_name) or servers.get(server_name))
             returncode, _, stderr = run_command(
                 [claude_cli, "mcp", "remove", server_name, "-s", scope], env
             )
-            if returncode != 0:
+            if returncode != 0 and server_name in adopted:
+                leave_foreign(server_name)
+            elif returncode != 0:
                 log(f"Failed to remove {server_name}: {stderr}", Color.RED)
                 success = False
                 failed_removals.add(server_name)
@@ -135,7 +165,9 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
 
     if to_install:
         log(f"Installing MCP servers: {', '.join(to_install)}", Color.GREEN)
-        for server_name in to_install:
+        for server_name in sorted(to_install):
+            if server_name in foreign:
+                continue
             server_config = servers[server_name]
 
             if server_config.get("command"):
@@ -196,17 +228,20 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                     cmd.append(server_config["url"])
 
             returncode, _, stderr = run_command(cmd, env)
-            if returncode != 0:
-                if "already exists" in stderr:
-                    log(
-                        f"{server_name} already exists, marking as installed",
-                        Color.BLUE,
-                    )
-                else:
-                    log(f"Failed to install {server_name}: {stderr}", Color.RED)
-                    success = False
-                    failed.add(server_name)
+            if returncode != 0 and "already exists" in stderr:
+                # Registered without showing in `mcp list`: adopt it the same way.
+                log(f"Adopting {server_name}, registered outside tools", Color.YELLOW)
+                scope = config_scope(server_config)
+                rc, _, _ = run_command([claude_cli, "mcp", "remove", server_name, "-s", scope], env)
+                if rc != 0:
+                    leave_foreign(server_name)
                     continue
+                returncode, _, stderr = run_command(cmd, env)
+            if returncode != 0:
+                log(f"Failed to install {server_name}: {stderr}", Color.RED)
+                success = False
+                failed.add(server_name)
+                continue
             else:
                 log(f"Installed {server_name}", Color.GREEN)
                 state_changed = True
@@ -214,12 +249,17 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     if not to_install and not to_remove:
         debug("All MCP servers already installed", Color.BLUE)
 
-    if state_changed or set(state.get("mcp", {}).get("servers", {}).keys()) != desired - unowned:
+    if foreign:
+        state.setdefault("mcp", {})["foreign"] = foreign
+    else:
+        state.get("mcp", {}).pop("foreign", None)
+    tracked_now = set(state.get("mcp", {}).get("servers", {}).keys())
+    if state_changed or tracked_now != desired - set(foreign):
         # A server whose `mcp add` failed is not installed; recording it as
         # such would hide the failure from the next run's diff.
         new_servers = {}
         for name, config in servers.items():
-            if name in failed or name in unowned:
+            if name in failed or name in foreign:
                 continue
             if name in failed_removals and name in tracked_cfg:
                 # Re-register whose removal failed: the old registration is

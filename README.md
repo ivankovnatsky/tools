@@ -24,8 +24,10 @@ tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--a
   version, source, commit or ref) or whose declared `binary:` is missing (`npm`,
   `uv`, `go`) and converges config files. `--update`
   additionally upgrades what is already there, combined with `--scope` like any
-  other run (`--scope gitRepos --update` only pulls checkouts). `tools diff`
-  never shows these upgrades, and `watch` never runs them. With `--update`:
+  other run (`--scope gitRepos --update` only pulls checkouts). The preview of
+  `deploy --update` lists them (`~ upgrade`, `~ pull`, `~ refetch`, `~ run
+  onUpdate:`, ...), so it always asks; `tools diff` never shows them, and
+  `watch` never runs them. With `--update`:
   - `gitRepos`: `git pull --ff-only` in every tracked checkout.
   - `skills`: git sources are fetched and moved to the newest commit of their
     ref.
@@ -114,15 +116,20 @@ sudo "$(command -v tools)" deploy --config PATH   # sudo's secure_path may hide 
   `workingDirectory` falls under it is an error (other daemons still deploy).
   Root goes second because daemons and host settings run what the user phase
   installs (brew, uv).
-- Last, when root runs and `mgmt` has work: `mgmt` in another dropped child, so a
-  service it configures can be a daemon root just started.
+- Last, when root runs: `launchd` agents and (when it has work) `mgmt` in another
+  dropped child, so an agent's `restartOn` sees system files root just wrote and
+  a service `mgmt` configures can be a daemon root just started. Daemons owed a
+  `restartUnits` restart are restarted by root itself, once: a daemon root
+  creates, updates or reactivates starts fresh and is not kickstarted again.
+  The user's state file is moved from a legacy location before root reads it.
 - `PATH` in the user child is the one sudo passed, with these added in front when
   they exist and are missing: `~/.local/bin`, `/opt/homebrew/bin`,
   `/opt/homebrew/sbin`, `/usr/local/bin`; `/usr/bin:/bin:/usr/sbin:/sbin` go
   last when missing. Shell rc files are never read.
 - Both diffs are shown first (root's, then the user's from a short-lived
-  dropped child) and one prompt covers both. A failed phase stops the phases
-  after it; a failure in any exits non-zero.
+  dropped child) and one prompt covers both. A failed phase stops the root
+  phase and `mgmt` after it; agents still run, as in a plain deploy. A failure
+  in any exits non-zero.
 - `--scope` restricts both phases; a scope without `files`, `launchd`,
   `defaults`, `settingsctl` or `users` skips the root phase. `sudo tools diff` shows both diffs the same way.
   `watch` and `reconcile` refuse root.
@@ -1218,6 +1225,13 @@ a unique temp file beside the state and are renamed into place.
   official Homebrew installer — both execute remote code you declared in config.
 - `sops` and `templates` never log, diff or persist secret values; see their
   sections for exactly what is shown.
+- An MCP server already registered under a configured name is adopted when it
+  is registered in the configured `scope` (default `user`): it is re-registered
+  from config once (its live definition is not read), then re-registered when
+  its config changes and removed when dropped from config. One registered in
+  another scope cannot be removed there; it is left alone with a warning and
+  remembered (`= skip` in diff) until the configured scope changes. Servers
+  under other names are never touched.
 - MCP servers with secret headers substitute secrets from `secretPaths` files at
   register time. The `claude mcp add` CLI only accepts headers as argv, so the
   resolved secret is briefly visible in the process list while the command runs.

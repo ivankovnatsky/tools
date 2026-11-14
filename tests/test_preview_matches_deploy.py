@@ -268,6 +268,25 @@ class RemovalRowsTest(unittest.TestCase):
                     run(), [f"  ! {section}.packages.a: restartUnits must be a list of strings"]
                 )
 
+    def test_non_mapping_entry_deploys_nothing_in_its_section(self):
+        from tools.user import bun, cargo, go, pi, uv
+
+        calls = []
+        record = lambda *a, **k: calls.append(a) or (0, "", "")  # noqa: E731
+        state = {"npm": {"packages": {"old": {}}}}
+        for module, run in (
+            (npm, lambda p: npm.install_npm_packages(p, {}, state, {"configFile": "x"})),
+            (bun, lambda p: bun.install_bun_packages(p, {}, state, {"configFile": "x"})),
+            (uv, lambda p: uv.install_uv_packages(p, {}, state)),
+            (go, lambda p: go.install_go_packages(p, {}, state)),
+            (cargo, lambda p: cargo.install_cargo_packages(p, {}, state)),
+            (pi, lambda p: pi.install_pi_packages(p, {}, state)),
+        ):
+            with self.subTest(module.__name__), mock.patch.object(module, "run_command", record):
+                self.assertFalse(_quiet(run, {"ruff": "1.0", "ok": {}}))
+        self.assertEqual(calls, [])
+        self.assertEqual(state, {"npm": {"packages": {"old": {}}}})
+
     def test_non_mapping_package_entry_is_an_error_row(self):
         for section in ("npm", "bun", "uv", "go", "cargo", "pi"):
             with self.subTest(section):
@@ -276,7 +295,9 @@ class RemovalRowsTest(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     clean = diff_mod.show_diff(config, "/tmp", (section,))
                 self.assertFalse(clean)
-                self.assertIn(f"! {section}.packages.ruff: must be a mapping", out.getvalue())
+                self.assertIn(
+                    f"! {section}.packages.ruff must be a mapping, got str", out.getvalue()
+                )
 
 
 class NpmPreviewTest(unittest.TestCase):
@@ -345,9 +366,36 @@ class GitReposTest(unittest.TestCase):
                 [f"  ~ release {d} (not a git checkout, left in place)"],
             )
             os.makedirs(os.path.join(d, ".git"))
+            with mock.patch.object(git_repos, "_has_local_work", return_value=False):
+                self.assertEqual(
+                    diff_mod._diff_git_repos({}, state), [f"  - remove {d} (deletes the checkout)"]
+                )
+
+    def test_release_and_keep_rows_match_deploy(self):
+        with tempfile.TemporaryDirectory() as d:
+            plain, unreadable = os.path.join(d, "plain"), os.path.join(d, "unreadable")
+            os.makedirs(plain)
+            os.makedirs(os.path.join(unreadable, ".git"))
+            state = {"gitRepos": {"installed": [plain, unreadable]}}
+            # git fails on the checkout: deploy keeps it, and so does the preview.
+            failing = lambda cmd, env=None, cwd=None: (128, "", "fatal")  # noqa: E731
+            with (
+                mock.patch.object(git_repos, "run_command", side_effect=failing),
+                mock.patch.object(git_repos, "system_bin", return_value="git"),
+                mock.patch("tools.system_paths.system_bin", return_value="git"),
+            ):
+                rows = diff_mod._diff_git_repos({}, state)
+                self.assertTrue(_quiet(git_repos.install_git_repos, {}, state))
             self.assertEqual(
-                diff_mod._diff_git_repos({}, state), [f"  - remove {d} (deletes the checkout)"]
+                rows,
+                [
+                    f"  ~ release {plain} (not a git checkout, left in place)",
+                    f"  ~ keep {unreadable} (uncommitted or unpushed work, or git cannot "
+                    "read it; not removed)",
+                ],
             )
+            self.assertEqual(state["gitRepos"]["installed"], [unreadable])
+            self.assertTrue(os.path.isdir(plain) and os.path.isdir(unreadable))
 
 
 if __name__ == "__main__":
