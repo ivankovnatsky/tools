@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tools.diff import _diff_npm
 from tools.user import npm as npm_mod
 from tools.user.npm import install_npm_packages
 
@@ -77,6 +78,28 @@ class NpmPartialFailureTest(unittest.TestCase):
         self.assertFalse(result)
 
 
+class NpmBinaryTest(unittest.TestCase):
+    def test_missing_declared_binary_is_reinstalled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "codex").touch()
+            paths = {"nodejs": "/n", "npmBin": str(bin_dir)}
+            packages = {
+                "@openai/codex": {"binary": "codex"},
+                "@google/gemini-cli": {"binary": "gemini"},
+            }
+            state = {"npm": {"packages": {}, "prefix": str(bin_dir)}}
+            for pkg in packages:
+                state["npm"]["packages"][pkg] = {"installed": True, "version": "latest"}
+            with mock.patch.object(npm_mod, "run_command", return_value=(0, "", "")) as run:
+                self.assertTrue(install_npm_packages(packages, paths, state, {}))
+            self.assertEqual(
+                [c.args[0] for c in run.call_args_list],
+                [["/n/npm", "install", "-g", "@google/gemini-cli"]],
+            )
+
+
 class NpmUpdateTest(unittest.TestCase):
     def test_unpinned_packages_reinstall_only_with_update(self):
         paths = {"nodejs": "/n", "npmBin": "/nonexistent/bin"}
@@ -94,6 +117,21 @@ class NpmUpdateTest(unittest.TestCase):
             with mock.patch.object(npm_mod, "run_command", fake_run):
                 self.assertTrue(install_npm_packages(packages, paths, state, {}, update))
         self.assertEqual(installs, [["loose"]])
+
+
+class NpmDiffTest(unittest.TestCase):
+    def test_missing_binary_preview(self):
+        with tempfile.TemporaryDirectory() as bin_dir:
+            (Path(bin_dir) / "codex").touch()
+            packages = {
+                "@openai/codex": {"binary": "codex"},
+                "@google/gemini-cli": {"binary": "gemini"},
+            }
+            state = {"npm": {"packages": {p: {"installed": True} for p in packages}}}
+
+            changes = _diff_npm(packages, {"npmBin": bin_dir}, state, {})
+
+        self.assertEqual(changes, ["  ~ reinstall @google/gemini-cli (binary gemini missing)"])
 
 
 if __name__ == "__main__":

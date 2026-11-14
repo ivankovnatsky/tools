@@ -1,6 +1,9 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from tools.diff import _diff_uv
 from tools.user.uv import _uv_commit_spec, install_uv_packages
 
 REPO = "git+https://github.com/ivankovnatsky/tools"
@@ -68,6 +71,27 @@ class UvInstallTest(unittest.TestCase):
         run.assert_not_called()
 
 
+class UvBinaryTest(unittest.TestCase):
+    def test_missing_declared_binary_is_force_reinstalled(self):
+        with tempfile.TemporaryDirectory() as bin_dir:
+            paths = {**PATHS, "uvBin": bin_dir}
+            (Path(bin_dir) / "ruff").touch()
+            packages = {"ruff": {"binary": "ruff"}, "osxphotos": {"binary": "osxphotos"}}
+            state = {"uv": {"context": f"{bin_dir}|/tooldir", "packages": {}}}
+            for pkg in packages:
+                state["uv"]["packages"][pkg] = {
+                    "installed": True,
+                    "version": "latest",
+                    "source": "",
+                }
+            with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")) as run:
+                self.assertTrue(install_uv_packages(packages, paths, state))
+            self.assertEqual(
+                [c.args[0] for c in run.call_args_list],
+                [["/uv/uv", "tool", "install", "osxphotos", "--force"]],
+            )
+
+
 class UvUpdateTest(unittest.TestCase):
     def test_unpinned_packages_upgrade_only_with_update(self):
         packages = {"loose": {}, "pinned": {"version": "1.0.0"}}
@@ -83,6 +107,18 @@ class UvUpdateTest(unittest.TestCase):
             with mock.patch("tools.user.uv.run_command", return_value=(0, "", "")) as run:
                 self.assertTrue(install_uv_packages(packages, PATHS, state, update))
             self.assertEqual([c.args[0] for c in run.call_args_list], expected)
+
+
+class UvDiffTest(unittest.TestCase):
+    def test_missing_binary_preview(self):
+        with tempfile.TemporaryDirectory() as bin_dir:
+            (Path(bin_dir) / "ruff").touch()
+            packages = {"ruff": {"binary": "ruff"}, "osxphotos": {"binary": "osxphotos"}}
+            state = {"uv": {"packages": {p: {"installed": True} for p in packages}}}
+
+            changes = _diff_uv(packages, {"uvBin": bin_dir}, state)
+
+        self.assertEqual(changes, ["  ~ reinstall osxphotos (binary osxphotos missing)"])
 
 
 if __name__ == "__main__":

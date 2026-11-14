@@ -16,6 +16,11 @@ from tools.util import (
 )
 
 
+def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
+    binary = pkg_info.get("binary")
+    return bool(binary) and not os.path.exists(os.path.join(os.path.expanduser(bin_dir), binary))
+
+
 def install_npm_packages(
     packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False
 ):
@@ -101,6 +106,7 @@ def install_npm_packages(
         if pkg in units and (
             pkg not in state_packages
             or version_changed(pkg, pkg_info, state, "npm")
+            or binary_missing(pkg_info, paths["npmBin"])
             or (update and pkg_unpinned(pkg_info))
         ):
             to_install.append(pkg_spec_full(pkg, pkg_info))

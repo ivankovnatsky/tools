@@ -32,6 +32,11 @@ def _uv_commit_spec(source: str, commit: str) -> str:
     return f"{base}@{commit}{sep}{fragment}"
 
 
+def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
+    binary = pkg_info.get("binary")
+    return bool(binary) and not os.path.exists(os.path.join(os.path.expanduser(bin_dir), binary))
+
+
 def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     desired = set(packages.keys())
 
@@ -85,12 +90,15 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
                 log(f"Removed: {pkg}", Color.GREEN)
                 tracked.pop(pkg, None)
 
-    # Install missing packages or reinstall on version change. Persist each
-    # success so a later failure does not discard progress.
+    # Install missing packages, reinstall on version change or when a declared
+    # binary is gone. Persist each success so a later failure does not discard
+    # progress.
     to_install = [
         pkg
         for pkg, pkg_info in packages.items()
-        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "uv")
+        if pkg not in state_packages
+        or version_changed(pkg, pkg_info, state, "uv")
+        or binary_missing(pkg_info, paths["uvBin"])
     ]
     units: Dict[str, list] = {}
     for pkg, pkg_info in packages.items():
@@ -114,7 +122,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
             else:
                 spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), source)
             cmd = [f"{paths['uv']}/uv", "tool", "install", spec]
-            # Force reinstall if already present but version changed
+            # Force reinstall if already present (version changed or binary gone)
             if pkg in state_packages:
                 cmd.append("--force")
             returncode, _, stderr = run_command(cmd, env)

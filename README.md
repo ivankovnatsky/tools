@@ -21,7 +21,8 @@ tools watch  --config PATH... [--scope SECTION]... [--only SECTION:NAME]... [--a
   deploys (state housekeeping, `--update` upgrades).
 - A plain deploy never upgrades anything already installed: it installs what is
   missing, removes what was dropped, reinstalls what changed in config (a new
-  version, source, commit or ref) and converges config files. `--update`
+  version, source, commit or ref) or whose declared `binary:` is missing (`npm`,
+  `uv`, `go`) and converges config files. `--update`
   additionally upgrades what is already there, combined with `--scope` like any
   other run (`--scope gitRepos --update` only pulls checkouts). `tools diff`
   never shows these upgrades, and `watch` never runs them. With `--update`:
@@ -1198,8 +1199,10 @@ All services:
 Deploy records what it installs in the state file and only ever removes what it
 recorded — anything installed by hand is never touched (the one opt-in
 exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
-config removes it from the system on the next deploy (where an uninstall exists;
-`go`, `cargo` and `curlShell` entries without `uninstall` only release tracking). Git checkout removal refuses to
+config removes it from the system on the next deploy (`go` deletes the binary it
+installed, `cargo` runs `cargo uninstall` and keeps the record for the next
+deploy when `cargo` is not on `PATH`; `curlShell` entries without `uninstall`
+only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
 
 Every deploy (including each `watch` run) holds an exclusive lock on

@@ -27,10 +27,12 @@ from tools.user.fetch import has_work as fetch_has_work
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.git_repos import is_checkout
+from tools.user.go import _resolve_go_bin
 from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
+from tools.user.npm import binary_missing
 from tools.user.ollama_models import diff_ollama_models
 from tools.user.plist import diff_plist
 from tools.user.plist import has_work as plist_has_work
@@ -113,6 +115,9 @@ def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict):
         elif version_changed(pkg, pkg_info, state, "npm"):
             changes.append(f"  ~ update {pkg}")
             changes += _notify_rows(pkg_info)
+        elif paths.get("npmBin") and binary_missing(pkg_info, paths["npmBin"]):
+            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
+            changes += _notify_rows(pkg_info)
 
     return changes
 
@@ -131,6 +136,9 @@ def _diff_uv(packages: Dict, paths: Dict, state: Dict):
         elif version_changed(pkg, pkg_info, state, "uv"):
             changes.append(f"  ~ update {pkg}")
             changes += _notify_rows(pkg_info)
+        elif paths.get("uvBin") and binary_missing(pkg_info, paths["uvBin"]):
+            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
+            changes += _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
         changes.append(f"  - remove {pkg}")
@@ -142,6 +150,9 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
     changes = []
     desired = set(packages.keys())
     state_packages = set(state.get("go", {}).get("packages", {}).keys())
+    go_bin = None
+    if any(pkg_info.get("binary") for pkg_info in packages.values()):
+        go_bin = _resolve_go_bin(paths)
 
     for pkg, pkg_info in packages.items():
         if pkg not in state_packages:
@@ -151,10 +162,16 @@ def _diff_go(packages: Dict, paths: Dict, state: Dict):
         elif version_changed(pkg, pkg_info, state, "go"):
             changes.append(f"  ~ update {pkg}")
             changes += _notify_rows(pkg_info)
+        elif (
+            go_bin
+            and pkg_info.get("binary")
+            and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
+        ):
+            changes.append(f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)")
+            changes += _notify_rows(pkg_info)
 
-    # Go has no uninstall; dropping a package leaves its binary in $GOBIN.
     for pkg in sorted(state_packages - desired):
-        changes.append(f"  - drop {pkg} (binary remains in $GOBIN)")
+        changes.append(f"  - remove {pkg}")
 
     return changes
 
@@ -174,7 +191,7 @@ def _diff_cargo(packages: Dict, paths: Dict, state: Dict):
             changes += _notify_rows(pkg_info)
 
     for pkg in sorted(state_packages - desired):
-        changes.append(f"  - drop {pkg} (binary remains in $CARGO_HOME/bin)")
+        changes.append(f"  - remove {pkg}")
 
     return changes
 

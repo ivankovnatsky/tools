@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from typing import Dict, List, Optional
@@ -40,9 +41,14 @@ def _cargo_env(paths: Dict) -> Dict[str, str]:
     env = os.environ.copy()
     if paths.get("cargoHome"):
         env["CARGO_HOME"] = os.path.expanduser(paths["cargoHome"])
-    if paths.get("cargoRoot"):
-        env["CARGO_INSTALL_ROOT"] = os.path.expanduser(paths["cargoRoot"])
+    # An inherited CARGO_INSTALL_ROOT would otherwise win over cargoHome.
+    if paths.get("cargoRoot") or paths.get("cargoHome"):
+        env["CARGO_INSTALL_ROOT"] = os.path.dirname(_resolve_cargo_bin(paths))
     return env
+
+
+class CrateRecordError(Exception):
+    """cargo's install record exists but cannot be read."""
 
 
 def _cargo_entry(pkg_info: Dict) -> Dict:
@@ -60,11 +66,13 @@ def _cargo_entry(pkg_info: Dict) -> Dict:
 def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     desired = set(packages.keys())
 
-    # Packages are only forgotten, never uninstalled (as with go), so a changed
-    # install dir cannot "release" anything; unchanged packages still need
-    # reinstalling into the new location.
+    # Unchanged packages still need reinstalling into a changed install dir.
     context = f"{paths.get('cargoRoot') or ''}|{paths.get('cargoHome') or ''}"
     context_changed = state.get("cargo", {}).get("context", context) != context
+    # Without configured paths the root comes from the environment, which can
+    # move between runs while the context above stays the same.
+    root = os.path.dirname(_resolve_cargo_bin(paths))
+    context_changed = context_changed or state.get("cargo", {}).get("root", root) != root
     if context_changed:
         log(
             "cargo install dir changed; reinstalling desired packages there "
@@ -79,18 +87,53 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
     tracked = dict(state_pkgs)
     success = True
 
-    # Dropping a package from config just forgets it here and leaves the
-    # binary in place.
+    # After an install dir change the binary sits in the old root, which
+    # `cargo uninstall` no longer looks at, so it is only forgotten.
     orphaned = sorted(state_packages - desired)
-    if orphaned:
-        cargo_bin_hint = _resolve_cargo_bin(paths) or "$CARGO_HOME/bin"
+    if orphaned and context_changed:
         log(
-            f"Dropping cargo packages from state (binaries remain in {cargo_bin_hint}, "
-            f"remove manually if unwanted): {', '.join(orphaned)}",
+            "Dropping cargo packages from state (binaries remain in the previous "
+            f"install dir, remove manually if unwanted): {', '.join(orphaned)}",
             Color.YELLOW,
         )
         for pkg in orphaned:
             tracked.pop(pkg, None)
+    elif orphaned:
+        log(f"Removing cargo packages: {', '.join(orphaned)}", Color.RED)
+        cargo_cmd = shutil.which("cargo")
+        if not cargo_cmd:
+            # Kept in state so the next run with cargo available removes them.
+            log(
+                "cargo binary not found on PATH, keeping cargo packages to remove "
+                f"next run: {', '.join(orphaned)}",
+                Color.YELLOW,
+            )
+        else:
+            cargo_env = _cargo_env(paths)
+            for pkg in orphaned:
+                entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+                try:
+                    name = _crate_name(pkg, entry, paths)
+                except CrateRecordError as e:
+                    log(f"Failed to remove cargo package {pkg}: {e}", Color.RED)
+                    success = False
+                    continue
+                if not name:
+                    log(
+                        f"Dropping cargo package {pkg} from state (not in cargo's "
+                        "install record, nothing to uninstall)",
+                        Color.YELLOW,
+                    )
+                    tracked.pop(pkg, None)
+                    continue
+                returncode, _, stderr = run_command([cargo_cmd, "uninstall", name], env=cargo_env)
+                # Already gone (removed by hand): nothing left to retry.
+                if returncode != 0 and "did not match any packages" not in stderr:
+                    log(f"Failed to remove cargo package {name}: {stderr}", Color.RED)
+                    success = False
+                    continue
+                log(f"Removed: {name}", Color.GREEN)
+                tracked.pop(pkg, None)
 
     units: Dict[str, list] = {}
     for pkg, pkg_info in packages.items():
@@ -122,11 +165,38 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
             if pkg not in units:
                 continue
             args = _install_args(pkg, packages[pkg])
+            old = tracked.get(pkg) if isinstance(tracked.get(pkg), dict) else None
+            # A different crate under the same key would leave the previous one
+            # behind; remove it first so a failure keeps the record to retry.
+            if old is not None and not context_changed:
+                try:
+                    old_name = _crate_name(pkg, old, paths)
+                    new_name = _crate_name(pkg, packages[pkg], paths)
+                except CrateRecordError as e:
+                    log(f"Failed to install cargo package {pkg}: {e}", Color.RED)
+                    success = False
+                    continue
+                same_repo = new_name is None and (get_pkg_source(old) or pkg) == (
+                    get_pkg_source(packages[pkg]) or pkg
+                )
+                # A new revision of the same repo replaces its crate in place.
+                if old_name and old_name != new_name and not same_repo:
+                    rc, _, err = run_command([cargo_cmd, "uninstall", old_name], env=cargo_env)
+                    if rc != 0 and "did not match any packages" not in err:
+                        log(f"Failed to remove old cargo package {old_name}: {err}", Color.RED)
+                        success = False
+                        continue
+                    # Gone now: if the install below fails, the next run retries it.
+                    tracked.pop(pkg, None)
             cmd = [cargo_cmd, "install", *args]
             returncode, _, stderr = run_command(cmd, env=cargo_env)
             if returncode != 0:
                 log(f"Failed to install cargo package {' '.join(args)}: {stderr}", Color.RED)
                 success = False
+                # The old record belongs to the previous install dir; keeping
+                # it would mark the package installed here and never retry.
+                if context_changed:
+                    tracked.pop(pkg, None)
                 continue
             log(f"Installed: {' '.join(args)}", Color.GREEN)
             tracked[pkg] = _cargo_entry(packages[pkg])
@@ -142,8 +212,37 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
     if tracked != state_pkgs:
         state.setdefault("cargo", {})["packages"] = tracked
     state.setdefault("cargo", {})["context"] = context
+    state.setdefault("cargo", {})["root"] = root
 
     return success
+
+
+def _crate_name(pkg: str, pkg_info: Dict, paths: Dict) -> Optional[str]:
+    """Package name `cargo uninstall` expects, matching `_install_args`.
+
+    A `--git` install is named by the repo, not the config key, so it is
+    looked up in cargo's install record. None when it is not recorded there;
+    CrateRecordError when the record cannot be read.
+    """
+    source = get_pkg_source(pkg_info) or pkg
+    if not get_pkg_commit(pkg_info):
+        return source
+    commit = get_pkg_commit(pkg_info)
+    cargo_bin = _resolve_cargo_bin(paths)
+    record = os.path.join(os.path.dirname(cargo_bin), ".crates2.json") if cargo_bin else ""
+    try:
+        with open(record) as f:
+            installs = json.load(f).get("installs", {})
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError) as e:
+        raise CrateRecordError(f"cannot read {record}: {e}") from e
+    # Keys look like "name 0.1.0 (git+https://host/repo.git?rev=abc#fullsha)".
+    for key in installs:
+        name, _, rest = key.partition(" ")
+        if f"(git+{source}?" in rest and f"rev={commit}#" in rest:
+            return name
+    return None
 
 
 def _install_args(pkg: str, pkg_info: Dict) -> List[str]:

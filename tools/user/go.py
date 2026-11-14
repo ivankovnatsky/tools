@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from typing import Dict, Optional
 
@@ -54,23 +55,52 @@ def _go_env(paths: Dict) -> Dict[str, str]:
     when set so the install dir matches the dir we scan for state.
     """
     env = os.environ.copy()
-    if paths.get("goBin"):
-        env["GOBIN"] = os.path.expanduser(paths["goBin"])
     if paths.get("goPath"):
         env["GOPATH"] = os.path.expanduser(paths["goPath"])
+    # An inherited GOBIN would otherwise win over the configured GOPATH.
+    if paths.get("goBin") or paths.get("goPath"):
+        env["GOBIN"] = _resolve_go_bin(paths)
     return env
 
 
-def _go_entry(pkg_info: Dict) -> Dict:
+def _go_binary(pkg: str, pkg_info: Dict) -> str:
+    """Executable name: declared `binary`, else what `go install` names it.
+
+    `go install` uses the last path element, skipping a `/vN` (N >= 2) major
+    version suffix (github.com/TwiN/gatus/v5 -> gatus).
+    """
+    declared = pkg_info.get("binary")
+    if declared:
+        return declared
+    parts = (get_pkg_source(pkg_info) or pkg).rstrip("/").split("/")
+    if len(parts) > 1 and re.fullmatch(r"v([2-9]|[1-9][0-9]+)", parts[-1]):
+        return parts[-2]
+    return parts[-1]
+
+
+def _go_entry(pkg_info: Dict, path: Optional[str]) -> Dict:
     entry = {
         "installed": True,
         "version": get_pkg_version(pkg_info),
         "source": get_pkg_source(pkg_info),
     }
+    if path:
+        entry["path"] = path
     commit = get_pkg_commit(pkg_info)
     if commit:
         entry["commit"] = commit
     return entry
+
+
+def _installed_path(pkg: str, entry: Dict, go_bin: Optional[str]) -> Optional[str]:
+    """Binary path to delete on removal, or None when it cannot be known."""
+    if entry.get("path"):
+        return entry["path"]
+    # Records from before paths were stored: only trust a configured dir, an
+    # env-derived one may have moved since the install.
+    if go_bin:
+        return os.path.join(go_bin, _go_binary(pkg, entry))
+    return None
 
 
 def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
@@ -95,19 +125,34 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
     tracked = dict(state_pkgs)
     success = True
 
-    # Go has no `go uninstall`; the only way to remove a tool is to delete its
-    # binary from $GOBIN by hand. We deliberately don't do that, so dropping a
-    # package from config just forgets it here and leaves the binary in place.
-    # This path never needs $GOBIN resolved, so don't fail on it here.
+    # Go has no `go uninstall`: removing a tool means deleting the binary it
+    # installed. Without a known path it is only forgotten.
     orphaned = sorted(state_packages - desired)
     if orphaned:
-        go_bin_hint = _resolve_go_bin(paths) or "$GOBIN"
-        log(
-            f"Dropping Go packages from state (binaries remain in {go_bin_hint}, "
-            f"remove manually if unwanted): {', '.join(orphaned)}",
-            Color.YELLOW,
-        )
+        legacy_bin = None
+        if not context_changed and (paths.get("goBin") or paths.get("goPath")):
+            legacy_bin = _resolve_go_bin(paths)
         for pkg in orphaned:
+            entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+            path = _installed_path(pkg, entry, legacy_bin)
+            if not path:
+                log(
+                    f"Dropping Go package {pkg} from state (install path unknown, "
+                    "binary not removed)",
+                    Color.YELLOW,
+                )
+                tracked.pop(pkg, None)
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                # Keep it tracked so the next run retries the removal.
+                log(f"Failed to remove Go package {pkg} ({path}): {e}", Color.RED)
+                success = False
+                continue
+            log(f"Removed: {pkg} ({path})", Color.GREEN)
             tracked.pop(pkg, None)
 
     units: Dict[str, list] = {}
@@ -120,11 +165,25 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
             log(str(e), Color.RED)
             success = False
 
+    # A declared binary that is gone from the install dir is reinstalled.
+    missing_binary = set()
+    if any(pkg_info.get("binary") for pkg_info in packages.values()):
+        go_bin = _resolve_go_bin(paths)
+        if go_bin:
+            missing_binary = {
+                pkg
+                for pkg, pkg_info in packages.items()
+                if pkg in state_packages
+                and pkg_info.get("binary")
+                and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
+            }
+
     to_install = [
         pkg
         for pkg, pkg_info in packages.items()
         if pkg not in state_packages
         or context_changed
+        or pkg in missing_binary
         or version_changed(pkg, pkg_info, state, "go")
         or (update and pkg_unpinned(pkg_info))
     ]
@@ -149,23 +208,43 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
             if pkg not in units:
                 continue
             spec = _install_spec(pkg, packages[pkg])
+            new_path = os.path.join(go_bin, _go_binary(pkg, packages[pkg]))
+            old = tracked.get(pkg) if isinstance(tracked.get(pkg), dict) else {}
+            old_path = old.get("path")
+            # A changed source or binary name would leave the previous binary
+            # behind; remove it first so a failure keeps the record to retry.
+            if not context_changed and old_path and old_path != new_path:
+                try:
+                    os.remove(old_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    log(f"Failed to remove old Go binary {old_path}: {e}", Color.RED)
+                    success = False
+                    continue
+                # Gone now: if the install below fails, the next run retries it.
+                tracked.pop(pkg, None)
             cmd = [go_cmd, "install", spec]
             returncode, _, stderr = run_command(cmd, env=go_env)
             if returncode != 0:
                 log(f"Failed to install Go package {spec}: {stderr}", Color.RED)
                 success = False
+                # The old record belongs to the previous install dir; keeping
+                # it would mark the package installed here and never retry.
+                if context_changed:
+                    tracked.pop(pkg, None)
                 continue
             log(f"Installed: {spec}", Color.GREEN)
-            tracked[pkg] = _go_entry(packages[pkg])
+            tracked[pkg] = _go_entry(packages[pkg], new_path)
             secrets_flow.owe_restarts(state, units[pkg], f"go/{pkg}")
     elif not orphaned:
         debug("All Go packages already installed", Color.BLUE)
 
-    # Refresh metadata for desired packages already installed and unchanged
-    # (drops any legacy fields such as the old "binary").
+    # Refresh metadata for desired packages already installed and unchanged.
     for pkg, pkg_info in packages.items():
         if pkg in tracked and pkg not in to_install:
-            tracked[pkg] = _go_entry(pkg_info)
+            old = tracked[pkg] if isinstance(tracked[pkg], dict) else {}
+            tracked[pkg] = _go_entry(pkg_info, old.get("path"))
 
     if tracked != state_pkgs:
         state.setdefault("go", {})["packages"] = tracked
