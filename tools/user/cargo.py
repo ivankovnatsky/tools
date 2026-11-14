@@ -238,11 +238,15 @@ def _crate_name(pkg: str, pkg_info: Dict, paths: Dict) -> Optional[str]:
     except (OSError, ValueError, AttributeError) as e:
         raise CrateRecordError(f"cannot read {record}: {e}") from e
     # Keys look like "name 0.1.0 (git+https://host/repo.git?rev=abc#fullsha)".
+    names = []
     for key in installs:
         name, _, rest = key.partition(" ")
         if f"(git+{source}?" in rest and f"rev={commit}#" in rest:
-            return name
-    return None
+            names.append(name)
+    # One repo and rev can hold several installed crates; the key names it.
+    if pkg in names:
+        return pkg
+    return names[0] if len(names) == 1 else None
 
 
 def _install_args(pkg: str, pkg_info: Dict) -> List[str]:

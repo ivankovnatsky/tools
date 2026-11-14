@@ -35,6 +35,31 @@ class CargoRemovalTest(unittest.TestCase):
         self.assertEqual(calls, [(["uninstall", "genpass"], "/c")])
         self.assertEqual(set(state["cargo"]["packages"]), {"ripgrep"})
 
+    def test_dropping_one_crate_of_a_shared_repo_uninstalls_that_crate(self):
+        src = "https://example.com/x.git"
+        with tempfile.TemporaryDirectory() as root:
+            record = {
+                "installs": {
+                    f"crate-a 0.1.0 (git+{src}?rev=abc#abcdef)": {},
+                    f"crate-b 0.1.0 (git+{src}?rev=abc#abcdef)": {},
+                }
+            }
+            Path(root, ".crates2.json").write_text(json.dumps(record))
+            entry = {"installed": True, "version": "latest", "source": src, "commit": "abc"}
+            state = {
+                "cargo": {
+                    "context": f"{root}|",
+                    "root": root,
+                    "packages": {"crate-a": dict(entry), "crate-b": dict(entry)},
+                }
+            }
+            keep = {"crate-a": {"source": src, "commit": "abc"}}
+            success, calls = self._run(keep, {"cargoRoot": root}, state)
+
+        self.assertTrue(success)
+        self.assertEqual([c[0] for c in calls], [["uninstall", "crate-b"]])
+        self.assertEqual(set(state["cargo"]["packages"]), {"crate-a"})
+
     def test_uninstall_name_matches_install(self):
         with tempfile.TemporaryDirectory() as root:
             record = {
