@@ -14,7 +14,7 @@ Script = Tuple[str, Optional[str]]
 
 def parse(raw) -> Tuple[Dict[str, Script], List[str]]:
     """Map each url to (shell, uninstall command or None), plus config errors."""
-    if not raw:
+    if raw is None:
         return {}, []
     if not isinstance(raw, Mapping):
         return {}, [f"curlShell must be a mapping of url -> shell, got {type(raw).__name__}"]
@@ -59,7 +59,7 @@ def install_curl_shell_scripts(raw: Dict, state: Dict):
     section = state.get("curlShell", {})
     installed = set(section.get("installed", []))
     recorded = dict(section.get("uninstall", {}))
-    if not raw and not installed:
+    if raw is None and not installed:
         return True
 
     scripts, errors = parse(raw)

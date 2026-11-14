@@ -155,6 +155,20 @@ class CurlShellTest(unittest.TestCase):
         self.assertEqual(self.uninstalls, [])
         self.assertEqual(state["curlShell"]["installed"], ["https://example/x.sh"])
 
+    def test_non_mapping_section_refuses_and_keeps_state(self):
+        for raw in ([], False, "x"):
+            with self.subTest(raw=raw):
+                record = {
+                    "installed": ["https://example/x.sh"],
+                    "uninstall": {"https://example/x.sh": "rm ~/.x"},
+                }
+                state = {"curlShell": dict(record)}
+
+                self.assertFalse(self._run(raw, state))
+
+                self.assertEqual(self.uninstalls, [])
+                self.assertEqual(state["curlShell"], record)
+
 
 class CurlShellDiffTest(unittest.TestCase):
     def test_rows(self):

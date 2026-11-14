@@ -723,7 +723,7 @@ def _run_sections(
     if "curlShell" in active and (
         config.get("curlShell") or state.get("curlShell", {}).get("installed")
     ):
-        success &= install_curl_shell_scripts(config.get("curlShell") or {}, state)
+        success &= install_curl_shell_scripts(config.get("curlShell"), state)
 
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
     # with nothing configured raises KeyError on a machine show_diff calls
