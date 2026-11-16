@@ -592,10 +592,7 @@ def install_fetch(
                 log(f"fetch: not removing {target}: {kept}; still tracked", Color.YELLOW)
                 continue
             try:
-                if _is_real_dir(target):
-                    _force_rmtree(target)
-                else:
-                    os.remove(target)
+                fsutil.trash(target)
             except OSError as err:
                 log(f"fetch: failed to remove {target}: {err}", Color.RED)
                 success = False

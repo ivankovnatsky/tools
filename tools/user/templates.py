@@ -457,7 +457,7 @@ def apply(
             installed.pop(target, None)
         for target in p.remove:
             try:
-                os.remove(target)
+                fsutil.trash(target)
             except OSError as e:
                 log(f"templates: failed to remove {target}: {e}", Color.RED)
                 res.success = False

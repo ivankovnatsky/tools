@@ -728,7 +728,7 @@ def apply(
             installed.pop(path, None)
         for path in p.remove:
             try:
-                os.remove(path)
+                fsutil.trash(path)
             except OSError as e:
                 log(f"sops: failed to remove {path}: {e}", Color.RED)
                 res.success = False

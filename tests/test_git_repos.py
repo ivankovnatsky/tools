@@ -3,8 +3,13 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools import diff as diff_mod
 from tools.user import git_repos
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 class FakeGit:
@@ -60,7 +65,7 @@ class GitReposRemovalTest(unittest.TestCase):
             mock.patch.object(git_repos, "system_bin", return_value="git"),
             mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
             mock.patch.object(git_repos, "run_command", fake.run),
-            mock.patch.object(git_repos.shutil, "rmtree", side_effect=removed.append),
+            mock.patch.object(git_repos.fsutil, "trash", side_effect=removed.append),
         ):
             return git_repos.install_git_repos(repos, state)
 
@@ -76,7 +81,7 @@ class GitReposRemovalTest(unittest.TestCase):
             self.assertEqual(state["gitRepos"]["installed"], [])
 
     def test_repo_with_uncommitted_work_is_kept(self):
-        # Removal is an rmtree; uncommitted work would be unrecoverable.
+        # Uncommitted work must not be removed, even to the Trash.
         with tempfile.TemporaryDirectory() as d:
             os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
@@ -97,8 +102,8 @@ class GitReposRemovalTest(unittest.TestCase):
             self.assertEqual(removed, [])
 
     def test_repo_with_stashed_work_is_kept(self):
-        # Stash entries are neither status output nor branch commits; rmtree
-        # would delete them silently.
+        # Stash entries are neither status output nor branch commits; removal
+        # would take them silently.
         with tempfile.TemporaryDirectory() as d:
             os.mkdir(os.path.join(d, ".git"))
             state = {"gitRepos": {"installed": [d]}}
@@ -123,7 +128,7 @@ class GitReposRemovalTest(unittest.TestCase):
             self.assertIn("--all", log_cmds[0])
             self.assertNotIn("--branches", log_cmds[0])
 
-    def test_failed_rmtree_keeps_repo_tracked(self):
+    def test_failed_trash_keeps_repo_tracked(self):
         # A stubborn checkout must not abort the deploy, and must stay in
         # state so the next run retries.
         with tempfile.TemporaryDirectory() as d:
@@ -137,7 +142,7 @@ class GitReposRemovalTest(unittest.TestCase):
                 mock.patch.object(git_repos, "system_bin", return_value="git"),
                 mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
                 mock.patch.object(git_repos, "run_command", FakeGit().run),
-                mock.patch.object(git_repos.shutil, "rmtree", side_effect=boom),
+                mock.patch.object(git_repos.fsutil, "trash", side_effect=boom),
             ):
                 result = git_repos.install_git_repos({}, state)
 
@@ -225,7 +230,7 @@ class GitReposUpdateTest(unittest.TestCase):
             )
 
     def test_non_repo_directory_is_not_marked_installed(self):
-        # Marking it installed would make it an rmtree candidate later.
+        # Marking it installed would make it a removal candidate later.
         with tempfile.TemporaryDirectory() as d:
             state = {}
             fake = FakeGit()
@@ -239,7 +244,7 @@ class GitReposDiffTest(unittest.TestCase):
     def test_dropped_section_is_previewed_at_top_level(self):
         # show_diff must gate gitRepos on config OR state, exactly like
         # _deploy: deleting the whole gitRepos block previously previewed
-        # "clean" while deploy --approve rmtree'd every tracked checkout.
+        # "clean" while deploy --approve trashed every tracked checkout.
         import json
 
         with tempfile.TemporaryDirectory() as d:
@@ -254,7 +259,7 @@ class GitReposDiffTest(unittest.TestCase):
         self.assertFalse(clean)
 
     def test_removal_is_previewed(self):
-        # rmtree with no preview line is the one missing diff entry that
+        # A removal with no preview line is the one missing diff entry that
         # costs data rather than clarity.
         state = {"gitRepos": {"installed": ["~/repo"]}}
 

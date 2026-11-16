@@ -414,7 +414,7 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
 
 
 def _git_local_work(path: str) -> bool:
-    """Read-only git queries deploy runs before an rmtree; any failure keeps the checkout."""
+    """Read-only git queries deploy runs before trashing a checkout; any failure keeps it."""
     from tools.system_paths import system_bin, system_dir
     from tools.user.git_repos import _has_local_work
 
@@ -440,7 +440,7 @@ def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
             changes.append(f"  + track {dest}")
         elif update:
             changes.append(f"  ~ pull {dest}")
-    # Removal is an rmtree of the whole checkout, so it must never reach the
+    # Removal trashes the whole checkout, so it must never reach the
     # user as a surprise — this is the one section where a missing preview
     # line costs data rather than a confusing diff.
     for dest in sorted(installed - set(git_repos)):
@@ -856,7 +856,7 @@ def show_diff(
     secrets(secrets_flow.EARLY if inside else None)
 
     # Gate on state too: dropping the whole gitRepos block is exactly the
-    # case where deploy rmtrees every tracked checkout — that must never be
+    # case where deploy trashes every tracked checkout — that must never be
     # invisible in the preview.
     if "gitRepos" in active and (
         config.get("gitRepos") or state.get("gitRepos", {}).get("installed")

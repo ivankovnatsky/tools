@@ -5,8 +5,13 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools import cli, diff, privilege
 from tools.user import files
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 def _write(path, content, mode=0o644):

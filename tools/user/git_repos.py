@@ -1,7 +1,7 @@
 import os
-import shutil
 from typing import Dict
 
+from tools import fsutil
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_dir
 from tools.util import run_command
@@ -23,7 +23,8 @@ def is_checkout(path: str) -> bool:
 def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
     """True if the worktree has uncommitted changes or unpushed commits.
 
-    Removal is an rmtree, so anything not on a remote is gone for good.
+    Removal trashes the whole checkout; anything not on a remote then lives
+    only in the Trash.
     A repo we cannot interrogate counts as having work — refusing to
     delete costs a stale directory, deleting costs the work itself.
     """
@@ -32,7 +33,7 @@ def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
         return True
     if stdout.strip():
         return True
-    # Stash entries are neither status output nor branch commits; rmtree
+    # Stash entries are neither status output nor branch commits; removal
     # would delete them silently.
     rc, stdout, _ = run_command([git_bin, "-C", path, "stash", "list"], env)
     if rc != 0 or stdout.strip():
@@ -100,7 +101,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
                 continue
             log(f"Removing git repo: {dest_path}", Color.RED)
             try:
-                shutil.rmtree(expanded_path)
+                fsutil.trash(expanded_path)
             except OSError as e:
                 # Keep it tracked so the next run retries, and don't let one
                 # stubborn checkout abort the whole deploy (unsaved state).
@@ -117,7 +118,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
         if os.path.exists(expanded_path):
             # Only a real checkout gets pulled and recorded. An arbitrary
             # directory at that path is not a repo we manage, and marking it
-            # installed would make it an rmtree candidate later.
+            # installed would make it a removal candidate later.
             if not is_checkout(expanded_path):
                 log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
                 success = False

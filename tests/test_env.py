@@ -5,9 +5,14 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools import cli
 from tools.config import ConfigError, resolve_config
 from tools.user import env, secrets_flow
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 class FakeLaunchctl:

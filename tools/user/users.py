@@ -33,7 +33,7 @@ import stat
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
-from tools import privilege
+from tools import fsutil, privilege
 from tools.log import Color, log
 from tools.util import run_command
 
@@ -41,7 +41,6 @@ KEYS = ("uid", "shell", "create", "deleteHome")
 SHELLS_FILE = "/etc/shells"
 DSCL = "/usr/bin/dscl"
 CREATEHOMEDIR = "/usr/sbin/createhomedir"
-RM = "/bin/rm"
 MIN_UID = 501
 STAFF_GID = 20
 DEFAULT_SHELL = "/bin/zsh"
@@ -436,7 +435,12 @@ def _remove_home(name: str, rec: Dict, run: Callable) -> bool:
             Color.RED,
         )
         return False
-    why = _fail(run, [RM, "-rf", "--", home])
+    try:
+        argv = fsutil.trash_argv(home)
+    except OSError as e:
+        log(f"users: removing {home} failed: {e}", Color.RED)
+        return False
+    why = _fail(run, argv)
     if why:
         log(f"users: removing {home} failed: {why}", Color.RED)
         return False

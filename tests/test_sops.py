@@ -9,10 +9,14 @@ import unittest
 from unittest import mock
 
 import ssh_keys
+import trash_fake
 
 from tools import fsutil
 from tools.placeholders import PlaceholderError
 from tools.user import secrets_flow, sops
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 SECRET_VALUE = "hunter2-very-secret"
 

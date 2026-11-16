@@ -5,10 +5,13 @@ import grp
 import hashlib
 import os
 import pwd
+import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 _NO_LINK_ERRNOS = {
     errno.EPERM,
@@ -384,6 +387,51 @@ def move_aside(path: str) -> Optional[str]:
         ) from None
     os.unlink(path)
     return dest
+
+
+MACOS_TRASH = "/usr/bin/trash"
+
+
+class TrashError(OSError):
+    """Moving a path to the Trash failed, or no trash tool is available."""
+
+
+def trash_argv(path: str) -> List[str]:
+    """Command that moves ``path`` to the invoking user's Trash.
+
+    macOS: ``/usr/bin/trash`` (macOS 15+). Linux: ``gio trash``, else
+    ``trash-put``. The path is made absolute, so it is never read as an option.
+    """
+    path = os.path.abspath(path)
+    if sys.platform == "darwin":
+        if os.path.exists(MACOS_TRASH):
+            return [MACOS_TRASH, path]
+        raise TrashError(errno.ENOENT, f"{MACOS_TRASH} not found (needs macOS 15+)", path)
+    gio = shutil.which("gio")
+    if gio:
+        return [gio, "trash", path]
+    trash_put = shutil.which("trash-put")
+    if trash_put:
+        return [trash_put, path]
+    raise TrashError(errno.ENOENT, "no trash tool found (need gio or trash-put on PATH)", path)
+
+
+def trash(path: str) -> bool:
+    """Move ``path`` (a file, a directory tree, or a symlink itself, dangling or
+    not) to the Trash. False if nothing is there; raises TrashError on failure."""
+    if not os.path.lexists(path):
+        return False
+    argv = trash_argv(path)
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        raise TrashError(e.errno, f"cannot run {argv[0]}: {e.strerror}", path) from None
+    if result.returncode != 0:
+        why = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        raise TrashError(errno.EIO, f"{os.path.basename(argv[0])} failed: {why}", path)
+    if os.path.lexists(path):
+        raise TrashError(errno.EIO, f"{os.path.basename(argv[0])} left it in place", path)
+    return True
 
 
 def aside_note(path: str, reason: str) -> str:

@@ -15,6 +15,7 @@ from tools.fsutil import (
     respell,
     same_file_as,
     same_identity,
+    trash,
 )
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
@@ -945,7 +946,7 @@ def install_files(
                     if is_dir:
                         os.rmdir(os.path.normpath(target))
                     else:
-                        os.remove(target)
+                        trash(target)
                     log(f"Removed: {target}", Color.RED)
                     changed = True
                 except OSError as e:

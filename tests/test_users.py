@@ -4,9 +4,14 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools import cli, diff, privilege
 from tools.config import TOP_LEVEL_KEYS
 from tools.user import users
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 FISH = "/opt/homebrew/bin/fish"
 MINI = {"ivan": {"uid": 502, "shell": FISH}}
@@ -490,7 +495,7 @@ class CreateDeleteInstallTest(unittest.TestCase):
         with mock.patch.object(users.os, "lstat", return_value=st):
             ok, commands = self._install({}, state, account("guest", 600))
         self.assertTrue(ok)
-        self.assertEqual(commands[-1], ["/bin/rm", "-rf", "--", "/Users/guest"])
+        self.assertEqual(commands[-1], users.fsutil.trash_argv("/Users/guest"))
 
     def test_keeps_home_not_owned_by_account(self):
         self.local["guest"] = 600

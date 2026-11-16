@@ -3,6 +3,7 @@ import re
 import shutil
 from typing import Dict, Optional
 
+from tools import fsutil
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
 from tools.util import (
@@ -160,9 +161,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
                 tracked.pop(pkg, None)
                 continue
             try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+                fsutil.trash(path)
             except OSError as e:
                 # Keep it tracked so the next run retries the removal.
                 log(f"Failed to remove Go package {pkg} ({path}): {e}", Color.RED)
@@ -231,9 +230,7 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
             # behind; remove it first so a failure keeps the record to retry.
             if not context_changed and old_path and old_path != new_path:
                 try:
-                    os.remove(old_path)
-                except FileNotFoundError:
-                    pass
+                    fsutil.trash(old_path)
                 except OSError as e:
                     log(f"Failed to remove old Go binary {old_path}: {e}", Color.RED)
                     success = False

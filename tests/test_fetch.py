@@ -9,9 +9,14 @@ import unittest
 import urllib.error
 from unittest import mock
 
+import trash_fake
+
 from tools import cli, diff
 from tools.user import fetch, secrets_flow
 from tools.user.files import _record as files_record
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 URL = "https://example.com/uk.utf-8.spl"
 

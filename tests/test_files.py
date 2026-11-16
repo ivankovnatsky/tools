@@ -6,7 +6,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools.user import files
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 class ParseModeTest(unittest.TestCase):
@@ -57,6 +62,14 @@ class FilesCleanupTest(unittest.TestCase):
 
             self.assertFalse(os.path.exists(target))
             self.assertNotIn(target, state["files"])
+            trashed = [
+                os.path.join(trash_fake.trash_dir(), n) for n in os.listdir(trash_fake.trash_dir())
+            ]
+            contents = []
+            for path in trashed:
+                with open(path) as f:
+                    contents.append(f.read())
+            self.assertIn("ours\n", contents)
 
     def test_locally_modified_file_is_kept(self):
         # The stored hash is the only evidence of who last wrote the file;
@@ -80,7 +93,7 @@ class FilesCleanupTest(unittest.TestCase):
             digest = _write(target, "ours\n")
             state = {"files": {target: {"hash": digest}}}
 
-            with mock.patch.object(files.os, "remove", side_effect=OSError("denied")):
+            with mock.patch.object(files, "trash", side_effect=OSError("denied")):
                 files.install_files([], d, state)
 
             self.assertIn(target, state["files"])

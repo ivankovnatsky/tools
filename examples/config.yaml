@@ -89,7 +89,7 @@ curlShell: {}
   #   https://example.test/install.sh: bash
   #   https://example.test/other.sh:
   #     shell: bash
-  #     uninstall: rm -rf ~/.other
+  #     uninstall: trash ~/.other
 
 gitRepos: {}
 

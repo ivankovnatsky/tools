@@ -3,8 +3,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import trash_fake
+
 from tools.diff import _diff_go
 from tools.user.go import _go_binary, _go_env, install_go_packages
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 class GoBinaryNameTest(unittest.TestCase):
@@ -162,7 +167,7 @@ class GoRemovalTest(unittest.TestCase):
 
     def test_failed_removal_stays_tracked(self):
         state = {"go": {"packages": {"rclone": {"installed": True}}}}
-        with mock.patch("tools.user.go.os.remove", side_effect=PermissionError("denied")):
+        with mock.patch("tools.user.go.fsutil.trash", side_effect=PermissionError("denied")):
             success = install_go_packages({}, {"goBin": "/gobin"}, state)
         self.assertFalse(success)
         self.assertIn("rclone", state["go"]["packages"])
@@ -269,7 +274,7 @@ class GoReinstallTest(unittest.TestCase):
         }
         state = {"go": {"context": "/g|", "packages": {"tool": dict(old)}}}
         with (
-            mock.patch("tools.user.go.os.remove", side_effect=PermissionError("denied")),
+            mock.patch("tools.user.go.fsutil.trash", side_effect=PermissionError("denied")),
             mock.patch("tools.user.go.run_command") as run,
             mock.patch("tools.user.go.shutil.which", return_value="/go"),
         ):

@@ -7,9 +7,14 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools import fsutil
 from tools.user import secrets_flow, templates
 from tools.user.sops import Decryptor, parse_sops
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 SECRET = "s3cr3t-password-value"
 

@@ -472,7 +472,7 @@ def install_env(raw, state: Dict, conflicts=None, run: Optional[Callable] = None
         installed.pop(target, None)
     for target in p.remove:
         try:
-            os.remove(target)
+            fsutil.trash(target)
         except OSError as e:
             log(f"env: failed to remove {target}: {e}", Color.RED)
             success = False

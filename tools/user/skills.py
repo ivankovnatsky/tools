@@ -54,6 +54,7 @@ import re
 import shutil
 from typing import Dict, List, Optional, Tuple
 
+from tools import fsutil
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_dir
 from tools.user.links import _make_link, _points_to, _readlink, _tracked_source
@@ -792,7 +793,7 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 log(f"skills: keeping {dest}: a link still points at it", Color.YELLOW)
                 continue
             try:
-                shutil.rmtree(dest)
+                fsutil.trash(dest)
             except OSError as e:
                 log(f"skills: failed to remove {dest}: {e}", Color.RED)
                 success = False
@@ -805,7 +806,7 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
             if not copy_ready(link, copy):
                 continue
             try:
-                shutil.rmtree(link)
+                fsutil.trash(link)
             except OSError as e:
                 log(f"skills: failed to remove {link}: {e}", Color.RED)
                 success = False

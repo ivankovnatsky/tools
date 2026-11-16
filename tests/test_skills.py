@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+import trash_fake
+
 from tools.user import skills
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 GIT = shutil.which("git")
 GIT_BIN = GIT or "/usr/bin/git"

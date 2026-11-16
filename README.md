@@ -505,7 +505,7 @@ curlShell:
   https://example.com/install.sh: bash
   https://example.com/other-install.sh:
     shell: bash
-    uninstall: rm -rf ~/.other ~/.local/bin/other
+    uninstall: trash ~/.other ~/.local/bin/other
 ```
 
 - A url is installed once and tracked in state; it runs again only after it is
@@ -813,7 +813,7 @@ Behaviour:
 - A plist tools didn't write is never replaced (an identical one is adopted) and never removed.
 - Removal re-reads the plist and stops if it changed since tools wrote it; a disabled label is re-enabled first.
 - An unreadable plist or a malformed state entry for a configured job holds that job and fails the deploy, with a fix hint.
-- As root every daemon change is a fixed command run directly (`install`, `launchctl`, `rm`, log `mkdir`/`touch`/`chown`) on paths derived from the label or the checked logDir; tools never calls sudo.
+- As root every daemon change is a fixed command run directly (`install`, `launchctl`, `trash`, log `mkdir`/`touch`/`chown`) on paths derived from the label or the checked logDir; tools never calls sudo.
 - Daemon logs default to nix-config's `/tmp/log/launchd`. Inside sticky `/tmp`, a root-owned `log` and `log/launchd` can't be renamed or replaced by a local user, so the check above holds at deploy. `/tmp` is emptied at boot, though: root daemons' wrappers recreate it as root (daemons with a `user` skip the wrapper's `mkdir`), but a local user who creates `/tmp/log` first owns it, and `sudo tools deploy` then refuses those daemons until it is removed by hand. For a dir that must stay root-only across reboots, set `logDir` under `/var/log`.
 - A missing daemon `workingDirectory` is created the same root-only way.
 
@@ -1041,7 +1041,7 @@ users:
   guest:
     uid: 600                       # required with create; 501 or higher
     create: true                   # create when missing
-    deleteHome: false              # on deletion also remove /Users/guest
+    deleteHome: false              # on deletion also trash /Users/guest
 ```
 
 - Runs in the sudo phase, after system `files` (which may write `/etc/shells`).
@@ -1065,8 +1065,8 @@ users:
   `/Users/NAME` already exists.
 - Created accounts are recorded in root's state. Once one leaves config it is
   deleted with `dscl . -delete`; its home is kept unless `deleteHome: true` was
-  deployed while the entry was still in config, and then removed only if it is
-  a directory owned by that uid. A recorded account whose uid changed, or that
+  deployed while the entry was still in config, and then moved to root's Trash
+  only if it is a directory owned by that uid. A recorded account whose uid changed, or that
   is no longer local, is reported and kept; one already gone is forgotten.
 - Never deleted: accounts tools did not create, root, uid 0, uids below 501, the
   current user and `SUDO_USER`. Any other user that leaves config is left as is.
@@ -1207,11 +1207,23 @@ All services:
 Deploy records what it installs in the state file and only ever removes what it
 recorded — anything installed by hand is never touched (the one opt-in
 exception is brew's [`onActivation.cleanup`](#brew)). Removing an entry from
-config removes it from the system on the next deploy (`go` deletes the binary it
+config removes it from the system on the next deploy (`go` trashes the binary it
 installed, `cargo` runs `cargo uninstall` and keeps the record for the next
 deploy when `cargo` is not on `PATH`; `curlShell` entries without `uninstall`
 only release tracking). Git checkout removal refuses to
 delete repos with uncommitted, unpushed, stashed, or local-ref-only work.
+
+Files and directories tools removes from disk go to the Trash, never straight
+to deletion: `files`, `sops`, `templates`, `fetch`, `env`, `skills` copies,
+`gitRepos` checkouts, `go` binaries, launchd plists and a `users` home with
+`deleteHome`. macOS uses `/usr/bin/trash` (macOS 15+); Linux uses `gio trash`,
+else `trash-put`. With no trash tool the removal fails and the entry stays
+tracked for the next deploy. Under `sudo tools deploy`, removals made as root
+(daemon plists, user homes) go to root's Trash (`/var/root/.Trash`). Removed
+symlinks (`links`, skill links) and empty directories tools created are
+unlinked directly, as they hold no data. Package managers' own uninstalls
+(`brew`, `npm`, `uv`, `bun`, `pi`, `cargo`, `flatpak`, `ollama rm`) and a
+`curlShell` `uninstall` command are run as declared.
 
 Every deploy (including each `watch` run) holds an exclusive lock on
 `<stateFile>.lock` (0600) from reading the state to its last save, so
@@ -1226,6 +1238,8 @@ a unique temp file beside the state and are renamed into place.
   official Homebrew installer — both execute remote code you declared in config.
 - `sops` and `templates` never log, diff or persist secret values; see their
   sections for exactly what is shown.
+- A removed `sops` secret or rendered template goes to the Trash like any other
+  removed file, so its plaintext stays there until the Trash is emptied.
 - An MCP server already registered under a configured name is adopted when it
   is registered in the configured `scope` (default `user`): it is re-registered
   from config once (its live definition is not read), then re-registered when

@@ -4,17 +4,23 @@ import plistlib
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import trash_fake
 from click.testing import CliRunner
 
 from tools import cli
 from tools.user import launchd
 
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
+
 UID = 501
+TRASH = sys.executable
 
 
 class FakeSystem:
@@ -65,8 +71,8 @@ class FakeSystem:
                 shutil.copyfile(cmd[-2], cmd[-1])
             if "-m" in cmd:
                 os.chmod(cmd[-1], int(cmd[cmd.index("-m") + 1], 8))
-        elif tool == "/bin/rm":
-            os.remove(cmd[-1])
+        elif tool == TRASH:
+            subprocess.run(cmd, check=True)
         elif tool == "/bin/mkdir":
             os.makedirs(cmd[-1], exist_ok=True)
         elif tool == "/usr/bin/touch":
@@ -1045,7 +1051,7 @@ class SystemDomainTest(LaunchdTestBase):
                       self.fake.calls)  # fmt: skip
         self.assertTrue(self.deploy(self.cfg({}, root=True)))
         self.assertFalse(os.path.exists(self.daemon_path("dns")))
-        self.assertIn(["/bin/rm", "-f", self.daemon_path("dns")], self.fake.calls)
+        self.assertIn(trash_fake.argv(self.daemon_path("dns")), self.fake.calls)
 
     def test_moving_an_agent_to_daemons_is_two_runs_with_two_states(self):
         user_state = {}
@@ -1656,7 +1662,7 @@ class NoRootTest(LaunchdTestBase):
         self.deploy(self.cfg({}, root=True))
         calls = self.fake.system_calls
         self.assertTrue(calls)
-        allowed = {"/usr/bin/install", launchd.LAUNCHCTL, "/bin/rm", "/usr/sbin/chown",
+        allowed = {"/usr/bin/install", launchd.LAUNCHCTL, TRASH, "/usr/sbin/chown",
                    "/bin/mkdir", "/usr/bin/touch"}  # fmt: skip
         for c in self.fake.calls:
             self.assertIn(c[0], allowed, c)
@@ -1689,7 +1695,7 @@ class NoRootTest(LaunchdTestBase):
         self.assertTrue(self.deploy(self.cfg({}, root=True)))
         self.assertEqual(
             self.fake.system_calls,
-            [[launchd.LAUNCHCTL, "bootout", "system/org.example.dns"], ["/bin/rm", "-f", path]],
+            [[launchd.LAUNCHCTL, "bootout", "system/org.example.dns"], trash_fake.argv(path)],
         )
         self.assertFalse(os.path.exists(path))
 
@@ -1702,7 +1708,7 @@ class NoRootTest(LaunchdTestBase):
         self.fake.system_calls.clear()
 
         self.assertTrue(self.deploy(self.cfg({}, root=True)))
-        self.assertIn(["/bin/rm", "-f", self.daemon_path("dns")], self.fake.system_calls)
+        self.assertIn(trash_fake.argv(self.daemon_path("dns")), self.fake.system_calls)
         self.assertFalse(any("/etc/passwd" in arg for c in self.fake.calls for arg in c))
 
     def test_tampered_state_domain_never_reaches_daemon_paths(self):
@@ -1712,7 +1718,7 @@ class NoRootTest(LaunchdTestBase):
         self.fake.calls.clear()
         self.deploy(self.cfg({}, root=True))
         self.assertFalse(any("/etc/passwd" in arg for c in self.fake.calls for arg in c))
-        self.assertFalse(any(c[0] == "/bin/rm" for c in self.fake.system_calls))
+        self.assertFalse(any(c[0] == TRASH for c in self.fake.system_calls))
         self.assertTrue(os.path.exists(self.agent_path("web")))
 
         for label, bad in (

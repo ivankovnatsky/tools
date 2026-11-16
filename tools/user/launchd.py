@@ -33,7 +33,7 @@ derived from the validated label and domain.
 Each run manages one domain. As the login user: agents only, as plain file
 ops plus `launchctl ... gui/<uid>`; configured daemons are reported, never
 touched. As root (`sudo tools deploy`, SUDO_USER required): daemons only,
-with `install`, `launchctl ... system/<label>`, `rm` and nix-style log
+with `install`, `launchctl ... system/<label>`, `trash` and nix-style log
 `mkdir`/`touch`/`chown` run directly; no daemon write target may sit under
 the user's home. tools never calls sudo itself.
 """
@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
-from tools import privilege
+from tools import fsutil, privilege
 from tools.log import Color, debug, log
 from tools.user import sops
 from tools.user.files import _parse_mode
@@ -1209,12 +1209,17 @@ def _remove_plist(path: str, domain: str, env: Env) -> bool:
         return True
     if domain == "user" and can_change(domain, env):
         try:
-            os.remove(path)
+            fsutil.trash(path)
             return True
         except OSError as e:
             log(f"launchd: failed to remove {path}: {e}", Color.RED)
             return False
-    rc, _out, err = _run_changing(["/bin/rm", "-f", path], domain, env)
+    try:
+        argv = fsutil.trash_argv(path)
+    except OSError as e:
+        log(f"launchd: failed to remove {path}: {e}", Color.RED)
+        return False
+    rc, _out, err = _run_changing(argv, domain, env)
     if rc != 0:
         log(f"launchd: failed to remove {path}: {err.strip()}", Color.RED)
         return False
