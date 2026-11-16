@@ -4,7 +4,16 @@ import os
 
 USER_AGENT = "youtube/1.0.0"
 
-DEFAULT_SECRETS_PATH = "~/.config/sops-nix/secrets"
+
+def default_secrets_dir() -> str:
+    """tools-rendered secrets when present, else the sops-nix ones."""
+    tools_dir = "~/.local/state/tools/secrets"
+    if os.path.isdir(os.path.expanduser(tools_dir)):
+        return tools_dir
+    return "~/.config/sops-nix/secrets"
+
+
+DEFAULT_SECRETS_PATH = default_secrets_dir()
 DEFAULT_CLIENT_SECRET_PATH = f"{DEFAULT_SECRETS_PATH}/youtube-client-secret"
 DEFAULT_API_KEY_PATH = f"{DEFAULT_SECRETS_PATH}/youtube-api-key"
 

@@ -108,9 +108,10 @@ def delete_cmd(base_url, email, password, system_id):
 def sync_cmd(config_file, dry_run):
     """Sync systems from configuration file.
 
-    Reads credentials directly from sops-rendered files under
-    ~/.config/sops-nix/secrets/ (beszel-email, beszel-password,
-    discord-webhook-beszel). base_url is read from the config JSON.
+    Reads credentials from sops-rendered files (beszel-email, beszel-password,
+    discord-webhook-beszel) under ~/.local/state/tools/secrets/ when it
+    exists, else ~/.config/sops-nix/secrets/. base_url is read from the
+    config JSON.
     """
     with open(config_file) as f:
         config = json.load(f)

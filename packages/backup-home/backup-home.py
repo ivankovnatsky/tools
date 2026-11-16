@@ -50,11 +50,19 @@ SOPS_SECRETS = {
 }
 
 
+def default_secrets_dir() -> Path:
+    """tools-rendered secrets when present, else the sops-nix ones."""
+    tools_dir = Path.home() / ".local/state/tools/secrets"
+    if tools_dir.is_dir():
+        return tools_dir
+    return Path.home() / ".config/sops-nix/secrets"
+
+
 def _read_secret(name: str) -> str | None:
-    """Read secret from sops-nix file."""
+    """Read secret from a sops-rendered file."""
     sops_name = SOPS_SECRETS.get(name)
     if sops_name:
-        sops_path = Path.home() / ".config/sops-nix/secrets" / sops_name
+        sops_path = default_secrets_dir() / sops_name
         try:
             return sops_path.read_text().strip()
         except OSError:
@@ -358,7 +366,8 @@ def upload_miniserve(
     name="backup-home",
     help="Backup home directory with automatic exclusions and remote upload.",
     epilog=(
-        "Secrets (read from ~/.config/sops-nix/secrets/):\n\n"
+        "Secrets (read from ~/.local/state/tools/secrets/ when it exists,\n"
+        "else ~/.config/sops-nix/secrets/):\n\n"
         "  miniserve-username    Username for miniserve authentication\n\n"
         "  miniserve-password    Password for miniserve authentication\n\n"
         "Examples:\n\n"
@@ -486,7 +495,7 @@ def main(
     miniserve_pass = _read_secret("MINISERVE_PASS")
     if not miniserve_user or not miniserve_pass:
         click.echo(
-            "Error: miniserve secrets not found in ~/.config/sops-nix/secrets/",
+            f"Error: miniserve secrets not found in {default_secrets_dir()}/",
             err=True,
         )
         sys.exit(1)

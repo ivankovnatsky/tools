@@ -16,7 +16,16 @@ API_HOST = "api.nextdns.io"
 API_BASE = f"https://{API_HOST}"
 USER_AGENT = "nextdns-mgmt/1.0.0"
 
-DEFAULT_SECRETS_PATH = "~/.config/sops-nix/secrets"
+
+def default_secrets_dir() -> str:
+    """tools-rendered secrets when present, else the sops-nix ones."""
+    tools_dir = "~/.local/state/tools/secrets"
+    if os.path.isdir(os.path.expanduser(tools_dir)):
+        return tools_dir
+    return "~/.config/sops-nix/secrets"
+
+
+DEFAULT_SECRETS_PATH = default_secrets_dir()
 DEFAULT_API_KEY_PATH = f"{DEFAULT_SECRETS_PATH}/nextdns-api-key"
 DEFAULT_PROFILE_ID_PATH_TEMPLATE = f"{DEFAULT_SECRETS_PATH}/nextdns-profile-{{name}}"
 
@@ -291,7 +300,7 @@ def sync(api_key, profile_id, profile_file, dry_run):
     "--profile-id-file",
     default=None,
     help="File containing the profile id; required to exist when given "
-    "(default: per-name file under the sops-nix secrets dir)",
+    "(default: per-name file under the secrets dir)",
 )
 @click.option(
     "--dry-run",
@@ -302,11 +311,12 @@ def sync(api_key, profile_id, profile_file, dry_run):
 def update(name, profile_file, api_key_file, profile_id_file, dry_run):
     """Update profile using nested endpoints (section by section).
 
-    Reads the API key from --api-key-file (default
-    ~/.config/sops-nix/secrets/nextdns-api-key). The profile id comes from
-    --profile-id-file, which must exist when given; otherwise, with --name,
-    ~/.config/sops-nix/secrets/nextdns-profile-<name> is tried and a missing
-    file falls back to name-based lookup.
+    Reads the API key from --api-key-file (default <secrets>/nextdns-api-key,
+    where <secrets> is ~/.local/state/tools/secrets when it exists, else
+    ~/.config/sops-nix/secrets). The profile id comes from --profile-id-file,
+    which must exist when given; otherwise, with --name,
+    <secrets>/nextdns-profile-<name> is tried and a missing file falls back
+    to name-based lookup.
     """
     api_key = _read_file(api_key_file)
     if not api_key:

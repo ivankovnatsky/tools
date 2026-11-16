@@ -13,9 +13,17 @@ from machines import current_hostname
 CATEGORY = "rebuild"
 
 
-DEFAULT_DISCORD_WEBHOOK_FILE = (
-    Path.home() / ".config" / "sops-nix" / "secrets" / "discord-webhook-rebuild"
-)
+def default_secrets_dir() -> Path:
+    """tools-rendered secrets when present, else the sops-nix ones."""
+    tools_dir = Path.home() / ".local/state/tools/secrets"
+    if tools_dir.is_dir():
+        return tools_dir
+    return Path.home() / ".config/sops-nix/secrets"
+
+
+def default_discord_webhook_file() -> Path:
+    return default_secrets_dir() / "discord-webhook-rebuild"
+
 
 # Lines to include before/after the last nix `error:` marker when extracting
 # failure context. Both windows are generous because nix's "builder for X
@@ -88,12 +96,12 @@ def send_failure_notification(webhook_file=None, exit_code=None, log_excerpt=Non
     The failure is not posted to Discord immediately; it is held in the shared
     digest store and posted in a batch by `notifications digest-flush` at 21:00,
     unless a later successful rebuild clears it first. Stores the webhook
-    *file path* (defaults to the sops-nix rendered
-    ~/.config/sops-nix/secrets/discord-webhook-rebuild) so the flush can read
+    *file path* (defaults to discord-webhook-rebuild under
+    default_secrets_dir()) so the flush can read
     the URL at send time. Silently skips if the file is missing — never fails
     the rebuild.
     """
-    path = Path(webhook_file) if webhook_file else DEFAULT_DISCORD_WEBHOOK_FILE
+    path = Path(webhook_file) if webhook_file else default_discord_webhook_file()
     if not path.exists():
         logging.debug(
             f"Discord webhook file not present at {path}; skipping notification"
