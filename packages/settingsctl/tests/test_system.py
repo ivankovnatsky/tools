@@ -282,6 +282,7 @@ class ExistingInvocationsTest(unittest.TestCase):
         ["windows", "quit", "--wait", "10", "Mac Mouse Fix"],
         ["accessibility", "set", "Hammerspoon,Mac Mouse Fix Helper,Muxy,Terminal,kitty"],
         ["fulldiskaccess", "--enable", "bash,kitty,Terminal"],
+        ["fulldiskaccess", "set", "bash,kitty,Terminal"],
         ["login", "set", "Hammerspoon,Mac Mouse Fix,LosslessSwitcher"],
         ["daemon", "run", "--autovolume", "--autovolume-idle", "1800"]
         + ["--autovolume-threshold", "6", "--check-interval", "300", "--verbose"],

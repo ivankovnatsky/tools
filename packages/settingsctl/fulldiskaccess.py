@@ -9,7 +9,15 @@ from pathlib import Path
 import click
 
 from common import _get_state_dir, is_macos
-from privacy_pane import ensure_enabled, list_apps, parse_app_specs, toggle_app
+from privacy_pane import (
+    enable_apps,
+    ensure_disabled,
+    ensure_enabled,
+    list_apps,
+    parse_app_specs,
+    partial_state,
+    toggle_app,
+)
 
 FDA_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 
@@ -45,18 +53,57 @@ def fda_write_state(enable_apps: list[str]) -> None:
     state.write_text(",".join(sorted(enable_apps)))
 
 
-def fda_enable(apps: dict[str, str | None], add_missing: bool = False) -> None:
-    """Ensure apps are enabled in Full Disk Access; add_missing adds unlisted ones."""
+def fda_previous_state() -> list[str]:
+    state = fda_state_file()
+    if not state.exists():
+        return []
+    return [a.strip() for a in state.read_text().split(",") if a.strip()]
+
+
+def _record(names: list[str]) -> None:
+    try:
+        fda_write_state(names)
+    except Exception as e:
+        print(f"Warning: could not write state: {e}", file=sys.stderr)
+
+
+def fda_enable(apps: dict[str, str | None], add_missing: bool = False) -> bool:
+    """Ensure apps are enabled in Full Disk Access; add_missing adds unlisted ones.
+
+    Returns False when the pane could not be read or an app is not enabled.
+    """
     names = list(apps)
     if not add_missing and fda_state_matches(names):
         print("Skipping Full Disk Access enable (already configured)")
-        return
+        return True
+    if not ensure_enabled(FDA_URL, "Full Disk Access", apps, add_missing):
+        return False
+    _record(names)
+    return True
 
-    if ensure_enabled(FDA_URL, "Full Disk Access", apps, add_missing):
-        try:
-            fda_write_state(names)
-        except Exception as e:
-            print(f"Warning: could not write state: {e}", file=sys.stderr)
+
+def fda_set(apps: dict[str, str | None], add_missing: bool = False) -> bool:
+    """Sync Full Disk Access to exactly these apps (declarative).
+
+    Turns off apps previously managed by us (per state file) that are no longer
+    listed, then enables the listed ones. Entries added by hand are left alone.
+    On partial failure the state keeps every app still granted by us and leaves
+    out the ones that failed, so the next run retries.
+    """
+    names = list(apps)
+    if not add_missing and fda_state_matches(names):
+        print("Skipping Full Disk Access set (already configured)")
+        return True
+    previous = fda_previous_state()
+    dropped = sorted(set(previous) - set(names))
+    off_ok, off = ensure_disabled(FDA_URL, "Full Disk Access", dropped)
+    on_ok, on = enable_apps(FDA_URL, "Full Disk Access", apps, add_missing)
+    ok = off_ok and on_ok
+    if ok:
+        _record(names)
+    elif (kept := partial_state(previous, off, on)) != sorted(previous):
+        _record(kept)
+    return ok
 
 
 def register(cli):
@@ -69,14 +116,23 @@ def register(cli):
     @click.option(
         "--add-missing",
         is_flag=True,
-        help="Add unlisted apps via + (needs you to authenticate).",
+        help="With --enable/set: add unlisted apps via + (needs you to authenticate).",
     )
     @click.argument(
-        "action", required=False, type=click.Choice(["list", "toggle", "open"])
+        "action", required=False, type=click.Choice(["list", "toggle", "open", "set"])
     )
     @click.argument("app", required=False)
     def fulldiskaccess(enable_apps, add_missing, action, app):
-        """Manage Full Disk Access permissions (macOS only)"""
+        """Manage Full Disk Access permissions (macOS only)
+
+        \b
+        Actions:
+          list                Show all entries and their enabled state
+          toggle APP          Toggle an app's enabled state
+          set "APP1,APP2,..." Declaratively sync to list; turns off previously
+                              managed apps no longer in the list
+          open                Open the Full Disk Access pane in System Settings
+        """
         if not is_macos():
             print("Full Disk Access settings only available on macOS", file=sys.stderr)
             sys.exit(1)
@@ -86,7 +142,19 @@ def register(cli):
             if not apps:
                 print("Error: specify app list", file=sys.stderr)
                 sys.exit(1)
-            fda_enable(apps, add_missing)
+            if not fda_enable(apps, add_missing):
+                sys.exit(1)
+            return
+
+        if action == "set":
+            if app is None:
+                print(
+                    "Error: specify app list (use empty string for none)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not fda_set(parse_app_specs(app), add_missing):
+                sys.exit(1)
             return
 
         if action == "open":

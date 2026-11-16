@@ -61,7 +61,8 @@ def register(cli):
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            accessibility_set(parse_app_specs(app), add_missing)
+            if not accessibility_set(parse_app_specs(app), add_missing):
+                sys.exit(1)
             return
 
         if action == "enable":
@@ -72,7 +73,8 @@ def register(cli):
             if not apps:
                 print("Error: specify app list", file=sys.stderr)
                 sys.exit(1)
-            accessibility_enable(apps, add_missing)
+            if not accessibility_enable(apps, add_missing):
+                sys.exit(1)
             return
 
         if action == "open":

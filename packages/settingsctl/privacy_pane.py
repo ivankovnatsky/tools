@@ -179,20 +179,23 @@ def remove_app(pane_url: str, name: str) -> bool:
     return "removed" in (run_in_pane(pane_url, body) or "")
 
 
-def enable_listed(pane_url: str, apps: list[str]) -> dict[str, str] | None:
-    """Enable listed apps in one session.
+def set_listed(pane_url: str, apps: list[str], on: bool = True) -> dict[str, str] | None:
+    """Turn listed apps' checkboxes on (or off) in one session.
 
-    Returns {name: "enabled" | "already enabled"} for apps found in the pane,
-    or None if the UI could not be read.
+    Returns {name: status} for apps found in the pane: "enabled" or "already
+    enabled" (or the "disabled" forms), "unchanged" when the click did not
+    stick (authentication cancelled). None if the UI could not be read.
     """
     if not apps:
         return {}
+    want = 1 if on else 0
+    verb = "enabled" if on else "disabled"
     checks = " or ".join(f'name of el is "{app}"' for app in apps)
     body = (
         '        set output to ""'
         + _for_each_checkbox(f"""                    if {checks} then
                         set appName to name of el
-                        if value of el is 0 then
+                        if value of el is not {want} then
                             click el
                             -- Wait for the password sheet to appear and be dismissed
                             delay 2
@@ -201,14 +204,22 @@ def enable_listed(pane_url: str, apps: list[str]) -> dict[str, str] | None:
                                 if (count of sheets of window 1) is 0 then exit repeat
                             end repeat
                             delay 0.5
-                            set output to output & appName & ":enabled" & linefeed
+                            if value of el is {want} then
+                                set output to output & appName & ":{verb}" & linefeed
+                            else
+                                set output to output & appName & ":unchanged" & linefeed
+                            end if
                         else
-                            set output to output & appName & ":already enabled" & linefeed
+                            set output to output & appName & ":already {verb}" & linefeed
                         end if
                     end if""")
         + "\n        return output"
     )
     return _parse_pairs(run_in_pane(pane_url, body, timeout=300))
+
+
+def enable_listed(pane_url: str, apps: list[str]) -> dict[str, str] | None:
+    return set_listed(pane_url, apps, on=True)
 
 
 def add_apps(pane_url: str, paths: list[str]) -> None:
@@ -256,16 +267,24 @@ def ensure_enabled(
 ) -> bool:
     """Enable apps; with add_missing, first add unlisted ones by path.
 
-    Returns True when the pane could be read. Apps that are not listed are
-    reported, not retried: adding needs a person to authenticate, so it only
-    runs when explicitly requested (add_missing), never from activation.
+    Returns True only when every app is listed and enabled. Apps that are not
+    listed are reported, not retried: adding needs a person to authenticate, so
+    it only runs when explicitly requested (add_missing), never from activation.
     """
+    return enable_apps(pane_url, label, apps, add_missing)[0]
+
+
+def enable_apps(
+    pane_url: str, label: str, apps: dict[str, str | None], add_missing: bool = False
+) -> tuple[bool, dict[str, bool]]:
+    """ensure_enabled, plus {name: enabled} for each app whose outcome is known."""
     names = list(apps)
     found = enable_listed(pane_url, names)
     if found is None:
-        print(f"Skipping {label} (could not read UI)", file=sys.stderr)
-        return False
+        print(f"Could not read the {label} list", file=sys.stderr)
+        return False, {}
 
+    added: dict[str, str] = {}
     missing = [name for name in names if name not in found]
     if missing and add_missing:
         to_add: dict[str, str] = {}
@@ -274,12 +293,13 @@ def ensure_enabled(
             if path:
                 to_add[name] = path
             else:
-                print(f"  {name}: no app found to add (pass NAME=/path)")
+                print(f"  {name}: no app found to add (pass NAME=/path)", file=sys.stderr)
         add_apps(pane_url, list(to_add.values()))
         again = enable_listed(pane_url, list(to_add)) or {}
         for name, path in to_add.items():
             if name in again:
-                found[name] = f"added from {path}, {again[name]}"
+                found[name] = again[name]
+                added[name] = path
             else:
                 print(
                     f"  {name}: not listed after adding {path}; check the {label} "
@@ -288,10 +308,62 @@ def ensure_enabled(
                 )
         missing = [name for name in names if name not in found]
 
+    ok = not missing
+    outcome = {name: False for name in missing}
     for name in names:
-        if name in found:
-            print(f"  {name}: {found[name]}")
+        if name not in found:
+            continue
+        status = found[name]
+        shown = f"added from {added[name]}, {status}" if name in added else status
+        outcome[name] = status in ("enabled", "already enabled")
+        if outcome[name]:
+            print(f"  {name}: {shown}")
+        else:
+            print(f"  {name}: {shown} (not enabled)", file=sys.stderr)
+            ok = False
     for name in missing:
         hint = "" if add_missing else " (run with --add-missing to add it)"
-        print(f"  {name}: not in {label} list{hint}")
-    return True
+        print(f"  {name}: not in {label} list{hint}", file=sys.stderr)
+    return ok, outcome
+
+
+def ensure_disabled(
+    pane_url: str, label: str, names: list[str]
+) -> tuple[bool, dict[str, bool]]:
+    """Turn listed apps off; apps not in the pane already have no grant.
+
+    Returns (True when the pane could be read and every listed one is off,
+    {name: off} for each app whose outcome is known).
+    """
+    if not names:
+        return True, {}
+    found = set_listed(pane_url, names, on=False)
+    if found is None:
+        print(f"Could not read the {label} list", file=sys.stderr)
+        return False, {}
+    ok = True
+    outcome = {}
+    for name in names:
+        status = found.get(name)
+        outcome[name] = status is None or status in ("disabled", "already disabled")
+        if status is None:
+            continue
+        if outcome[name]:
+            print(f"  {name}: {status}")
+        else:
+            print(f"  {name}: {status} (still enabled)", file=sys.stderr)
+            ok = False
+    return ok, outcome
+
+
+def partial_state(
+    previous: list[str], gone: dict[str, bool], enabled: dict[str, bool]
+) -> list[str]:
+    """Apps still granted by us after a sync that partly failed.
+
+    Keeps previously managed apps unless known to be off or gone, and adds the
+    ones turned on. Apps that failed to turn on are left out, so the state
+    differs from the list and the next run retries.
+    """
+    kept = {a for a in previous if not gone.get(a) and enabled.get(a) is not False}
+    return sorted(kept | {a for a, on in enabled.items() if on})

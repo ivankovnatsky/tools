@@ -5,13 +5,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from accessibility_ui import (
-    ACCESSIBILITY_URL,
-    accessibility_list,
-    accessibility_remove,
-)
+from accessibility_ui import ACCESSIBILITY_URL, accessibility_remove
 from common import _get_state_dir, quit_app
-from privacy_pane import ensure_enabled
+from privacy_pane import enable_apps, ensure_enabled, list_apps, partial_state
 
 
 def accessibility_state_file() -> Path:
@@ -41,43 +37,58 @@ def accessibility_previous_state() -> list[str]:
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
+def _record(names: list[str]) -> None:
+    try:
+        accessibility_write_state(names)
+    except Exception as e:
+        print(f"Warning: could not write state: {e}", file=sys.stderr)
+
+
 def accessibility_enable(
     apps: dict[str, str | None], add_missing: bool = False
-) -> None:
-    """Ensure apps are enabled in Accessibility; add_missing adds unlisted ones."""
+) -> bool:
+    """Ensure apps are enabled in Accessibility; add_missing adds unlisted ones.
+
+    Returns False when the pane could not be read or an app is not enabled.
+    """
     names = list(apps)
     if not add_missing and accessibility_state_matches(names):
         print("Skipping accessibility enable (already configured)")
-        return
-
-    if ensure_enabled(ACCESSIBILITY_URL, "accessibility", apps, add_missing):
-        try:
-            accessibility_write_state(names)
-        except Exception as e:
-            print(f"Warning: could not write state: {e}", file=sys.stderr)
+        return True
+    if not ensure_enabled(ACCESSIBILITY_URL, "accessibility", apps, add_missing):
+        return False
+    _record(names)
+    return True
 
 
-def accessibility_set(apps: dict[str, str | None], add_missing: bool = False) -> None:
+def accessibility_set(apps: dict[str, str | None], add_missing: bool = False) -> bool:
     """Sync accessibility permissions to exactly target_apps (declarative).
 
     Removes apps previously managed by us (per state file) that are no longer
     in target_apps, then enables target_apps. User-added entries are preserved.
+    On partial failure the state keeps every app still granted by us and leaves
+    out the ones that failed, so the next run retries.
     """
     target_apps = list(apps)
     if not add_missing and accessibility_state_matches(target_apps):
         print("Skipping accessibility set (already configured)")
-        return
+        return True
 
-    target = set(target_apps)
-    previously_managed = set(accessibility_previous_state())
-    to_remove = previously_managed - target
-
+    ok = True
+    previous = accessibility_previous_state()
+    to_remove = set(previous) - set(target_apps)
+    gone: dict[str, bool] = {}
     if to_remove:
-        current = {item["name"] for item in accessibility_list()}
-        for app in sorted(to_remove):
-            if app not in current:
-                continue
+        listed = list_apps(ACCESSIBILITY_URL)
+        if listed is None:
+            print("Could not read the accessibility list", file=sys.stderr)
+            ok = False
+        else:
+            current = {item["name"] for item in listed}
+            gone = {app: app not in current for app in to_remove}
+        for app in sorted(a for a in to_remove if gone.get(a) is False):
             if accessibility_remove(app):
+                gone[app] = True
                 print(f"Removed accessibility entry: {app}")
                 if quit_app(app):
                     print(f"Quit running app: {app}")
@@ -86,5 +97,12 @@ def accessibility_set(apps: dict[str, str | None], add_missing: bool = False) ->
                     f"Could not remove accessibility entry: {app}",
                     file=sys.stderr,
                 )
+                ok = False
 
-    accessibility_enable(apps, add_missing)
+    on_ok, on = enable_apps(ACCESSIBILITY_URL, "accessibility", apps, add_missing)
+    ok = on_ok and ok
+    if ok:
+        _record(target_apps)
+    elif (kept := partial_state(previous, gone, on)) != sorted(previous):
+        _record(kept)
+    return ok
