@@ -42,6 +42,7 @@ from tools.user.plist import diff_plist
 from tools.user.plist import has_work as plist_has_work
 from tools.user.settingsctl import diff_settingsctl
 from tools.user.settingsctl import has_root_work as settingsctl_has_root_work
+from tools.user.settingsctl import has_work as settingsctl_has_work
 from tools.user.skills import diff_skills
 from tools.user.skills import has_work as skills_has_work
 from tools.user.users import diff_users
@@ -918,8 +919,8 @@ def show_diff(
         if changes:
             sections.append(("flatpak", changes))
 
-    if "settingsctl" in active and config.get("settingsctl") is not None:
-        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"))
+    if "settingsctl" in active and settingsctl_has_work(config.get("settingsctl"), state):
+        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"), state=state)
         if changes:
             sections.append(("settingsctl", changes))
 

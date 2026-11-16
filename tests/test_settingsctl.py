@@ -13,9 +13,11 @@ MINI = {
 }
 
 
-class SettingsctlTest(unittest.TestCase):
+class SettingsctlCase(unittest.TestCase):
     def setUp(self):
         self.applied = {}
+        self.after = {}
+        self.after_failure = False
         self.login_items = ""
         for patch in (
             mock.patch.object(settingsctl.sys, "platform", "darwin"),
@@ -28,19 +30,28 @@ class SettingsctlTest(unittest.TestCase):
         self.commands.append(cmd)
         if cmd[1:] == ["login", "list"]:
             return 0, self.login_items, ""
-        return self.rc, "", ""
+        rc = next((rc for verb, rc in self.fail.items() if verb in cmd), self.rc)
+        if rc == 0 or self.after_failure:
+            self.applied.update(self.after.pop(cmd[1], {}))
+        if "login_items" in self.after:
+            self.login_items = self.after.pop("login_items")
+        return rc, "", ""
 
-    def _install(self, raw, rc=0):
-        self.commands, self.rc = [], rc
+    def _install(self, raw, rc=0, state=None, fail=None):
+        self.commands, self.rc, self.fail = [], rc, fail or {}
         with mock.patch.object(settingsctl, "run_command", self.fake_run):
-            ok = settingsctl.install_settingsctl(raw, which=lambda _: "/bin/settings")
+            ok = settingsctl.install_settingsctl(raw, which=lambda _: "/bin/settings", state=state)
         return ok, [c for c in self.commands if c[1:] != ["login", "list"]]
 
-    def diff(self, raw, which=lambda _: "/bin/settings"):
-        self.commands, self.rc = [], 0
+    def diff(self, raw, which=lambda _: "/bin/settings", state=None):
+        self.commands, self.rc, self.fail = [], 0, {}
         with mock.patch.object(settingsctl, "run_command", self.fake_run):
-            return settingsctl.diff_settingsctl(raw, which=which, executable=lambda _: False)
+            return settingsctl.diff_settingsctl(
+                raw, which=which, executable=lambda _: False, state=state
+            )
 
+
+class SettingsctlTest(SettingsctlCase):
     def test_runs_each_declared_list(self):
         ok, commands = self._install(MINI)
         self.assertTrue(ok)
@@ -64,8 +75,8 @@ class SettingsctlTest(unittest.TestCase):
         self.assertEqual(
             self.diff(MINI),
             [
-                "  ~ settings fulldiskaccess set 'kitty,Terminal'"
-                " (now 'Terminal,determinate-nixd,kitty')",
+                "  ~ settings fulldiskaccess --enable 'kitty,Terminal'"
+                " (now 'Terminal,determinate-nixd,kitty') (leaves 'determinate-nixd' alone)",
                 "  ~ settings accessibility set 'Hammerspoon'",
                 "  ~ settings login set 'Hammerspoon,LosslessSwitcher' (now 'Hammerspoon')",
             ],
@@ -107,7 +118,7 @@ class SettingsctlTest(unittest.TestCase):
         self.assertEqual(commands, [])
 
     def test_empty_list_is_rejected(self):
-        for key in settingsctl.KEYS:
+        for key in set(settingsctl.KEYS) - set(settingsctl.LIST_KEYS):
             with self.subTest(key=key):
                 raw = {**MINI, key: []}
                 self.assertEqual(len(settingsctl.diff_settingsctl(raw)), 1)
@@ -117,6 +128,171 @@ class SettingsctlTest(unittest.TestCase):
 
     def test_missing_binary(self):
         self.assertFalse(settingsctl.install_settingsctl(MINI, which=lambda _: None))
+
+
+S = "/bin/settings"
+
+
+class ListRecordTest(SettingsctlCase):
+    """state.json records what tools granted; recorded names that leave config are revoked."""
+
+    def assert_preview_matches(self, raw, state, commands):
+        """Rows from diff are exactly the commands deploy ran, in order."""
+        rows = self.diff(raw, state=state)
+        shown = [r.split(" (now ")[0].split(" (leaves ")[0] for r in rows]
+        ran = [
+            "  {} settings {}".format(
+                "-" if c[2] in ("revoke", "remove") else "~",
+                " ".join(c[1:-1]) + " " + repr(c[-1])
+                if c[1:3] != ["login", "remove"]
+                else settingsctl._shown(c[1:]),
+            )
+            for c in commands
+        ]
+        self.assertEqual(shown, ran)
+
+    def test_records_granted_names(self):
+        state = {}
+        ok, _ = self._install(MINI, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(
+            state["settingsctl"],
+            {
+                "fullDiskAccess": ["Terminal", "kitty"],
+                "accessibility": ["Hammerspoon"],
+                "loginItems": ["Hammerspoon", "LosslessSwitcher"],
+            },
+        )
+
+    def test_adopts_already_applied_lists(self):
+        self.applied["fda-enabled"] = "Terminal,kitty"
+        self.applied["accessibility-enabled"] = "Hammerspoon"
+        self.login_items = "LosslessSwitcher\nHammerspoon\n"
+        state = {}
+        ok, commands = self._install(MINI, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [])
+        self.assertEqual(state["settingsctl"]["accessibility"], ["Hammerspoon"])
+
+    def test_adoption_does_not_import_settingsctl_state(self):
+        self.applied["accessibility-enabled"] = "Old,Hammerspoon"
+        state = {}
+        ok, commands = self._install({"accessibility": ["Hammerspoon"]}, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [[S, "accessibility", "enable", "Hammerspoon"]])
+        self.assertEqual(state["settingsctl"], {"accessibility": ["Hammerspoon"]})
+
+    def removed_state(self):
+        return {
+            "settingsctl": {
+                "fullDiskAccess": ["kitty"],
+                "accessibility": ["A", "B"],
+                "loginItems": ["L1", "L2"],
+            }
+        }
+
+    def test_removed_keys_revoke_only_recorded_names(self):
+        self.applied["fda-enabled"] = "kitty,other"
+        self.login_items = "L1\nHandAdded\n"
+        expected = [
+            [S, "fulldiskaccess", "revoke", "kitty"],
+            [S, "accessibility", "revoke", "A,B"],
+            [S, "login", "remove", "L1"],
+        ]
+        for raw in (None, {}, {"fullDiskAccess": [], "accessibility": [], "loginItems": []}):
+            with self.subTest(raw=raw):
+                self.assertTrue(settingsctl.has_work(raw, self.removed_state()))
+                self.assert_preview_matches(raw, self.removed_state(), expected)
+                state = self.removed_state()
+                ok, commands = self._install(raw, state=state)
+                self.assertTrue(ok)
+                self.assertEqual(commands, expected)
+                self.assertNotIn("settingsctl", state)
+                self.assertFalse(settingsctl.has_work(None, state))
+
+    def test_failed_revoke_stays_recorded(self):
+        self.login_items = "L1\nL2\n"
+        state = self.removed_state()
+        ok, _ = self._install(None, state=state, fail={"accessibility": 1, "L2": 1})
+        self.assertFalse(ok)
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A", "B"], "loginItems": ["L2"]})
+        self.assertEqual(
+            self.diff(None, state=state),
+            ["  - settings accessibility revoke 'A,B'", "  - settings login remove L2"],
+        )
+
+    def test_shrunk_list_revokes_only_dropped_names(self):
+        state = {"settingsctl": {"accessibility": ["A", "B"], "fullDiskAccess": ["k", "t"]}}
+        self.applied["accessibility-enabled"] = "A,B"
+        self.applied["fda-enabled"] = "k"
+        raw = {"accessibility": ["A"], "fullDiskAccess": ["k"]}
+        expected = [[S, "fulldiskaccess", "revoke", "t"], [S, "accessibility", "set", "A"]]
+        self.assert_preview_matches(raw, state, expected)
+        ok, commands = self._install(raw, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, expected)
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A"], "fullDiskAccess": ["k"]})
+
+    def test_unrecorded_settingsctl_names_are_left_alone(self):
+        state = {"settingsctl": {"accessibility": ["A", "C"]}}
+        self.applied["accessibility-enabled"] = "A,C,X"
+        raw = {"accessibility": ["A", "B=/Applications/B.app"]}
+        expected = [
+            [S, "accessibility", "enable", "A,B=/Applications/B.app"],
+            [S, "accessibility", "revoke", "C"],
+        ]
+        self.assert_preview_matches(raw, state, expected)
+        ok, commands = self._install(raw, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, expected)
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A", "B"]})
+
+    def test_partial_set_records_what_was_granted(self):
+        self.applied["fda-enabled"] = "old"
+        self.after = {"fulldiskaccess": {"fda-enabled": "A,old"}}
+        self.after_failure = True
+        state = {"settingsctl": {"fullDiskAccess": ["old", "Z"]}}
+        ok, commands = self._install({"fullDiskAccess": ["A", "B", "Z"]}, rc=1, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(commands, [[S, "fulldiskaccess", "set", "A,B,Z"]])
+        self.assertEqual(state["settingsctl"], {"fullDiskAccess": ["A", "Z", "old"]})
+
+    def test_failed_enable_records_its_targets(self):
+        self.applied["accessibility-enabled"] = "X"
+        state = {}
+        ok, _ = self._install({"accessibility": ["A"]}, rc=1, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A"]})
+
+    def test_login_set_drops_recorded_items_it_removed(self):
+        self.login_items = "L1\nL2\n"
+        state = {"settingsctl": {"loginItems": ["L1", "L2"]}}
+        ok, commands = self._install({"loginItems": ["L1"]}, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [[S, "login", "set", "L1"]])
+        self.assertEqual(state["settingsctl"], {"loginItems": ["L1"]})
+
+    def test_failed_login_set_records_from_current_items(self):
+        self.login_items = "L2\n"
+        self.after = {"login_items": "L2\nN1\n"}
+        state = {"settingsctl": {"loginItems": ["L2"]}}
+        ok, _ = self._install({"loginItems": ["N1", "N2"]}, rc=1, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(state["settingsctl"], {"loginItems": ["L2", "N1"]})
+
+    def test_missing_cli_keeps_records(self):
+        state = self.removed_state()
+        self.assertFalse(settingsctl.install_settingsctl(None, which=lambda _: None, state=state))
+        self.assertEqual(state, self.removed_state())
+        self.assertIn("`settings` not found", self.diff(None, which=lambda _: None, state=state)[0])
+
+    def test_root_ignores_records(self):
+        state = self.removed_state()
+        ok = settingsctl.install_settingsctl(
+            {"timeZone": "UTC"}, root=True, which=lambda _: None, state=state
+        )
+        self.assertFalse(ok)
+        self.assertEqual(state, self.removed_state())
 
 
 class DriftKeysTest(unittest.TestCase):
@@ -355,7 +531,23 @@ class WiringTest(unittest.TestCase):
         self._deploy({}).assert_not_called()
 
     def test_deploy_runs_declared_section(self):
-        self._deploy({"settingsctl": MINI}).assert_called_once_with(MINI, None)
+        inst = self._deploy({"settingsctl": MINI})
+        inst.assert_called_once()
+        self.assertEqual(inst.call_args.args, (MINI, None))
+        self.assertIn("state", inst.call_args.kwargs)
+
+    def test_deploy_runs_removed_section_with_records(self):
+        state = {"version": 2, "settingsctl": {"accessibility": ["A"]}}
+        with (
+            mock.patch.object(cli, "load_json", return_value=state),
+            mock.patch.object(cli, "migrate_state_file"),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "state_lock"),
+            mock.patch.object(cli, "install_settingsctl", return_value=True) as inst,
+        ):
+            self.assertTrue(cli._deploy({}, "/tmp"))
+        inst.assert_called_once()
+        self.assertIsNone(inst.call_args.args[0])
 
     def test_root_phase_runs_only_with_root_keys(self):
         with (

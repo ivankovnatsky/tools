@@ -73,6 +73,7 @@ from tools.user.pi import install_pi_packages
 from tools.user.plist import has_work as plist_has_work
 from tools.user.plist import install_plist
 from tools.user.settingsctl import has_root_work as settingsctl_has_root_work
+from tools.user.settingsctl import has_work as settingsctl_has_work
 from tools.user.settingsctl import install_settingsctl
 from tools.user.skills import has_work as skills_has_work
 from tools.user.skills import install_skills
@@ -854,8 +855,8 @@ def _run_sections(
         success &= install_flatpak_packages(config.get("flatpak", {}) or {}, state, update)
 
     # After uv (installs settingsctl) and brew (installs the apps it grants).
-    if "settingsctl" in active and config.get("settingsctl") is not None:
-        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
+    if "settingsctl" in active and settingsctl_has_work(config.get("settingsctl"), state):
+        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"), state=state)
 
     if "users" in active and users_has_work(config.get("users")):
         success &= install_users(config.get("users"))

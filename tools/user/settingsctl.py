@@ -18,13 +18,17 @@ Config shape::
       sleep: {computer: never, display: 10, disk: never}  # settings sleep set
       remoteLogin: true                          # settings remotelogin set on|off
 
-Each list is synced with `set`: an app dropped from the list loses the grant (or login
-item) settingsctl gave it. A list runs when it differs from what settingsctl last
-applied (its state files under ~/.local/state/settings) or, for login items, from
-`settings login list`. Every other key is read first (`settings ... get --json`, the
-appearance state file) and set only when it differs. Root keys run in the sudo phase;
-as the user they are read and reported in a note. A scalar key that leaves config is
-left as is.
+A list runs when it differs from what settingsctl last applied (its state files under
+~/.local/state/settings) or, for login items, from `settings login list`. Privacy lists
+use `set`, or `enable` when settingsctl's state names apps tools never recorded (so
+`set` would revoke them). After an apply the granted names are recorded in state.json
+under `settingsctl`; a recorded name that leaves its list (or the key or section goes,
+or the list is `[]`) is revoked: `settings <pane> revoke` for privacy panes, `settings
+login remove` per login item. A failed revoke stays recorded and is retried.
+
+Every other key is read first (`settings ... get --json`, the appearance state file)
+and set only when it differs. Root keys run in the sudo phase; as the user they are
+read and reported in a note. A scalar key that leaves config is left as is.
 
 Finding settings: `path` when given; otherwise, as the user, `settings` on PATH and
 then in `paths.uvBin`. Root never searches its own PATH: it uses `path`, `paths.uvBin`
@@ -59,15 +63,26 @@ ROOT_HINT = "run sudo tools deploy --scope settingsctl"
 STATE_DIR = "~/.local/state/settings"
 APPEARANCE_STATE = f"{STATE_DIR}/appearance/last-run"
 LIST_STATE = {"fullDiskAccess": "fda-enabled", "accessibility": "accessibility-enabled"}
+PANE = {"fullDiskAccess": "fulldiskaccess", "accessibility": "accessibility"}
 
 
-def _command(key: str, apps: List[str]) -> List[str]:
+ENABLE = {
+    "fullDiskAccess": ["fulldiskaccess", "--enable"],
+    "accessibility": ["accessibility", "enable"],
+}
+
+
+def _command(key: str, apps: List[str], enable: bool = False) -> List[str]:
     joined = ",".join(apps)
-    if key == "fullDiskAccess":
-        return ["fulldiskaccess", "set", joined]
-    if key == "accessibility":
-        return ["accessibility", "set", joined]
-    return ["login", "set", joined]
+    if key == "loginItems":
+        return ["login", "set", joined]
+    return [*ENABLE[key], joined] if enable else [PANE[key], "set", joined]
+
+
+def _names(key: str, apps: List[str]) -> List[str]:
+    if key == "loginItems":
+        return [os.path.splitext(os.path.basename(a))[0] if "/" in a else a for a in apps]
+    return [a.partition("=")[0].strip() for a in apps]
 
 
 def _sleep_error(value) -> Optional[str]:
@@ -119,15 +134,10 @@ def parse(raw) -> Tuple[Dict, List[str]]:
         apps = raw.get(key)
         if apps is None:
             continue
-        if (
-            not isinstance(apps, list)
-            or not apps
-            or not all(isinstance(a, str) and a.strip() and "," not in a for a in apps)
+        if not isinstance(apps, list) or not all(
+            isinstance(a, str) and a.strip() and "," not in a for a in apps
         ):
-            errors.append(
-                f"{key}: must be a non-empty list of app names without commas"
-                " (omit the key to leave it alone)"
-            )
+            errors.append(f"{key}: must be a list of app names without commas")
             continue
         spec[key] = [a.strip() for a in apps]
     for key in KEYS:
@@ -308,38 +318,108 @@ def _login_items(runner: Optional[Runner]) -> Optional[List[str]]:
     return [] if lines == ["No login items found."] else lines
 
 
-def _list_now(key: str, apps: List[str], runner: Optional[Runner]) -> Tuple[bool, Optional[str]]:
-    """(already applied, what is there now) for a list key; settingsctl's own skip rule."""
-    if key == "loginItems":
-        current = _login_items(runner)
-        if current is None:
-            return False, None
-        want = {os.path.splitext(os.path.basename(a))[0] if "/" in a else a for a in apps}
-        return set(current) == want, ",".join(sorted(current))
-    names = [a.partition("=")[0].strip() for a in apps]
-    applied = _read_state(LIST_STATE[key])
-    return applied == ",".join(sorted(names)), applied
+def _state_names(key: str) -> List[str]:
+    return [a.strip() for a in (_read_state(LIST_STATE[key]) or "").split(",") if a.strip()]
+
+
+def recorded(state: Optional[Dict]) -> Dict[str, List[str]]:
+    """{list key: names tools granted} from state.json."""
+    section = (state or {}).get("settingsctl")
+    if not isinstance(section, dict):
+        return {}
+    return {
+        key: [n for n in names if isinstance(n, str)]
+        for key, names in section.items()
+        if key in LIST_KEYS and isinstance(names, list) and names
+    }
+
+
+@dataclass
+class ListStep:
+    key: str
+    row: str
+    args: List[str]
+    revoke: List[str]  # names this step revokes; empty for an apply
+    method: str = "set"
+
+
+@dataclass
+class ListPlan:
+    steps: List[ListStep]
+    forget: Dict[str, List[str]]  # recorded login items already gone
+
+
+def _apply_row(args: List[str], now: Optional[str]) -> str:
+    row = f"  ~ settings {' '.join(args[:-1])} {args[-1]!r}"
+    if now is not None:
+        row += f" (now {now!r})" if now else " (now none)"
+    return row
+
+
+def plan_lists(spec: Dict, runner: Optional[Runner], record: Dict[str, List[str]]) -> ListPlan:
+    """Applies and revokes for the list keys; reads only."""
+    result = ListPlan([], {})
+    for key in LIST_KEYS:
+        target = _names(key, spec.get(key) or [])
+        dropped = sorted(set(record.get(key) or []) - set(target))
+        if not target and not dropped:
+            continue
+        if key == "loginItems":
+            current = _login_items(runner)
+            if target:
+                if current is None or set(current) != set(target):
+                    args = _command(key, spec[key])
+                    now = None if current is None else ",".join(sorted(current))
+                    result.steps.append(ListStep(key, _apply_row(args, now), args, []))
+                continue
+            gone = [n for n in dropped if current is not None and n not in current]
+            if gone:
+                result.forget[key] = gone
+            for name in dropped:
+                if name in gone:
+                    continue
+                args = ["login", "remove", name]
+                result.steps.append(ListStep(key, f"  - settings {_shown(args)}", args, [name]))
+            continue
+        raw = _read_state(LIST_STATE[key])
+        applied = _state_names(key)
+        revoke = dropped
+        if target:
+            extras = set(applied) - set(record.get(key) or []) - set(target)
+            if sorted(applied) != sorted(target):
+                args = _command(key, spec[key], enable=bool(extras))
+                row = _apply_row(args, raw)
+                if extras:
+                    row += f" (leaves {','.join(sorted(extras))!r} alone)"
+                method = "enable" if extras else "set"
+                result.steps.append(ListStep(key, row, args, [], method))
+                if not extras:
+                    revoke = [n for n in dropped if n not in applied]
+        if revoke:
+            args = [PANE[key], "revoke", ",".join(revoke)]
+            row = f"  - settings {' '.join(args[:-1])} {args[-1]!r}"
+            result.steps.append(ListStep(key, row, args, revoke))
+    return result
 
 
 def plan_user(
     spec: Dict,
     runner: Optional[Runner],
     exists: Callable[[str], bool] = os.path.exists,
+    record: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
-    """([(diff row, settings args)], read errors) for declared user keys."""
+    """([(diff row, settings args)], read errors) for user keys and recorded lists."""
+    todo, errors = plan_other(spec, runner, exists)
+    lists = [(step.row, step.args) for step in plan_lists(spec, runner, record or {}).steps]
+    return lists + todo, errors
+
+
+def plan_other(
+    spec: Dict, runner: Optional[Runner], exists: Callable[[str], bool] = os.path.exists
+) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
+    """([(diff row, settings args)], read errors) for the user keys that are not lists."""
     todo: List[Tuple[str, List[str]]] = []
     errors: List[str] = []
-    for key in LIST_KEYS:
-        if key not in spec:
-            continue
-        done, now = _list_now(key, spec[key], runner)
-        if done:
-            continue
-        args = _command(key, spec[key])
-        row = f"  ~ settings {' '.join(args[:-1])} {args[-1]!r}"
-        if now is not None:
-            row += f" (now {now!r})" if now else " (now none)"
-        todo.append((row, args))
     if spec.get("appearanceInit") and not exists(os.path.expanduser(APPEARANCE_STATE)):
         todo.append(("  ~ settings appearance --init", ["appearance", "--init"]))
     if "defaultBrowser" in spec and runner:
@@ -360,8 +440,9 @@ def plan_user(
     return todo, errors
 
 
-def _needs_cli_as_user(spec: Dict) -> bool:
-    return any(k in spec for k in USER_KEYS)
+def _needs_cli_as_user(spec: Dict, record: Dict[str, List[str]]) -> bool:
+    others = any(k in spec for k in USER_KEYS if k not in LIST_KEYS)
+    return others or bool(record) or any(spec.get(k) for k in LIST_KEYS)
 
 
 # --------------------------------------------------------------------------
@@ -369,8 +450,8 @@ def _needs_cli_as_user(spec: Dict) -> bool:
 # --------------------------------------------------------------------------
 
 
-def has_work(raw) -> bool:
-    return raw is not None
+def has_work(raw, state: Optional[Dict] = None) -> bool:
+    return raw is not None or bool(recorded(state))
 
 
 def has_root_work(raw) -> bool:
@@ -393,6 +474,7 @@ def diff_settingsctl(
     run: Optional[Callable] = None,
     root: Optional[bool] = None,
     executable: Callable[[str], bool] = _executable,
+    state: Optional[Dict] = None,
 ) -> List[str]:
     if sys.platform != "darwin":
         return []
@@ -411,10 +493,10 @@ def diff_settingsctl(
         todo, read_errors = plan_root(spec, runner)
         return [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]
     rows: List[str] = []
-    needs = _needs_cli_as_user(spec)
-    if needs and not runner:
+    record = recorded(state)
+    if _needs_cli_as_user(spec, record) and not runner:
         rows.append(f"  ? `settings` not found (looked in {looked})")
-    todo, read_errors = plan_user(spec, runner, exists)
+    todo, read_errors = plan_user(spec, runner, exists, record)
     rows += [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]
     if has_root and not privilege.UNDER_SUDO:
         if not runner:
@@ -443,6 +525,47 @@ def _apply(runner: Runner, todo: List[Tuple[str, List[str]]]) -> bool:
     return success
 
 
+def _still_recorded(
+    key: str,
+    spec: Dict,
+    record: Dict[str, List[str]],
+    plan: ListPlan,
+    results: List[Tuple[ListStep, bool]],
+    runner: Runner,
+) -> List[str]:
+    """Names tools granted for key after this run's steps: what it applied, plus dropped
+    names whose revoke did not succeed."""
+    target = set(_names(key, spec.get(key) or []))
+    had = set(record.get(key) or [])
+    steps = [(step, ok) for step, ok in results if step.key == key]
+    applied = next(((step, ok) for step, ok in steps if not step.revoke), None)
+    names = had & target
+    after: Optional[set] = None
+    if target:
+        if applied is None or applied[1]:
+            names |= target
+        elif key == "loginItems":
+            current = _login_items(runner)
+            after = None if current is None else set(current)
+            names |= target & (after or set())
+        elif applied[0].method == "set":
+            after = set(_state_names(key))
+            names |= target & after
+        else:
+            names |= target
+    gone = set(plan.forget.get(key) or [])
+    for name in had - target:
+        if name in gone:
+            continue
+        revoke = next((ok for step, ok in steps if name in step.revoke), None)
+        if revoke is not None:
+            if not revoke:
+                names.add(name)
+        elif applied is not None and not applied[1] and (after is None or name in after):
+            names.add(name)
+    return sorted(names)
+
+
 def install_settingsctl(
     raw,
     paths: Optional[Dict] = None,
@@ -451,6 +574,7 @@ def install_settingsctl(
     run: Optional[Callable] = None,
     root: Optional[bool] = None,
     executable: Callable[[str], bool] = _executable,
+    state: Optional[Dict] = None,
 ) -> bool:
     if sys.platform != "darwin":
         log("settingsctl: skipping, not macOS", Color.YELLOW)
@@ -464,12 +588,13 @@ def install_settingsctl(
     has_root = any(k in spec for k in ROOT_KEYS)
     if root and not has_root:
         return True
+    record = {} if root else recorded(state)
     if not root:
         if has_root and not privilege.UNDER_SUDO:
             count = sum(1 for k in ROOT_KEYS if k in spec)
             msg = f"{count} system setting(s) not managed as user; {ROOT_HINT}"
             log(f"settingsctl: {msg}", Color.YELLOW)
-        if not _needs_cli_as_user(spec):
+        if not _needs_cli_as_user(spec, record):
             return True
     cli, looked = find_cli(spec, paths, root, which, executable)
     if not cli:
@@ -478,8 +603,27 @@ def install_settingsctl(
     runner = Runner(cli, run or run_command)
     if root:
         todo, read_errors = plan_root(spec, runner)
-    else:
-        todo, read_errors = plan_user(spec, runner, exists)
+        for err in read_errors:
+            log(f"settingsctl: {err}", Color.RED)
+        return _apply(runner, todo) and not read_errors
+    plan = plan_lists(spec, runner, record)
+    todo, read_errors = plan_other(spec, runner, exists)
     for err in read_errors:
         log(f"settingsctl: {err}", Color.RED)
-    return _apply(runner, todo) and not read_errors
+    results = [(step, _apply(runner, [(step.row, step.args)])) for step in plan.steps]
+    success = all(ok for _step, ok in results)
+    success = _apply(runner, todo) and success
+    if state is not None:
+        section = state.get("settingsctl")
+        section = section if isinstance(section, dict) else {}
+        for key in LIST_KEYS:
+            names = _still_recorded(key, spec, record, plan, results, runner)
+            if names:
+                section[key] = names
+            else:
+                section.pop(key, None)
+        if section:
+            state["settingsctl"] = section
+        else:
+            state.pop("settingsctl", None)
+    return success and not read_errors

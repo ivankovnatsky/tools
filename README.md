@@ -1028,10 +1028,18 @@ settingsctl:
   binary the user can replace, as with any other command in this config.
 - `appearanceInit` switches to dark mode once; settingsctl then writes
   `~/.local/state/settings/appearance/last-run` and later toggles are yours.
-- Lists are declarative: an app dropped from `fullDiskAccess` is turned off,
-  one dropped from `accessibility` is removed from the pane, and a login item
-  not listed is removed. Entries settingsctl never managed in the privacy panes
-  are left alone. settingsctl exits non-zero, failing the deploy, when the pane
+- Lists are declarative. After an apply, the names granted are recorded in
+  `state.json` under `settingsctl` (the first run records the configured names
+  once they are applied; settingsctl's own state files are not imported). A
+  recorded name dropped from its list, or whose key or the whole section goes
+  (`[]` counts as gone), is revoked: `settings fulldiskaccess revoke` turns it
+  off, `settings accessibility revoke` removes it from the pane, `settings
+  login remove` deletes the login item. Only recorded names are revoked; a
+  failed revoke stays recorded and is retried. When settingsctl's state names
+  apps tools never recorded, the list is applied with `enable` instead of
+  `set`, so those are left alone. While `loginItems` is declared, `login set`
+  still removes every login item not listed, including ones added by hand.
+- settingsctl exits non-zero, failing the deploy, when the pane
   cannot be read or a listed app is missing or stays off; its state file then
   records only the apps it still grants, so the next deploy retries. Apps
   not yet in a pane are added once by hand with the whole list, as `set` syncs
