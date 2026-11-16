@@ -14,6 +14,7 @@ from tools.state import (
     find_state_file,
     load_json,
     lock_path,
+    migrate_state_file,
     migrate_state_schema,
     save_json,
     state_lock,
@@ -139,6 +140,32 @@ class StateWriteTest(unittest.TestCase):
             self.assertEqual(find_state_file(current), legacy)
             # Read-only: nothing was migrated.
             self.assertFalse(os.path.exists(current))
+
+    def test_migrated_legacy_file_is_not_found_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            sibling = os.path.join(d, "manual-packages", "state.json")
+            relocated = os.path.join(d, "home-manager", "tools", "state.json")
+            for legacy in (sibling, relocated):
+                os.makedirs(os.path.dirname(legacy))
+                with open(legacy, "w") as f:
+                    json.dump({"uv": {"packages": [legacy]}}, f)
+            current = os.path.join(d, "tools", "state.json")
+
+            with mock.patch.object(state_mod, "LEGACY_STATE_FILES", [relocated]):
+                migrate_state_file(current)
+                self.assertEqual(load_json(current), {"uv": {"packages": [sibling]}})
+                self.assertFalse(os.path.exists(sibling))
+                self.assertTrue(os.path.isfile(f"{sibling}.migrated"))
+
+                os.unlink(current)
+                migrate_state_file(current)
+                self.assertEqual(load_json(current), {"uv": {"packages": [relocated]}})
+                self.assertFalse(os.path.exists(relocated))
+
+                os.unlink(current)
+                self.assertEqual(find_state_file(current), current)
+                migrate_state_file(current)
+                self.assertFalse(os.path.exists(current))
 
 
 class StateLockTest(unittest.TestCase):

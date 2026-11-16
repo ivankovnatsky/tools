@@ -234,4 +234,6 @@ def _migrate(old_state_file: str, new_state_file: str):
     )
     os.makedirs(os.path.dirname(new_state_file), exist_ok=True)
     shutil.copy2(old_state_file, new_state_file)
+    # Out of every lookup path, so removing state.json later can't bring its records back.
+    os.replace(old_state_file, f"{old_state_file}.migrated")
     log("State file migrated successfully", Color.GREEN)
