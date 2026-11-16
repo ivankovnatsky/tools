@@ -180,6 +180,18 @@ class RenderTest(TemplatesTestBase):
         self.deploy(raw)
         self.assertEqual(self.read(), f"user:{SECRET}\nliteral ${{HOME}}\n")
 
+    def test_raw_parts_join_in_key_order(self):
+        self.write_secret("password", SECRET)
+        parts = {"50-host": "b ${sops:password}", "10-base": "a\n", "60-empty": ""}
+        self.deploy(self.tpl(parts, fmt="raw"))
+        self.assertEqual(self.read(), f"a\nb {SECRET}\n")
+
+    def test_raw_part_must_be_string(self):
+        _, errors = templates.parse_templates(self.tpl({"a": 1}, fmt="raw"))
+        self.assertEqual(errors, ["app: raw content part 'a' must be a string"])
+        _, errors = templates.parse_templates(self.tpl({5: "a", 10: "b"}, fmt="raw"))
+        self.assertEqual(errors, ["app: raw content part names must be strings, got [5, 10]"])
+
     def test_ini_and_env_formats(self):
         self.write_secret("password", SECRET)
         self.deploy(self.tpl({"APP": "x", "db": {"PASSWD": "${sops:password}"}}, fmt="ini"))

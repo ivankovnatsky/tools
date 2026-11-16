@@ -6,7 +6,7 @@ Input is plain, already-resolved data keyed by template name::
       "<name>": {
         "path": "~/.config/app/app.ini",     # identity; default <secretsDir>/rendered/<name>
         "format": "ini",                     # yaml | json | toml | ini | env | raw
-        "content": {...} | "text",           # mapping/list, or text for raw
+        "content": {...} | "text",           # mapping/list; raw: text or {part: text}
         "mode": "0400", "owner": ..., "group": ...,
         "secrets": False,                    # force secret handling
         "restartUnits": ["launchd:org.example.app"],
@@ -114,8 +114,11 @@ def parse_templates(
                 raise ValueError(f"{name}: format must be one of {', '.join(FORMATS)}")
             if "content" not in spec:
                 raise ValueError(f"{name}: content is required")
-            if fmt == "raw" and not isinstance(spec["content"], str):
-                raise ValueError(f"{name}: raw content must be a string")
+            content = spec["content"]
+            if fmt == "raw" and isinstance(content, Mapping):
+                content = join_parts(content, name)
+            if fmt == "raw" and not isinstance(content, str):
+                raise ValueError(f"{name}: raw content must be a string or a mapping of parts")
             if fmt in ("ini", "env", "toml") and not isinstance(spec["content"], Mapping):
                 raise ValueError(f"{name}: {fmt} content must be a mapping")
             if fmt in ("json", "yaml") and not isinstance(spec["content"], (Mapping, list)):
@@ -146,7 +149,7 @@ def parse_templates(
                 name=name,
                 target=target,
                 format=fmt,
-                content=spec["content"],
+                content=content,
                 mode=mode,
                 owner=spec.get("owner"),
                 group=spec.get("group"),
@@ -158,6 +161,22 @@ def parse_templates(
             )
         )
     return result, errors
+
+
+def join_parts(parts: Mapping, name: str) -> str:
+    """Raw content given as {part: text}: parts join in sorted key order, each
+    ending in a newline. Mappings deep-merge across configs, so each config
+    can add its own part (e.g. ``10-base``, ``50-host``)."""
+    out = []
+    bad = [k for k in parts if not isinstance(k, str)]
+    if bad:
+        raise ValueError(f"{name}: raw content part names must be strings, got {bad!r}")
+    for key in sorted(parts):
+        text = parts[key]
+        if not isinstance(text, str):
+            raise ValueError(f"{name}: raw content part {key!r} must be a string")
+        out.append(text if not text or text.endswith("\n") else text + "\n")
+    return "".join(out)
 
 
 def render(t: Template, secret_lookup: Optional[SecretLookup]) -> Tuple[bytes, bool]:

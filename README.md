@@ -379,6 +379,7 @@ templates:
 ```
 
 - `content`: text for `raw`, mapping for `ini`/`env`/`toml`, mapping or list for `yaml`/`json`.
+- `raw` content may also be a mapping of parts (`{10-base: "...", 50-host: "..."}`), joined in sorted key order, each ending in a newline. Mappings deep-merge across configs, so each one can add its own part; every config must use this form, since a string replaces the mapping.
 - `env` values are shell single-quoted; `quote: false` writes `KEY=value`.
 - `${sops:}` renders from the same decryption as `sops`, so diff and deploy agree.
 - Default mode `0400`; `owner`/`group` and new dirs as in sops.
