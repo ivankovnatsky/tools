@@ -9,6 +9,6 @@ let
   ]);
 in
 pkgs.writeShellScriptBin "jira-custom" ''
-  export PYTHONPATH="${./.}:$PYTHONPATH"
-  exec ${python}/bin/python -m jira_custom "$@"
+  export PYTHONPATH="${./.}''${PYTHONPATH:+:$PYTHONPATH}"
+  exec ${python}/bin/python -P -m jira_custom "$@"
 ''
