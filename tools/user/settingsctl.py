@@ -163,7 +163,13 @@ class Runner:
     env: Optional[Dict[str, str]] = None
 
     def call(self, *args: str) -> Tuple[int, str, str]:
-        return self.run([self.cli, NO_STATE, *args], env=self.env)
+        rc, stdout, stderr = self.run([self.cli, NO_STATE, *args], env=self.env)
+        if rc != 0 and NO_STATE in (stderr or "") and "No such option" in (stderr or ""):
+            stderr = (
+                f"{self.cli} is too old for {NO_STATE}; update it "
+                "(tools deploy --update --only uv:settingsctl, or rebuild its nix package)"
+            )
+        return rc, stdout, stderr
 
     def get(self, *args: str) -> Dict:
         rc, stdout, stderr = self.call(*args, "--json")
@@ -355,9 +361,20 @@ def recorded(state: Optional[Dict]) -> Dict[str, List[str]]:
     }
 
 
+def _legacy_appearance_marker() -> str:
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    return os.path.join(home, ".local/state/settings/appearance/last-run")
+
+
 def _inited(state: Optional[Dict]) -> bool:
     section = (state or {}).get("settingsctl")
     return isinstance(section, dict) and section.get("appearanceInit") is True
+
+
+def _init_done(state: Optional[Dict]) -> bool:
+    """appearanceInit already ran: recorded, or settingsctl's own marker from before
+    tools recorded it, so an upgrade never forces dark mode again."""
+    return _inited(state) or os.path.exists(_legacy_appearance_marker())
 
 
 @dataclass
@@ -500,7 +517,7 @@ def diff_settingsctl(
     record = recorded(state)
     if _needs_cli_as_user(spec, record) and not runner:
         rows.append(f"  ? `settings` not found (looked in {looked})")
-    todo, read_errors = plan_user(spec, runner, record, _inited(state))
+    todo, read_errors = plan_user(spec, runner, record, _init_done(state))
     rows += [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]
     if has_root and not privilege.UNDER_SUDO:
         if not runner:
@@ -596,7 +613,7 @@ def install_settingsctl(
     if root and not has_root:
         return True
     record = {} if root else recorded(state)
-    inited = bool(spec.get("appearanceInit")) and _inited(state)
+    inited = bool(spec.get("appearanceInit")) and _init_done(state)
     if not root:
         if has_root and not privilege.UNDER_SUDO:
             count = sum(1 for k in ROOT_KEYS if k in spec)

@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -71,9 +72,12 @@ class FakeCli:
 
 class SettingsctlCase(unittest.TestCase):
     def setUp(self):
-        patch = mock.patch.object(settingsctl.sys, "platform", "darwin")
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (
+            mock.patch.object(settingsctl.sys, "platform", "darwin"),
+            mock.patch.object(settingsctl, "_legacy_appearance_marker", lambda: "/nonexistent"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
         self.fake = FakeCli()
 
     def grant(self, key, *names, on=True):
@@ -419,6 +423,17 @@ class AppearanceInitTest(SettingsctlCase):
     def test_false_does_nothing(self):
         self.assertEqual(self.diff({"appearanceInit": False}), [])
 
+    def test_legacy_marker_counts_as_already_inited(self):
+        with tempfile.NamedTemporaryFile() as marker:
+            with mock.patch.object(settingsctl, "_legacy_appearance_marker", lambda: marker.name):
+                raw = {"appearanceInit": True}
+                state = {}
+                self.assertEqual(self.diff(raw, state=state), [])
+                ok, commands = self._install(raw, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [])
+        self.assertEqual(state, {"settingsctl": {"appearanceInit": True}})
+
     def test_leaving_config_forgets_the_record(self):
         state = {"settingsctl": {"appearanceInit": True}}
         self.assertTrue(settingsctl.has_work(None, state))
@@ -662,3 +677,13 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OldCliTest(unittest.TestCase):
+    def test_cli_without_no_state_gets_a_clear_error(self):
+        def run(cmd, env=None):
+            return 2, "", "Error: No such option: --no-state"
+
+        rc, _, stderr = settingsctl.Runner("/old/settings", run).call("login", "list")
+        self.assertEqual(rc, 2)
+        self.assertIn("too old for --no-state", stderr)
