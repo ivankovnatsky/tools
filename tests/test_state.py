@@ -180,8 +180,9 @@ class StateLockTest(unittest.TestCase):
             state_file = os.path.join(d, "state.json")
             holder = os.open(lock_path(state_file), os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(holder, fcntl.LOCK_EX)
-            threading.Timer(0.2, os.close, args=(holder,)).start()
-            with mock.patch.object(state_mod, "log") as log:
+            with mock.patch.object(
+                state_mod, "log", side_effect=lambda *_: os.close(holder)
+            ) as log:
                 with state_lock(state_file):
                     pass
             self.assertIn("Waiting for another tools run", log.call_args[0][0])
