@@ -6,7 +6,7 @@ from unittest import mock
 import trash_fake
 
 from tools import diff as diff_mod
-from tools.user import git_repos
+from tools.user import git_repos, secrets_flow
 
 setUpModule = trash_fake.start
 tearDownModule = trash_fake.stop
@@ -232,12 +232,67 @@ class GitReposUpdateTest(unittest.TestCase):
     def test_non_repo_directory_is_not_marked_installed(self):
         # Marking it installed would make it a removal candidate later.
         with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "keep"), "w").close()
             state = {}
             fake = FakeGit()
 
             self.assertFalse(self._reconcile({d: "https://example/r.git"}, state, fake))
 
             self.assertNotIn(d, state.get("gitRepos", {}).get("installed", []))
+
+    def test_empty_directory_is_cloned_into(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = {}
+            fake = FakeGit()
+
+            self.assertTrue(self._reconcile({d: "https://example/r.git"}, state, fake))
+
+            self.assertIn(["git", "clone", "https://example/r.git", d], fake.commands)
+            self.assertEqual(state["gitRepos"]["installed"], [d])
+
+    def test_tracked_emptied_directory_is_cloned_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = {"gitRepos": {"installed": [d]}}
+            fake = FakeGit()
+
+            self.assertTrue(self._reconcile({d: "u"}, state, fake))
+
+            self.assertIn(["git", "clone", "u", d], fake.commands)
+
+
+class GitReposSpellingTest(unittest.TestCase):
+    def test_other_spelling_of_a_declared_repo_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as home:
+            home = os.path.realpath(home)
+            repo = os.path.join(home, "r")
+            os.makedirs(os.path.join(repo, ".git"))
+            state = {"gitRepos": {"installed": [repo]}}
+            fake, removed = FakeGit(), []
+            with (
+                mock.patch.dict(os.environ, {"HOME": home}),
+                mock.patch.object(git_repos, "system_bin", return_value="git"),
+                mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+                mock.patch.object(git_repos, "run_command", fake.run),
+                mock.patch.object(git_repos.shutil, "rmtree", side_effect=removed.append),
+            ):
+                self.assertTrue(git_repos.install_git_repos({"~/r": "u"}, state))
+
+            self.assertEqual(removed, [])
+            self.assertNotIn(["git", "clone", "u", repo], fake.commands)
+            self.assertEqual(state["gitRepos"]["installed"], ["~/r"])
+
+
+class LocalWorkTest(unittest.TestCase):
+    def test_ignored_files_count_as_local_work(self):
+        calls = []
+
+        def run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            return 0, ("!! .env" if "--ignored" in cmd else ""), ""
+
+        with mock.patch.object(git_repos, "run_command", run):
+            self.assertTrue(git_repos._has_local_work("git", "/r", {}))
+        self.assertEqual(calls[0], ["git", "-C", "/r", "status", "--porcelain", "--ignored"])
 
 
 class GitReposDiffTest(unittest.TestCase):
@@ -279,6 +334,32 @@ class GitReposDiffTest(unittest.TestCase):
             changes = diff_mod._diff_git_repos({d: "https://example/r.git"}, state)
 
             self.assertFalse(any("remove" in c for c in changes), changes)
+
+    def test_empty_directory_is_previewed_as_clone(self):
+        with tempfile.TemporaryDirectory() as d:
+            changes = diff_mod._diff_git_repos({d: "u"}, {"gitRepos": {"installed": [d]}})
+
+        self.assertEqual(changes, [f"  + clone {d}"])
+
+    def test_other_spelling_is_not_previewed_as_track_and_remove(self):
+        with tempfile.TemporaryDirectory() as home:
+            home = os.path.realpath(home)
+            repo = os.path.join(home, "r")
+            os.makedirs(os.path.join(repo, ".git"))
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                changes = diff_mod._diff_git_repos(
+                    {"~/r": "u"}, {"gitRepos": {"installed": [repo]}}
+                )
+
+        self.assertEqual(changes, [])
+
+    def test_empty_destination_awaits_the_clone(self):
+        with tempfile.TemporaryDirectory() as d:
+            inside = os.path.join(d, "secrets.yaml")
+            own = secrets_flow.ownership_conflicts(git_repos_raw={d: "u"}, clone_pending=True)
+
+            self.assertIsNone(own.repo_reason(inside))
+            self.assertIsNotNone(own.awaiting_clone(inside))
 
     def test_missing_checkout_is_previewed_as_clone(self):
         changes = diff_mod._diff_git_repos(

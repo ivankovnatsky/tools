@@ -21,14 +21,14 @@ def is_checkout(path: str) -> bool:
 
 
 def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
-    """True if the worktree has uncommitted changes or unpushed commits.
+    """True if the worktree has uncommitted changes, ignored files or unpushed commits.
 
     Removal trashes the whole checkout; anything not on a remote then lives
     only in the Trash.
     A repo we cannot interrogate counts as having work — refusing to
     delete costs a stale directory, deleting costs the work itself.
     """
-    rc, stdout, _ = run_command([git_bin, "-C", path, "status", "--porcelain"], env)
+    rc, stdout, _ = run_command([git_bin, "-C", path, "status", "--porcelain", "--ignored"], env)
     if rc != 0:
         return True
     if stdout.strip():
@@ -48,15 +48,28 @@ def _has_local_work(git_bin: str, path: str, env: Dict[str, str]) -> bool:
     return bool(stdout.strip())
 
 
+def _is_empty_dir(path: str) -> bool:
+    try:
+        return os.path.isdir(path) and not os.path.islink(path) and not os.listdir(path)
+    except OSError:
+        return False
+
+
 def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
     """Clone missing repositories; with ``update``, also pull existing ones."""
-    installed = set(state.get("gitRepos", {}).get("installed", []))
-    if not repos and not installed:
+    stored = set(state.get("gitRepos", {}).get("installed", []))
+    if not repos and not stored:
         return True
+    # State keys match declared paths by file identity, not spelling.
+    installed = set(fsutil.respell(dict.fromkeys(stored), repos.keys()))
     desired = set(repos.keys())
-    # A tracked checkout deleted by hand is cloned again.
+    # A tracked checkout deleted (or emptied) by hand is cloned again.
     to_install = {
-        d for d in desired if d not in installed or not os.path.exists(os.path.expanduser(d))
+        d
+        for d in desired
+        if d not in installed
+        or not os.path.exists(os.path.expanduser(d))
+        or _is_empty_dir(os.path.expanduser(d))
     }
     to_remove = installed - desired
     to_update = (
@@ -67,7 +80,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
 
     if not to_install and not to_remove and not to_update:
         debug("All git repos already installed", Color.BLUE)
-        if installed != desired:
+        if installed != stored:
             state.setdefault("gitRepos", {})["installed"] = sorted(installed)
         return True
 
@@ -115,7 +128,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
         repo_url = repos[dest_path]
         expanded_path = os.path.expanduser(dest_path)
 
-        if os.path.exists(expanded_path):
+        if os.path.exists(expanded_path) and not _is_empty_dir(expanded_path):
             # Only a real checkout gets pulled and recorded. An arbitrary
             # directory at that path is not a repo we manage, and marking it
             # installed would make it a removal candidate later.
@@ -146,7 +159,7 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
         installed.add(dest_path)
         state_changed = True
 
-    if state_changed or installed != desired:
+    if state_changed or installed != stored:
         state.setdefault("gitRepos", {})["installed"] = sorted(installed)
 
     return success
