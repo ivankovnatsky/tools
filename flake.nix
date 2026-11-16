@@ -33,6 +33,8 @@
           overlays = [ self.overlays.default ];
         };
 
+        cleanPythonSource = import ./packages/cleanPythonSource.nix { inherit lib; };
+
         programs = lib.filterAttrs (_: lib.meta.availableOn pkgs.stdenv.hostPlatform) (
           lib.genAttrs programNames (name: pkgs.${name})
         );
@@ -91,30 +93,56 @@
           default = toolsPackage;
         };
 
-        checks.default = toolsPackage.overridePythonAttrs (_: {
-          src = sourceWith [ ./tests ];
-          doCheck = true;
-          nativeCheckInputs = [ pkgs.git ];
-          checkPhase = ''
-            runHook preCheck
-            python -m unittest discover -s tests -v
-            runHook postCheck
-          '';
-        });
-
-        checks.settingsctl =
-          pkgs.runCommand "settingsctl-tests"
-            {
-              nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.click ])) ];
-              src = (import ./packages/cleanPythonSource.nix { inherit lib; }) ./packages/settingsctl;
-            }
-            ''
-              cp -r "$src" settingsctl
-              chmod -R u+w settingsctl
-              cd settingsctl
+        # Without the program builds, flake check only evaluates them.
+        checks = programs // {
+          default = toolsPackage.overridePythonAttrs (_: {
+            src = sourceWith [ ./tests ];
+            doCheck = true;
+            nativeCheckInputs = [ pkgs.git ];
+            checkPhase = ''
+              runHook preCheck
               python -m unittest discover -s tests -v
-              touch "$out"
+              runHook postCheck
             '';
+          });
+
+          settingsctl-tests =
+            pkgs.runCommand "settingsctl-tests"
+              {
+                nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.click ])) ];
+                src = cleanPythonSource ./packages/settingsctl;
+              }
+              ''
+                cp -r "$src" settingsctl
+                chmod -R u+w settingsctl
+                cd settingsctl
+                python -m unittest discover -s tests -v
+                touch "$out"
+              '';
+
+          # test_alerting imports digest from the sibling ../discord directory.
+          reposync-tests =
+            pkgs.runCommand "reposync-tests"
+              {
+                nativeBuildInputs = [
+                  (pkgs.python3.withPackages (ps: [
+                    ps.click
+                    ps.discord-webhook
+                  ]))
+                ];
+                reposync = cleanPythonSource ./packages/reposync;
+                discord = cleanPythonSource ./packages/discord;
+              }
+              ''
+                mkdir packages
+                cp -r "$reposync" packages/reposync
+                cp -r "$discord" packages/discord
+                chmod -R u+w packages
+                cd packages/reposync
+                python -m unittest test_alerting -v
+                touch "$out"
+              '';
+        };
 
         devShells.default = pkgs.mkShell {
           buildInputs = [

@@ -28,16 +28,36 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install ruff
-        run: pip install ruff
-
+      - uses: cachix/install-nix-action@v31
       - name: Run ruff
         run: |
-          ruff check .
-          ruff format --check .
+          nix develop -c ruff check .
+          nix develop -c ruff format --check .
+          # pyproject.toml excludes packages/; hold them to errors only.
+          nix develop -c ruff check --isolated --select F,E9 packages
+
+  wheels:
+    # Catches modules missing from a wheel's only-include/force-include
+    # lists. macOS because these wheels are installed on the Macs.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Build and smoke-test package wheels
+        run: |
+          set -euo pipefail
+          for pyproject in packages/*/pyproject.toml; do
+            dir=$(dirname "$pyproject")
+            name=$(basename "$dir")
+            case "$name" in
+              agent-sessions | dock-mgmt) continue ;;
+            esac
+            out="$RUNNER_TEMP/wheels/$name"
+            uv build --wheel --out-dir "$out" "$dir"
+            scripts=$(uv run --no-project --python '>=3.11' python -c 'import sys, tomllib; print(*tomllib.load(open(sys.argv[1], "rb"))["project"]["scripts"])' "$pyproject")
+            for script in $scripts; do
+              echo "::group::$name: $script --help"
+              uvx --isolated --from "$(echo "$out"/*.whl)" "$script" --help
+              echo "::endgroup::"
+            done
+          done
