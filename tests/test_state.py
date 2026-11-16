@@ -71,6 +71,18 @@ class StateSchemaTest(unittest.TestCase):
 
         self.assertEqual(state["npm"]["packages"], {"x": {"installed": True}})
 
+    def test_removed_dotfile_flags_are_forgotten(self):
+        state = {
+            "version": STATE_VERSION,
+            "npm": {"npmrc_created": True, "packages": {"x": {}}},
+            "bun": {"bunfig_created": True},
+        }
+
+        migrate_state_schema(state)
+
+        self.assertEqual(state["npm"], {"packages": {"x": {}}})
+        self.assertEqual(state["bun"], {})
+
 
 class StateWriteTest(unittest.TestCase):
     def test_save_is_atomic_and_leaves_no_temp(self):

@@ -457,12 +457,140 @@ class BrewOptionsTest(unittest.TestCase):
         self.assertEqual(
             fake.calls,
             [
+                ["/brew", "update"],
                 ["/brew", "upgrade", "--formula", "a"],
                 ["/brew", "upgrade", "--cask", "c"],
                 ["/brew", "install", "new"],
             ],
         )
         self.assertNotIn("HOMEBREW_NO_INSTALL_UPGRADE", fake.envs[0])
+
+    def test_update_refreshes_homebrew_even_with_auto_update_off(self):
+        config = {"brews": ["a"], "onActivation": {"autoUpdate": False}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", FakeBrew()) as fake,
+        ):
+            self.assertTrue(brew.install_brew_packages(config, _state(brews=["a"]), update=True))
+            self.assertEqual(
+                dict(brew.diff_brew(config, _state(brews=["a"]), True))["homebrew"],
+                ["    ~ update Homebrew (brew update)"],
+            )
+        self.assertEqual(fake.calls, [["/brew", "update"], ["/brew", "upgrade", "--formula", "a"]])
+        self.assertEqual(fake.envs[0]["HOMEBREW_NO_AUTO_UPDATE"], "1")
+
+    def test_update_without_brew_upgrades_skips_brew_update(self):
+        config = {"masApps": {"App": 1}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "_mas_bin_from_env", return_value="/mas"),
+            mock.patch.object(brew, "run_command", FakeBrew()) as fake,
+        ):
+            state = _state(masApps={"App": 1})
+            self.assertTrue(brew.install_brew_packages(config, state, update=True))
+            self.assertNotIn("homebrew", dict(brew.diff_brew(config, state, True)))
+        self.assertEqual(fake.calls, [["/mas", "upgrade", "1"]])
+
+    def test_failed_brew_update_still_upgrades(self):
+        fake = FakeBrew()
+        fake.fail.add("update")
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            result = brew.install_brew_packages({"brews": ["a"]}, _state(brews=["a"]), update=True)
+        self.assertFalse(result)
+        self.assertIn(["/brew", "upgrade", "--formula", "a"], fake.calls)
+
+    def test_tap_qualified_rename_only_renames_state(self):
+        for config_name, state_name in (("user/tap/foo", "foo"), ("foo", "user/tap/foo")):
+            for key in ("brews", "casks"):
+                with self.subTest(key=key, config=config_name):
+                    state = _state(**{key: [state_name]})
+                    config = {key: [config_name]}
+                    with (
+                        mock.patch.object(brew.sys, "platform", "darwin"),
+                        mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+                        mock.patch.object(brew, "run_command", FakeBrew()) as fake,
+                    ):
+                        self.assertEqual(brew.diff_brew(config, state), [])
+                        self.assertTrue(brew.install_brew_packages(config, state))
+                    self.assertEqual(fake.calls, [])
+                    self.assertEqual(state["brew"][key], [config_name])
+
+    def test_ambiguous_short_name_is_not_a_rename(self):
+        state = _state(brews=["foo"])
+        result, fake = self._run({"brews": ["a/b/foo", "c/d/foo"]}, state)
+        self.assertTrue(result)
+        self.assertIn(["/brew", "install", "a/b/foo", "c/d/foo"], fake.calls)
+        self.assertIn(["/brew", "uninstall", "foo"], fake.calls)
+
+    def test_move_to_another_tap_is_not_a_rename(self):
+        state = _state(brews=["a/b/foo"])
+        result, fake = self._run({"brews": ["c/d/foo"]}, state)
+        self.assertTrue(result)
+        self.assertIn(["/brew", "install", "c/d/foo"], fake.calls)
+        self.assertIn(["/brew", "uninstall", "a/b/foo"], fake.calls)
+
+    def test_renamed_cask_token_only_renames_state(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            if cmd[1:4] == ["info", "--json=v2", "--cask"]:
+                entry = {"token": "new-app", "full_token": "new-app", "old_tokens": ["old-app"]}
+                return 0, json.dumps({"casks": [entry]}), ""
+            if cmd[1:4] == ["info", "--json=v2", "--formula"]:
+                entry = {"name": "newf", "full_name": "newf", "aliases": [], "oldnames": ["oldf"]}
+                return 0, json.dumps({"formulae": [entry]}), ""
+            raise AssertionError(f"unexpected {cmd}")
+
+        config = {"brews": ["newf"], "casks": ["new-app"]}
+        state = _state(brews=["oldf"], casks=["old-app"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertEqual(brew.diff_brew(config, state), [])
+            self.assertTrue(brew.install_brew_packages(config, state))
+        self.assertEqual(state["brew"]["brews"], ["newf"])
+        self.assertEqual(state["brew"]["casks"], ["new-app"])
+        self.assertTrue(all(c[1] == "info" for c in calls))
+
+    def test_cask_old_token_never_renames_a_formula(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            if cmd[1:4] == ["info", "--json=v2", "--cask"]:
+                entry = {"token": "foo", "full_token": "foo", "old_tokens": ["bar"]}
+                return 0, json.dumps({"casks": [entry]}), ""
+            if cmd[1:4] == ["info", "--json=v2", "--formula"]:
+                entry = {"name": "foo", "full_name": "foo", "aliases": [], "oldnames": []}
+                return 0, json.dumps({"formulae": [entry]}), ""
+            return 0, "", ""
+
+        config = {"brews": ["foo"], "casks": ["foo", "baz"]}
+        state = _state(brews=["bar"], casks=["baz", "qux"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertTrue(brew.install_brew_packages(config, state))
+        self.assertIn(["/brew", "install", "foo"], calls)
+        self.assertIn(["/brew", "uninstall", "bar"], calls)
+
+    def test_unrelated_swap_still_installs_and_removes(self):
+        fake = FakeBrew(casks={"old-app": {}})
+        result, fake = self._run({"casks": ["new-app"]}, _state(casks=["old-app"]), fake)
+        self.assertTrue(result)
+        self.assertIn(["/brew", "install", "--cask", "new-app"], fake.calls)
+        self.assertIn(["/brew", "uninstall", "--cask", "old-app"], fake.calls)
 
     def test_without_cleanup_unmanaged_items_are_never_queried(self):
         result, fake = self._run({"brews": ["a"]}, _state(brews=["a"]))
@@ -897,14 +1025,24 @@ class BrewPhaseTest(unittest.TestCase):
     def test_install_phase_never_removes(self):
         state = self.state()
         calls = self._run(brew.INSTALL, state)
-        self.assertEqual(calls, [["tap", "x/new"], ["install", "new"]])
+        self.assertEqual(
+            calls, [["info", "--json=v2", "--formula", "new"], ["tap", "x/new"], ["install", "new"]]
+        )
         self.assertEqual(state["brew"]["brews"], ["new", "old"])
         self.assertEqual(state["brew"]["taps"], ["x/new", "x/old"])
 
     def test_remove_phase_never_installs(self):
         state = self.state()
         calls = self._run(brew.REMOVE, state)
-        self.assertEqual(calls, [["uninstall", "old"], ["autoremove"], ["untap", "x/old"]])
+        self.assertEqual(
+            calls,
+            [
+                ["info", "--json=v2", "--formula", "new"],
+                ["uninstall", "old"],
+                ["autoremove"],
+                ["untap", "x/old"],
+            ],
+        )
         self.assertEqual(state["brew"]["brews"], [])
         self.assertEqual(state["brew"]["taps"], [])
 
@@ -1105,7 +1243,7 @@ class BrewRestartUnitsTest(unittest.TestCase):
             return 0, "", ""
 
         self._run({"brews": ["jq"]}, _state(brews=["jq"]), fake_run, update=True)
-        self.assertEqual(calls, [["/brew", "upgrade", "--formula", "jq"]])
+        self.assertEqual(calls, [["/brew", "update"], ["/brew", "upgrade", "--formula", "jq"]])
 
     def test_diff_shows_queued_restart(self):
         with (

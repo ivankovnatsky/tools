@@ -78,7 +78,7 @@ Sections: `bun`, `npm`, `uv`, `go`, `cargo`, `pi`, `mcp`, `curlShell`, `gitRepos
   its state record is kept as it is. `brew` `onActivation.cleanup`,
   moves between `files`/`sops`/`templates`/`fetch`, a `defaults` key dropped
   from a selected domain, and pending `onChange` hooks of other entries wait
-  for a full run. `npm` `configFile` is not written.
+  for a full run.
 - `tools diff` with the same `--only` shows exactly what deploy would do.
 - A `uv` tool dir or `npm` prefix that changed since the last deploy is an
   error: run that section whole first.

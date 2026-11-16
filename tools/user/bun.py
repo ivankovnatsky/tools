@@ -3,6 +3,7 @@ from typing import Dict
 
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
+from tools.user.npm import CONFIG_FILE_REMOVED
 from tools.util import (
     checked_packages,
     pkg_spec_full,
@@ -23,20 +24,9 @@ def install_bun_packages(
     packages, ok = checked_packages("bun", packages)
     if not ok:
         return False
-    # Handle .bunfig.toml creation (only if bun.configFile is set)
-    bunfig_content = bun_config.get("configFile")
-    if bunfig_content and not state.get("bun", {}).get("bunfig_created"):
-        bunfig_path = os.path.expanduser("~/.bunfig.toml")
-        if not os.path.exists(bunfig_path):
-            log("Creating .bunfig.toml file", Color.GREEN)
-            # May carry registry auth, same as .npmrc — do not inherit umask.
-            fd = os.open(bunfig_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(bunfig_content)
-            state.setdefault("bun", {})["bunfig_created"] = True
-        else:
-            log(".bunfig.toml already exists, skipping creation", Color.BLUE)
-            state.setdefault("bun", {})["bunfig_created"] = True
+    if bun_config.get("configFile") is not None:
+        log(f"bun: {CONFIG_FILE_REMOVED}", Color.RED)
+        return False
 
     desired = set(packages.keys())
     # See npm: ownership is only meaningful against the prefix it was recorded

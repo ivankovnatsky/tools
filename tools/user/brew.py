@@ -298,6 +298,86 @@ def _plan(spec: BrewSpec, prev: Dict) -> Dict[str, list]:
     }
 
 
+def _adopt_renames(
+    spec: BrewSpec, prev: Dict, known: Optional[Dict[str, Dict[str, Set[str]]]] = None
+) -> Dict:
+    """`prev` with each recorded brew/cask that config now names differently
+    (tap-qualified vs short, or an alias, old name or old token in `known`)
+    recorded under the config's name, so it is neither installed nor removed.
+    """
+    known = known or {}
+    out = dict(prev)
+    for key in ("brews", "casks"):
+        recorded = set(prev.get(key, []))
+        desired = getattr(spec, key)
+        added = sorted(desired - recorded)
+        names = known.get(key, {})
+        renamed, taken = set(recorded), set()
+        for old in sorted(recorded - desired):
+            hits = [
+                n
+                for n in added
+                if n not in taken
+                and (
+                    old in _variants([n])
+                    or n in _variants([old])
+                    or names.get(n, set()) & _variants([old])
+                )
+            ]
+            if len(hits) == 1:
+                renamed = (renamed - {old}) | {hits[0]}
+                taken.add(hits[0])
+        if renamed != recorded:
+            out[key] = sorted(renamed)
+    return out
+
+
+def _known_names(
+    brew: str, env: Dict, spec: BrewSpec, prev: Dict
+) -> Dict[str, Dict[str, Set[str]]]:
+    """Every name brew knows for configured, unrecorded short names, when state
+    also holds names config dropped. Tap-qualified names are left out: they only
+    resolve once their tap is added."""
+    known: Dict[str, Dict[str, Set[str]]] = {}
+    for key, kind, section, keys in (
+        ("brews", "--formula", "formulae", _FORMULA_NAME_KEYS),
+        ("casks", "--cask", "casks", _CASK_NAME_KEYS),
+    ):
+        recorded = set(prev.get(key, []))
+        desired = getattr(spec, key)
+        added = sorted(n for n in desired - recorded if "/" not in n)
+        if not added or not recorded - desired:
+            continue
+        rc, stdout, _ = run_command([brew, "info", "--json=v2", kind] + added, env)
+        if rc != 0:
+            continue
+        try:
+            entries = json.loads(stdout).get(section) or []
+        except (ValueError, AttributeError):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            names = _entry_names(entry, keys)
+            for n in added:
+                if n in names:
+                    known.setdefault(key, {}).setdefault(n, set()).update(names)
+    return known
+
+
+def _resolve_renames(spec: BrewSpec, prev: Dict) -> Dict:
+    renamed = _adopt_renames(spec, prev)
+    plan = _plan(spec, renamed)
+    brew = _brew_bin()
+    if not brew or not (
+        (plan["brews_install"] and plan["brews_remove"])
+        or (plan["casks_install"] and plan["casks_remove"])
+    ):
+        return renamed
+    known = _known_names(brew, _brew_env(brew, spec), spec, renamed)
+    return _adopt_renames(spec, renamed, known) if known else renamed
+
+
 def _brew_env(brew: str, spec: BrewSpec, update: bool = False) -> Dict[str, str]:
     env = os.environ.copy()
     env["PATH"] = f"{os.path.dirname(brew)}:{env.get('PATH', '')}"
@@ -655,7 +735,11 @@ def install_brew_packages(
             log(f"brew: {err}", Color.RED)
         return False
 
-    prev = state.get("brew", {})
+    prev = _resolve_renames(spec, state.get("brew", {}))
+    if "brew" in state:
+        for key in ("brews", "casks"):
+            if prev.get(key, []) != state["brew"].get(key, []):
+                state["brew"][key] = prev[key]
     whole = _plan(spec, prev)
     # The other phase's work is left out; cleanup still sees all of it (e.g. App Store
     # apps still to remove keep `mas`).
@@ -756,6 +840,14 @@ def install_brew_packages(
             inst_trust.add(tap)
 
     # --- Upgrades of what was already installed, before installs and removals ---
+    if upgrades and (upgrade["--formula"] or upgrade["--cask"]):
+        # `brew upgrade` only sees new versions once the API cache or taps are
+        # refreshed, which autoUpdate: false otherwise never does.
+        log("Updating Homebrew", Color.BLUE)
+        rc, _, stderr = run_command([brew, "update"], env)
+        if rc != 0:
+            log(f"Failed to update Homebrew: {stderr}", Color.RED)
+            success = False
     if upgrades:
         for kind, units, label in (
             ("--formula", spec.brew_units, "brews"),
@@ -918,7 +1010,7 @@ def diff_brew(brew_config, state: Dict, update: bool = False) -> List[Tuple[str,
     if errors:
         return [("errors", [f"    ! {err}" for err in errors])]
 
-    prev = state.get("brew", {})
+    prev = _resolve_renames(spec, state.get("brew", {}))
     plan = _plan(spec, prev)
     if (any(plan.values()) or spec.cleanup) and (refusal := _nix_managed_error()):
         return [("errors", [f"    ! {refusal}"])]
@@ -943,6 +1035,8 @@ def diff_brew(brew_config, state: Dict, update: bool = False) -> List[Tuple[str,
     if update and (brew or bootstrap):
         upgrade["brews"] = sorted(set(prev.get("brews", [])) & spec.brews)
         upgrade["casks"] = sorted(set(prev.get("casks", [])) & spec.casks)
+        if upgrade["brews"] or upgrade["casks"]:
+            bootstrap.append("    ~ update Homebrew (brew update)")
         if brew and _mas_bin_from_env(_brew_env(brew, spec, update)):
             prev_ids = {str(i) for i in dict(prev.get("masApps", {})).values()}
             upgrade["mas"] = sorted((n, i) for n, i in spec.mas.items() if str(i) in prev_ids)

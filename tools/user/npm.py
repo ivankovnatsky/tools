@@ -16,6 +16,8 @@ from tools.util import (
     version_changed,
 )
 
+CONFIG_FILE_REMOVED = "configFile is no longer supported; manage the dotfile with files"
+
 
 def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
     binary = pkg_info.get("binary")
@@ -32,21 +34,9 @@ def install_npm_packages(
     packages, ok = checked_packages("npm", packages)
     if not ok:
         return False
-    # Handle .npmrc creation
-    npmrc_content = npm_config.get("configFile")
-    if npmrc_content and not state.get("npm", {}).get("npmrc_created"):
-        npmrc_path = os.path.expanduser("~/.npmrc")
-        if not os.path.exists(npmrc_path):
-            log("Creating .npmrc file", Color.GREEN)
-            # .npmrc routinely holds registry auth tokens, so it must not
-            # inherit a world-readable umask.
-            fd = os.open(npmrc_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(npmrc_content)
-            state.setdefault("npm", {})["npmrc_created"] = True
-        else:
-            log(".npmrc already exists, skipping creation", Color.BLUE)
-            state.setdefault("npm", {})["npmrc_created"] = True
+    if npm_config.get("configFile") is not None:
+        log(f"npm: {CONFIG_FILE_REMOVED}", Color.RED)
+        return False
 
     desired = set(packages.keys())
     # Packages recorded against a different global prefix live somewhere we no

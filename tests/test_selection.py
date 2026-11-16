@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import shutil
 import tempfile
@@ -231,14 +232,13 @@ class DeployTest(unittest.TestCase):
         )
         config = {
             "paths": {"nodejs": "/node", "npmBin": "/n/bin"},
-            "npm": {"configFile": "x=1", "packages": {"new": {}}},
+            "npm": {"packages": {"new": {}}},
         }
         with (
             mock.patch.dict(os.environ, {"HOME": self.tmp}),
             mock.patch("tools.user.npm.run_command", side_effect=ok) as run,
         ):
             self.assertTrue(self.deploy(config, {"npm": frozenset({"new"})}))
-        self.assertFalse(os.path.exists(os.path.join(self.tmp, ".npmrc")))
         self.assertEqual([c.args[0][1:] for c in run.call_args_list], [["install", "-g", "new"]])
         self.assertEqual(self.state()["npm"]["packages"]["gone"], {"v": 1})
 
@@ -269,7 +269,8 @@ class DeployTest(unittest.TestCase):
         rows = " ".join(str(c.args[0]) for c in dlog.call_args_list)
         self.assertIn("+ install new", rows)
         self.assertNotIn("remove", rows)
-        self.assertEqual([c.args[0][1:] for c in run.call_args_list], [["install", "new"]])
+        changes = [c.args[0][1:] for c in run.call_args_list if c.args[0][1] != "info"]
+        self.assertEqual(changes, [["install", "new"]])
         state = self.state()["brew"]
         for key, value in prev.items():
             if key != "brews":
@@ -286,6 +287,29 @@ class DeployTest(unittest.TestCase):
         upgrade = [c for c in run.call_args_list if c.args[0][1] == "upgrade"]
         self.assertEqual([c.args[0][1:] for c in upgrade], [["upgrade", "--formula", "new"]])
         self.assertEqual(upgrade[0].args[1]["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"], "1")
+
+    def test_brew_rename_of_a_dropped_name_is_adopted(self):
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd[1:])
+            if cmd[1:4] == ["info", "--json=v2", "--formula"]:
+                entry = {"name": "newf", "full_name": "newf", "aliases": [], "oldnames": ["oldf"]}
+                return 0, json.dumps({"formulae": [entry]}), ""
+            return 0, "", ""
+
+        for old, new in (("foo", "user/tap/foo"), ("oldf", "newf")):
+            with self.subTest(new=new):
+                calls: list = []
+                save_json(self.state_file, {"version": 2, "brew": {"brews": [old, "gone", "kept"]}})
+                config = {"brew": {"brews": ["kept", new]}}
+                only = {"brew": frozenset({new})}
+                with (
+                    mock.patch.object(brew_mod.sys, "platform", "darwin"),
+                    mock.patch.object(brew_mod, "_brew_bin", return_value="/brew"),
+                    mock.patch.object(brew_mod, "run_command", side_effect=fake_run),
+                ):
+                    self.assertTrue(self.deploy(config, only))
+                self.assertTrue(all(c[0] == "info" for c in calls), calls)
+                self.assertEqual(self.state()["brew"]["brews"], sorted(["gone", "kept", new]))
 
     def test_brew_app_store_id_change_refuses_without_uninstall(self):
         save_json(self.state_file, {"version": 2, "brew": {"masApps": {"App": 1}}})

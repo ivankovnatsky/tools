@@ -35,7 +35,7 @@ from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
-from tools.user.npm import binary_missing
+from tools.user.npm import CONFIG_FILE_REMOVED, binary_missing
 from tools.user.ollama_models import diff_ollama_models
 from tools.user.plist import diff_plist
 from tools.user.plist import has_work as plist_has_work
@@ -124,6 +124,8 @@ def _diff_js(section: str, packages: Dict, state: Dict, prefix_key: str, paths: 
 
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update: bool = False):
+    if bun_config.get("configFile") is not None:
+        return [f"  ! {CONFIG_FILE_REMOVED}"]
     changes, state_packages = _diff_js("bun", packages, state, "bunBin", paths)
 
     for pkg, pkg_info in packages.items():
@@ -138,21 +140,13 @@ def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update
             err = _units_error("bun", pkg, pkg_info)
             changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
 
-    bunfig_content = bun_config.get("configFile")
-    if bunfig_content and not state.get("bun", {}).get("bunfig_created"):
-        if not os.path.exists(os.path.expanduser("~/.bunfig.toml")):
-            changes.append("  + create ~/.bunfig.toml")
-
     return changes
 
 
 def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False):
+    if npm_config.get("configFile") is not None:
+        return [f"  ! {CONFIG_FILE_REMOVED}"]
     changes: List[str] = []
-    npmrc_content = npm_config.get("configFile")
-    if npmrc_content and not state.get("npm", {}).get("npmrc_created"):
-        if not os.path.exists(os.path.expanduser("~/.npmrc")):
-            changes.append("  + create ~/.npmrc")
-
     rows, state_packages = _diff_js("npm", packages, state, "npmBin", paths)
     changes += rows
     stored = state.get("npm", {}).get("packages", {}) if state_packages else {}

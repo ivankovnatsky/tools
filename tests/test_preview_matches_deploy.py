@@ -129,6 +129,7 @@ class UpdatePreviewTest(unittest.TestCase):
             self.assertEqual(
                 dict(brew.diff_brew(config, state, True)),
                 {
+                    "homebrew": ["    ~ update Homebrew (brew update)"],
                     "brews": ["    ~ upgrade a"],
                     "casks": ["    ~ upgrade c"],
                     "masApps": ["    ~ upgrade App (1)"],
@@ -275,8 +276,8 @@ class RemovalRowsTest(unittest.TestCase):
         record = lambda *a, **k: calls.append(a) or (0, "", "")  # noqa: E731
         state = {"npm": {"packages": {"old": {}}}}
         for module, run in (
-            (npm, lambda p: npm.install_npm_packages(p, {}, state, {"configFile": "x"})),
-            (bun, lambda p: bun.install_bun_packages(p, {}, state, {"configFile": "x"})),
+            (npm, lambda p: npm.install_npm_packages(p, {}, state, {})),
+            (bun, lambda p: bun.install_bun_packages(p, {}, state, {})),
             (uv, lambda p: uv.install_uv_packages(p, {}, state)),
             (go, lambda p: go.install_go_packages(p, {}, state)),
             (cargo, lambda p: cargo.install_cargo_packages(p, {}, state)),
@@ -307,17 +308,24 @@ class NpmPreviewTest(unittest.TestCase):
         self.tmp = self._tmp.name
         self.paths = {"npmBin": os.path.join(self.tmp, "bin"), "nodejs": "/node"}
 
-    def test_config_file_is_previewed(self):
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
-            self.assertEqual(
-                diff_mod._diff_npm({}, {}, {}, {"configFile": "x"}), ["  + create ~/.npmrc"]
-            )
+    def test_removed_config_file_is_an_error(self):
+        from tools.user import bun
 
-    def test_config_file_without_packages_or_paths_deploys(self):
-        state: dict = {}
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
-            self.assertTrue(_quiet(npm.install_npm_packages, {}, {}, state, {"configFile": "x"}))
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, ".npmrc")))
+        error = [f"  ! {npm.CONFIG_FILE_REMOVED}"]
+        state: dict = {"npm": {"packages": {"a": {}}}, "bun": {"packages": {"b": {}}}}
+        with (
+            mock.patch.dict(os.environ, {"HOME": self.tmp}),
+            mock.patch.object(npm, "run_command") as npm_run,
+            mock.patch.object(bun, "run_command") as bun_run,
+        ):
+            self.assertEqual(diff_mod._diff_npm({}, {}, state, {"configFile": "x"}), error)
+            self.assertEqual(diff_mod._diff_bun({}, {}, state, {"configFile": "x"}), error)
+            self.assertFalse(_quiet(npm.install_npm_packages, {}, {}, state, {"configFile": "x"}))
+            self.assertFalse(_quiet(bun.install_bun_packages, {}, {}, state, {"configFile": "x"}))
+        npm_run.assert_not_called()
+        bun_run.assert_not_called()
+        self.assertEqual(os.listdir(self.tmp), [])
+        self.assertEqual(state, {"npm": {"packages": {"a": {}}}, "bun": {"packages": {"b": {}}}})
 
     def test_post_install_and_subpackages_are_previewed(self):
         os.makedirs(os.path.join(self.tmp, "lib", "node_modules", "a"))

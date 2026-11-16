@@ -16,7 +16,7 @@ from tools.user import defaults as defaults_section
 from tools.user import launchd as launchd_section
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
-from tools.user.brew import _normalize_tap, entry_name, parse_brew
+from tools.user.brew import _normalize_tap, _resolve_renames, entry_name, parse_brew
 from tools.user.files import _resolve_entries, declared_hooks
 from tools.user.secrets_flow import template_hooks
 
@@ -97,8 +97,7 @@ class _Packages:
 
     def config(self, raw, names, ctx):
         packages = _dict(_dict(raw).get("packages"))
-        # Not an item: `configFile` writes a dotfile once.
-        out = {k: v for k, v in _dict(raw).items() if k != "configFile"}
+        out = dict(_dict(raw))
         out["packages"] = {k: v for k, v in packages.items() if k in names}
         return out
 
@@ -217,6 +216,17 @@ class _Brew:
             stash[key] = [
                 v for v in value if (_normalize_tap(v) if "aps" in key else v) not in keep[key]
             ]
+        # A dropped name the selected one renames stays visible, so it is adopted
+        # rather than set aside and later uninstalled under its old name.
+        full = self._names(ctx.config.get("brew"))
+        candidates = {
+            key: [v for v in prev.get(key, []) if v in keep[key] or v not in full[key]]
+            for key in ("brews", "casks")
+        }
+        resolved = _resolve_renames(parse_brew(view)[0], candidates)
+        for key in ("brews", "casks"):
+            adopted = set(candidates[key]) - set(resolved.get(key, []))
+            stash[key] = [v for v in stash[key] if v not in adopted]
         mas = prev.get("masApps", {})
         if not isinstance(mas, dict):
             raise _bad_state("brew")

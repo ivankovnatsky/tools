@@ -140,6 +140,10 @@ def migrate_state_schema(state: Dict) -> Dict:
             f"State file is version {found} but this tools understands {STATE_VERSION}. "
             "Upgrade tools, or remove the state file to start fresh."
         )
+    for section_name, flag in (("npm", "npmrc_created"), ("bun", "bunfig_created")):
+        section = state.get(section_name)
+        if isinstance(section, dict):
+            section.pop(flag, None)
     if found == STATE_VERSION:
         return state
 
