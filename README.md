@@ -990,19 +990,20 @@ written, restored or deleted, and Dock tiles added, changed or removed
 ## settingsctl
 
 `settingsctl:` drives settingsctl (`settings`, from `packages/settingsctl`) on
-macOS only. Each declared list is synced with `set` when it differs from what
-settingsctl last applied (its state files under `~/.local/state/settings`) or,
-for login items, from the current login items. Every other key is read first
-and set only when it differs; `diff` shows the commands deploy would run and
-the current values.
+macOS only. Every command runs as `settings --no-state ...`, so settingsctl
+neither reads nor writes `~/.local/state/settings`; what tools granted is
+recorded only in `state.json` under `settingsctl`. As the user, `settings` runs
+with `HOME` from the passwd entry and without `SUDO_*` variables. Every other
+key is read first and set only when it differs; `diff` shows the commands
+deploy would run and the current values.
 
 ```yaml
 settingsctl:
   path: /usr/local/bin/settings               # optional, see below
-  fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess set
-  accessibility: [Hammerspoon, kitty]         # settings accessibility set
-  loginItems: [Hammerspoon, LosslessSwitcher] # settings login set
-  appearanceInit: true    # settings appearance --init, while its state file is missing
+  fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess --enable / revoke
+  accessibility: [Hammerspoon, kitty]         # settings accessibility enable / revoke
+  loginItems: [Hammerspoon, LosslessSwitcher] # settings login add / remove
+  appearanceInit: true    # settings appearance --init, once
   defaultBrowser: firefox # settings defaultbrowser set; macOS asks to confirm
   # root only: sudo tools deploy
   hostName: my-mac        # settings hostname set --host-name
@@ -1026,25 +1027,24 @@ settingsctl:
   of the invoking user, failing when none has it. On a fresh machine run
   `tools deploy` once without sudo so `uv` installs it. Root then runs a
   binary the user can replace, as with any other command in this config.
-- `appearanceInit` switches to dark mode once; settingsctl then writes
-  `~/.local/state/settings/appearance/last-run` and later toggles are yours.
-- Lists are declarative. After an apply, the names granted are recorded in
-  `state.json` under `settingsctl` (the first run records the configured names
-  once they are applied; settingsctl's own state files are not imported). A
-  recorded name dropped from its list, or whose key or the whole section goes
-  (`[]` counts as gone), is revoked: `settings fulldiskaccess revoke` turns it
-  off, `settings accessibility revoke` removes it from the pane, `settings
-  login remove` deletes the login item. Only recorded names are revoked; a
-  failed revoke stays recorded and is retried. When settingsctl's state names
-  apps tools never recorded, the list is applied with `enable` instead of
-  `set`, so those are left alone. While `loginItems` is declared, `login set`
-  still removes every login item not listed, including ones added by hand.
-- settingsctl exits non-zero, failing the deploy, when the pane
-  cannot be read or a listed app is missing or stays off; its state file then
-  records only the apps it still grants, so the next deploy retries. Apps
-  not yet in a pane are added once by hand with the whole list, as `set` syncs
-  to it: `settings fulldiskaccess set "A,B,NEW" --add-missing` (needs
-  authentication).
+- `appearanceInit` switches to dark mode once; tools records
+  `appearanceInit: true` in `state.json` and later toggles are yours. Dropping
+  the key forgets the record, so adding it back initialises again.
+- Lists are additive plus revoke. A privacy list with names not yet recorded
+  reads the pane (`settings <pane> list --json`) and enables the configured
+  names that are not on; fully recorded lists skip the pane. Login items are
+  read with `settings login list` on every run and missing ones added with
+  `settings login add`. A recorded name dropped from its list, or whose key or
+  the whole section goes (`[]` counts as gone), is revoked: `settings
+  fulldiskaccess revoke` turns it off, `settings accessibility revoke` removes
+  it from the pane, `settings login remove` deletes the login item. Entries
+  tools never recorded (added by hand) are never touched.
+- settingsctl exits non-zero, failing the deploy, when the pane cannot be read
+  or a listed app is missing or stays off. tools then reads the live list again
+  and records what it shows granted; when that read fails, failed revokes stay
+  recorded and failed applies record their targets. Apps not yet in a pane are
+  added once by hand: `settings accessibility enable "NEW" --add-missing`
+  (needs authentication).
 - Without `settings` on the machine, `diff` reports it whenever a user key is
   declared, since deploy fails then.
 - A scalar key that leaves config is left as is. Any config error holds the
