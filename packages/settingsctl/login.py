@@ -8,7 +8,7 @@ from pathlib import Path
 
 import click
 
-from common import _get_state_dir, is_macos, quit_app
+from common import _get_state_dir, is_macos, quit_app, state_disabled
 
 
 def login_state_file() -> Path:
@@ -16,6 +16,8 @@ def login_state_file() -> Path:
 
 
 def login_state_matches(app_list: list[str]) -> bool:
+    if state_disabled():
+        return False
     state = login_state_file()
     if not state.exists():
         return False
@@ -23,6 +25,8 @@ def login_state_matches(app_list: list[str]) -> bool:
 
 
 def login_write_state(app_list: list[str]) -> None:
+    if state_disabled():
+        return
     login_state_file().write_text(",".join(sorted(app_list)))
 
 
@@ -36,11 +40,6 @@ def login_list_status() -> tuple[bool, list[str]]:
     if not names:
         return True, []
     return True, [n.strip() for n in names.split(",")]
-
-
-def login_list() -> list[str]:
-    _, items = login_list_status()
-    return items
 
 
 def _app_name(entry: str) -> str:
@@ -163,7 +162,10 @@ def register(cli):
                 return
             ok = True
             for app in app_list:
-                existing = login_list()
+                read, existing = login_list_status()
+                if not read:
+                    print("Could not read login items", file=sys.stderr)
+                    sys.exit(1)
                 if _app_name(app) in existing:
                     print(f"Already a login item: {app}")
                     continue
@@ -185,7 +187,10 @@ def register(cli):
                 sys.exit(1)
             ok = True
             for app in app_list:
-                existing = login_list()
+                read, existing = login_list_status()
+                if not read:
+                    print("Could not read login items", file=sys.stderr)
+                    sys.exit(1)
                 if app not in existing:
                     print(f"Not a login item: {app}")
                     continue

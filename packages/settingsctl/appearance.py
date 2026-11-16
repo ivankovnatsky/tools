@@ -10,7 +10,7 @@ from pathlib import Path
 
 import click
 
-from common import is_kde, is_macos
+from common import is_kde, is_macos, state_disabled
 
 
 def _get_skylight():
@@ -154,12 +154,16 @@ def appearance_get_state_file() -> Path:
 
 
 def appearance_write_state() -> None:
+    if state_disabled():
+        return
     state_dir = appearance_get_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     appearance_get_state_file().write_text(date.today().isoformat())
 
 
 def appearance_remove_state() -> None:
+    if state_disabled():
+        return
     try:
         appearance_get_state_file().unlink()
     except FileNotFoundError:
@@ -198,7 +202,9 @@ def appearance_open_settings() -> None:
 def register(cli):
     @cli.command()
     @click.option(
-        "--init", is_flag=True, help="Initialize to dark mode without toggling"
+        "--init",
+        is_flag=True,
+        help="Initialize to dark mode without toggling; once, unless --no-state",
     )
     def appearance(init):
         """Toggle dark/light mode and wallpaper"""
@@ -207,11 +213,11 @@ def register(cli):
             sys.exit(1)
 
         if init:
-            appearance_get_state_dir().mkdir(parents=True, exist_ok=True)
-            state_file = appearance_get_state_file()
-            if state_file.exists():
-                print("Skipping appearance init (already configured)")
-                return
+            if not state_disabled():
+                appearance_get_state_dir().mkdir(parents=True, exist_ok=True)
+                if appearance_get_state_file().exists():
+                    print("Skipping appearance init (already configured)")
+                    return
             appearance_set_dark_mode(True)
             print("Initialized appearance")
             appearance_write_state()

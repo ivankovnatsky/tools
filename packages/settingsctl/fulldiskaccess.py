@@ -8,23 +8,20 @@ from pathlib import Path
 
 import click
 
-from common import _get_state_dir, is_macos
+from common import _get_state_dir, is_macos, state_disabled
 from privacy_pane import (
     enable_apps,
     ensure_disabled,
     ensure_enabled,
+    NO_STATE_SET,
     list_apps,
     parse_app_specs,
     partial_state,
+    print_list,
     toggle_app,
 )
 
 FDA_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-
-
-def fda_list() -> list[dict]:
-    """List apps in Full Disk Access with their enabled status."""
-    return list_apps(FDA_URL) or []
 
 
 def fda_toggle(app_name: str) -> bool | None:
@@ -42,6 +39,8 @@ def fda_state_file() -> Path:
 
 
 def fda_state_matches(enable_apps: list[str]) -> bool:
+    if state_disabled():
+        return False
     state = fda_state_file()
     if not state.exists():
         return False
@@ -54,6 +53,8 @@ def fda_write_state(enable_apps: list[str]) -> None:
 
 
 def fda_previous_state() -> list[str]:
+    if state_disabled():
+        return []
     state = fda_state_file()
     if not state.exists():
         return []
@@ -61,6 +62,8 @@ def fda_previous_state() -> list[str]:
 
 
 def _record(names: list[str]) -> None:
+    if state_disabled():
+        return
     try:
         fda_write_state(names)
     except Exception as e:
@@ -109,10 +112,11 @@ def fda_set(apps: dict[str, str | None], add_missing: bool = False) -> bool:
 def fda_revoke(names: list[str]) -> bool:
     """Turn these apps off and drop them from the state file; apps not listed are off."""
     ok, off = ensure_disabled(FDA_URL, "Full Disk Access", names)
-    previous = fda_previous_state()
-    kept = [a for a in previous if not off.get(a)]
-    if kept != previous:
-        _record(kept)
+    if not state_disabled():
+        previous = fda_previous_state()
+        kept = [a for a in previous if not off.get(a)]
+        if kept != previous:
+            _record(kept)
     return ok
 
 
@@ -132,12 +136,13 @@ def register(cli):
         "action", required=False, type=click.Choice(["list", "toggle", "open", "set", "revoke"]),
     )
     @click.argument("app", required=False)
-    def fulldiskaccess(enable_apps, add_missing, action, app):
+    @click.option("--json", "as_json", is_flag=True, help="With list: print JSON.")
+    def fulldiskaccess(enable_apps, add_missing, action, app, as_json):
         """Manage Full Disk Access permissions (macOS only)
 
         \b
         Actions:
-          list                Show all entries and their enabled state
+          list [--json]       Show all entries and their enabled state
           toggle APP          Toggle an app's enabled state
           set "APP1,APP2,..." Declaratively sync to list; turns off previously
                               managed apps no longer in the list
@@ -158,6 +163,9 @@ def register(cli):
             return
 
         if action == "set":
+            if state_disabled():
+                print(NO_STATE_SET, file=sys.stderr)
+                sys.exit(2)
             if app is None:
                 print(
                     "Error: specify app list (use empty string for none)",
@@ -182,13 +190,8 @@ def register(cli):
             return
 
         if action == "list":
-            items = fda_list()
-            if not items:
-                print("No Full Disk Access items found (or could not read)")
-            else:
-                for item in items:
-                    status = "enabled" if item["enabled"] else "disabled"
-                    print(f"  {item['name']}: {status}")
+            if not print_list(list_apps(FDA_URL), "Full Disk Access", as_json):
+                sys.exit(1)
             return
 
         if action == "toggle":

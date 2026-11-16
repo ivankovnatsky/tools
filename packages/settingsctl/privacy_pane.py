@@ -356,6 +356,27 @@ def ensure_disabled(
     return ok, outcome
 
 
+def print_list(items: list[dict] | None, label: str, as_json: bool) -> bool:
+    """Print a pane's rows (or {"items": [...]} as JSON); False when unreadable."""
+    if items is None:
+        print(f"Could not read the {label} list", file=sys.stderr)
+        return False
+    if as_json:
+        import json
+
+        print(json.dumps({"items": items}))
+    elif not items:
+        print(f"No {label} items found")
+    else:
+        for item in items:
+            status = "enabled" if item["enabled"] else "disabled"
+            print(f"  {item['name']}: {status}")
+    return True
+
+
+NO_STATE_SET = "Error: set needs the state file; with --no-state use enable and revoke"
+
+
 def partial_state(
     previous: list[str], gone: dict[str, bool], enabled: dict[str, bool]
 ) -> list[str]:

@@ -28,6 +28,7 @@ Subcommands:
 
 import click
 
+import common
 from common import AliasedGroup
 
 import accessibility
@@ -57,9 +58,15 @@ import windows
 
 
 @click.group(cls=AliasedGroup, invoke_without_command=True)
+@click.option(
+    "--no-state",
+    is_flag=True,
+    help="Neither read nor write ~/.local/state/settings; act on the live system only.",
+)
 @click.pass_context
-def cli(ctx):
+def cli(ctx, no_state):
     """Toggle system settings (appearance, menubar, scaling)"""
+    common.NO_STATE = no_state
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 

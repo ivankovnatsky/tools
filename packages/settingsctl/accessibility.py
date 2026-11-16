@@ -12,14 +12,20 @@ from accessibility_state import (
     accessibility_set,
 )
 from accessibility_ui import (
+    ACCESSIBILITY_URL,
     accessibility_add,
-    accessibility_list,
     accessibility_open,
     accessibility_remove,
     accessibility_toggle,
 )
-from common import is_macos
-from privacy_pane import parse_app_specs, resolve_app_path
+from common import is_macos, state_disabled
+from privacy_pane import (
+    NO_STATE_SET,
+    list_apps,
+    parse_app_specs,
+    print_list,
+    resolve_app_path,
+)
 
 
 def register(cli):
@@ -35,11 +41,12 @@ def register(cli):
         is_flag=True,
         help="With enable/set: add unlisted apps via + (needs you to authenticate).",
     )
-    def accessibility(action, app, add_missing):
+    @click.option("--json", "as_json", is_flag=True, help="With list: print JSON.")
+    def accessibility(action, app, add_missing, as_json):
         """Manage accessibility permissions (macOS only)
 
         Actions:
-          list                    Show all entries and their enabled state
+          list [--json]           Show all entries and their enabled state
           add APP                 Add an app entry (UI automation; may prompt)
           remove APP              Remove an app entry
           toggle APP              Toggle an app's enabled state
@@ -57,6 +64,9 @@ def register(cli):
             sys.exit(1)
 
         if action == "set":
+            if state_disabled():
+                print(NO_STATE_SET, file=sys.stderr)
+                sys.exit(2)
             if app is None:
                 print(
                     "Error: specify app list (use empty string for none)",
@@ -93,13 +103,8 @@ def register(cli):
             return
 
         if action == "list":
-            items = accessibility_list()
-            if not items:
-                print("No accessibility items found (or could not read)")
-            else:
-                for item in items:
-                    status = "enabled" if item["enabled"] else "disabled"
-                    print(f"  {item['name']}: {status}")
+            if not print_list(list_apps(ACCESSIBILITY_URL), "accessibility", as_json):
+                sys.exit(1)
             return
 
         if action == "add":

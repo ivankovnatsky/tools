@@ -115,22 +115,34 @@ def quit_app(app_name: str) -> bool:
     return result.returncode == 0
 
 
-def _get_state_dir() -> Path:
-    """Return persistent state directory (~/.local/state/settings/).
+NO_STATE = False
 
-    When running under sudo (e.g. nix-darwin activation), Path.home()
-    resolves to /var/root/ which is wrong.  Use SUDO_USER to find the
-    real user's home so that state files are shared between interactive
-    and activation contexts.
+
+def state_disabled() -> bool:
+    """True under `settings --no-state`: no command reads or writes the state dir."""
+    return NO_STATE
+
+
+def _user_home() -> Path:
+    """Home of the user the state belongs to.
+
+    Root under sudo (nix-darwin activation) uses SUDO_USER's home, since its own is
+    /var/root. Anyone else uses their passwd home: home-manager activation runs as
+    the user with SUDO_USER=root and HOME possibly still /var/root.
     """
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        import pwd
+    import pwd
 
-        home = Path(pwd.getpwnam(sudo_user).pw_dir)
-    else:
-        home = Path.home()
-    d = home / ".local" / "state" / "settings"
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _get_state_dir() -> Path:
+    """Return persistent state directory (~/.local/state/settings/)."""
+    if state_disabled():
+        raise RuntimeError("state directory used under --no-state")
+    d = _user_home() / ".local" / "state" / "settings"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

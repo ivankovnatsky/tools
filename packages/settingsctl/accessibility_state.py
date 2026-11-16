@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from accessibility_ui import ACCESSIBILITY_URL, accessibility_remove
-from common import _get_state_dir, quit_app
+from common import _get_state_dir, quit_app, state_disabled
 from privacy_pane import enable_apps, ensure_enabled, list_apps, partial_state
 
 
@@ -16,6 +16,8 @@ def accessibility_state_file() -> Path:
 
 def accessibility_state_matches(enable_apps: list[str]) -> bool:
     """Check if state file matches the requested app list."""
+    if state_disabled():
+        return False
     state = accessibility_state_file()
     if not state.exists():
         return False
@@ -28,6 +30,8 @@ def accessibility_write_state(enable_apps: list[str]) -> None:
 
 
 def accessibility_previous_state() -> list[str]:
+    if state_disabled():
+        return []
     state = accessibility_state_file()
     if not state.exists():
         return []
@@ -38,6 +42,8 @@ def accessibility_previous_state() -> list[str]:
 
 
 def _record(names: list[str]) -> None:
+    if state_disabled():
+        return
     try:
         accessibility_write_state(names)
     except Exception as e:
@@ -126,8 +132,9 @@ def accessibility_revoke(names: list[str]) -> bool:
         else:
             print(f"Could not remove accessibility entry: {app}", file=sys.stderr)
             ok = False
-    previous = accessibility_previous_state()
-    kept = [a for a in previous if a not in done]
-    if kept != previous:
-        _record(kept)
+    if not state_disabled():
+        previous = accessibility_previous_state()
+        kept = [a for a in previous if a not in done]
+        if kept != previous:
+            _record(kept)
     return ok
