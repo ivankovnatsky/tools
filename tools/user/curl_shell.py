@@ -23,6 +23,9 @@ def parse(raw) -> Tuple[Dict[str, Script], List[str]]:
     errors: List[str] = []
     for url, spec in raw.items():
         where = f"curlShell.{url}"
+        if not isinstance(url, str) or not url.lower().startswith("https://"):
+            errors.append(f"{where}: url must be https://")
+            continue
         if isinstance(spec, str):
             spec = {"shell": spec}
         if not isinstance(spec, Mapping):
@@ -119,34 +122,25 @@ def install_curl_shell_scripts(raw: Dict, state: Dict):
         shell, uninstall = scripts[url]
         log(f"Running: curl -fsSL {url} | {shell}", Color.GREEN)
 
-        curl_cmd = [curl_bin, "-fsSL", url]
-        curl_proc = subprocess.Popen(
-            curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
-        )
-
-        shell_proc = subprocess.Popen(
-            [shells[url]],
-            stdin=curl_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        # Fetched whole before the shell sees a byte: a cut-off download must not half-run.
+        fetch = subprocess.run(
+            [curl_bin, "--proto", "=https", "--proto-redir", "=https", "-fsSL", url],
+            capture_output=True,
             env=env,
         )
-
-        curl_proc.stdout.close()
-        stdout, stderr = shell_proc.communicate()
-        curl_proc.wait()
-
-        if curl_proc.returncode != 0:
-            curl_stderr = curl_proc.stderr.read().decode() if curl_proc.stderr else ""
+        if fetch.returncode != 0 or not fetch.stdout.strip():
+            reason = f"curl exit {fetch.returncode}" if fetch.returncode else "empty body"
             log(
-                f"Failed to fetch {url} (curl exit {curl_proc.returncode}): {curl_stderr}",
+                f"Failed to fetch {url} ({reason}): {fetch.stderr.decode(errors='replace')}",
                 Color.RED,
             )
             success = False
             continue
 
+        shell_proc = subprocess.run([shells[url]], input=fetch.stdout, capture_output=True, env=env)
+
         if shell_proc.returncode != 0:
-            log(f"Failed to run script from {url}: {stderr.decode()}", Color.RED)
+            log(f"Failed to run script from {url}: {shell_proc.stderr.decode()}", Color.RED)
             success = False
             continue
 

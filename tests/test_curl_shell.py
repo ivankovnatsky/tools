@@ -1,32 +1,20 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from tools.user import curl_shell
 
 
-class FakeProc:
-    def __init__(self, returncode=0, stderr=b""):
-        self.returncode = returncode
-        # Real pipes: the code closes stdout and reads stderr on failure.
-        self.stdout = mock.MagicMock()
-        self.stderr = mock.MagicMock()
-        self.stderr.read.return_value = stderr
-
-    def communicate(self, *a, **kw):
-        return b"", b""
-
-    def wait(self):
-        return self.returncode
-
-
 class CurlShellTest(unittest.TestCase):
-    def _run(self, scripts, state, curl_rc=0, shell_rc=0, uninstall_rc=0):
+    def _run(self, scripts, state, curl_rc=0, shell_rc=0, uninstall_rc=0, body=b"echo hi\n"):
         self.uninstalls = []
+        self.calls = []
 
-        def fake_popen(cmd, **kw):
+        def fake_subprocess_run(cmd, **kw):
+            self.calls.append((cmd, kw.get("input")))
             if "curl" in cmd[0]:
-                return FakeProc(curl_rc)
-            return FakeProc(shell_rc)
+                return SimpleNamespace(returncode=curl_rc, stdout=body, stderr=b"")
+            return SimpleNamespace(returncode=shell_rc, stdout=b"", stderr=b"")
 
         def fake_run(cmd, env=None, cwd=None):
             self.uninstalls.append(cmd)
@@ -36,7 +24,7 @@ class CurlShellTest(unittest.TestCase):
             mock.patch.object(curl_shell, "system_bin", return_value="/usr/bin/curl"),
             mock.patch.object(curl_shell, "system_dir", return_value="/usr/bin"),
             mock.patch.object(curl_shell, "system_dir_optional", return_value=None),
-            mock.patch.object(curl_shell.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(curl_shell.subprocess, "run", side_effect=fake_subprocess_run),
             mock.patch.object(curl_shell, "run_command", side_effect=fake_run),
         ):
             return curl_shell.install_curl_shell_scripts(scripts, state)
@@ -55,6 +43,50 @@ class CurlShellTest(unittest.TestCase):
         self.assertFalse(self._run({"https://example/x.sh": "bash"}, state, curl_rc=1))
 
         self.assertEqual(state.get("curlShell", {}).get("installed", []), [])
+
+    def test_script_runs_only_after_a_full_https_download(self):
+        state = {}
+
+        self.assertTrue(self._run({"https://example/x.sh": "bash"}, state, body=b"echo ok\n"))
+
+        (curl_cmd, _), (shell_cmd, shell_input) = self.calls
+        self.assertEqual(
+            curl_cmd,
+            [
+                "/usr/bin/curl",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "-fsSL",
+                "https://example/x.sh",
+            ],
+        )
+        self.assertEqual(shell_input, b"echo ok\n")
+
+    def test_failed_or_empty_download_never_runs_the_shell(self):
+        for curl_rc, body in ((18, b"partial"), (0, b""), (0, b"  \n")):
+            with self.subTest(curl_rc=curl_rc, body=body):
+                state = {}
+
+                self.assertFalse(
+                    self._run({"https://example/x.sh": "bash"}, state, curl_rc=curl_rc, body=body)
+                )
+
+                self.assertEqual(len(self.calls), 1)
+                self.assertNotIn("curlShell", state)
+
+    def test_non_https_url_refuses_section(self):
+        for url in ("http://example/x.sh", "file:///tmp/x.sh", "example/x.sh"):
+            with self.subTest(url=url):
+                state = {"curlShell": {"installed": ["https://example/old.sh"]}}
+
+                self.assertFalse(self._run({url: "bash"}, state))
+
+                self.assertEqual(self.calls, [])
+                self.assertEqual(state["curlShell"]["installed"], ["https://example/old.sh"])
+                _, errors = curl_shell.parse({url: "bash"})
+                self.assertEqual(errors, [f"curlShell.{url}: url must be https://"])
 
     def test_script_failure_is_not_success(self):
         state = {}
@@ -163,7 +195,7 @@ class CurlShellTest(unittest.TestCase):
             mock.patch.object(curl_shell, "system_dir", return_value="/usr/bin"),
             mock.patch.object(curl_shell, "system_dir_optional", return_value=None),
             mock.patch.object(curl_shell.shutil, "which", return_value=None),
-            mock.patch.object(curl_shell.subprocess, "Popen", popen),
+            mock.patch.object(curl_shell.subprocess, "run", popen),
         ):
             result = curl_shell.install_curl_shell_scripts(
                 {"https://example/x.sh": "nosuchshell"}, state
