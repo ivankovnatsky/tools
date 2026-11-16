@@ -89,15 +89,22 @@ UNSAFE_ENV = (
 )
 _UNSAFE_PREFIXES = ("DYLD_", "LD_")
 
+# The PATH sudo passed, set aside by `act_as` for the user run (`user_environ`).
+_INVOKER_PATH: Optional[str] = None
+
 
 def act_as(inv: Invoker) -> None:
     """Make `~`, `$HOME` and `${env:HOME}` resolve to the invoking user's, as without sudo,
-    and drop user-controlled temp dir and loader settings from root's environment."""
+    and drop user-controlled temp dir, loader and PATH settings from root's environment."""
+    global _INVOKER_PATH
     if not inv.root:
         return
     for name in list(os.environ):
         if name in UNSAFE_ENV or name.startswith(_UNSAFE_PREFIXES):
             del os.environ[name]
+    if _INVOKER_PATH is None:
+        _INVOKER_PATH = os.environ.get("PATH")
+    os.environ["PATH"] = os.pathsep.join(BASE_PATH_DIRS)
     tempfile.tempdir = None
     os.environ["HOME"] = inv.home
     if inv.login:
@@ -291,7 +298,8 @@ def user_environ(inv: Invoker, environ=None) -> None:
         if name in UNSAFE_ENV or name.startswith("SUDO_"):
             del environ[name]
     environ["HOME"] = inv.home
-    environ["PATH"] = user_path(inv, environ.get("PATH"))
+    current = _INVOKER_PATH if _INVOKER_PATH is not None else environ.get("PATH")
+    environ["PATH"] = user_path(inv, current)
     if inv.login:
         environ["USER"] = environ["LOGNAME"] = inv.login
     if inv.shell:

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -399,6 +400,7 @@ class RootInvocation:
             mock.patch("os.geteuid", return_value=0),
             mock.patch("pwd.getpwnam", side_effect=_getpwnam),
             mock.patch("tools.config._PINNED_HOSTNAME", None),
+            mock.patch.object(privilege, "_INVOKER_PATH", None),
         ):
             return CliRunner().invoke(cli.main, args)
 
@@ -437,6 +439,11 @@ class InvokerTest(unittest.TestCase):
     def test_normal_user_is_not_root(self):
         self.assertFalse(privilege.invoker(501, {"SUDO_USER": "root"}).root)
 
+    def setUp(self):
+        patcher = mock.patch.object(privilege, "_INVOKER_PATH", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_act_as_points_home_at_the_user(self):
         with mock.patch.dict(os.environ, {"HOME": "/var/root", "USER": "root"}):
             privilege.act_as(privilege.Invoker(True, 501, "/Users/me", "me"))
@@ -456,6 +463,24 @@ class InvokerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TMPDIR": "/Users/me/t"}):
             privilege.act_as(privilege.Invoker(False, 501, "/Users/me", "me"))
             self.assertEqual(os.environ["TMPDIR"], "/Users/me/t")
+
+    def test_act_as_gives_root_a_fixed_path_and_keeps_the_users_for_the_user_run(self):
+        with mock.patch.dict(os.environ, {"PATH": "/Users/me/bin:/usr/bin"}):
+            privilege.act_as(privilege.Invoker(True, 501, "/Users/me", "me"))
+            self.assertEqual(os.environ["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+            environ = {"PATH": os.environ["PATH"]}
+            with mock.patch.object(privilege, "user_path", return_value="P") as path:
+                privilege.user_environ(privilege.Invoker(True, 501, "/Users/me", "me"), environ)
+            path.assert_called_once_with(mock.ANY, "/Users/me/bin:/usr/bin")
+        with mock.patch.dict(os.environ, {"PATH": "/Users/me/bin"}):
+            privilege.act_as(privilege.Invoker(False, 501, "/Users/me", "me"))
+            self.assertEqual(os.environ["PATH"], "/Users/me/bin")
+
+    def test_act_as_again_keeps_the_path_sudo_passed(self):
+        with mock.patch.dict(os.environ, {"PATH": "/Users/me/bin:/usr/bin"}):
+            privilege.act_as(privilege.Invoker(True, 501, "/Users/me", "me"))
+            privilege.act_as(privilege.Invoker(True, 501, "/Users/me", "me"))
+            self.assertEqual(privilege._INVOKER_PATH, "/Users/me/bin:/usr/bin")
 
     def test_under_home_ignores_case_and_follows_symlinks(self):
         self.assertTrue(privilege.under_home("/users/ME/Library/x", "/Users/me"))
@@ -525,6 +550,26 @@ class RootRefusalTest(RootInvocation, unittest.TestCase):
                     self.assertNotEqual(result.exit_code, 0, result.output)
                     self.assertIn("tools must not run as root directly", result.output)
                     load.assert_not_called()
+
+    def test_subcommands_under_sudo_keep_the_path_sudo_passed(self):
+        sudo_env = {"SUDO_USER": "me", "SUDO_UID": "501", "PATH": "/Users/me/bin:/usr/bin"}
+        for args in (["deploy", "--approve"], ["diff"], ["status"]):
+            with self.subTest(cmd=args[0]):
+                seen = []
+
+                def stop(*_a, **_k):
+                    seen.append((privilege._INVOKER_PATH, os.environ["PATH"]))
+                    sys.exit(0)
+
+                with (
+                    mock.patch.object(cli, "_selection", side_effect=stop),
+                    mock.patch.object(cli, "_load_merged_config", side_effect=stop),
+                ):
+                    result = self.invoke(args, sudo_env)
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    seen, [("/Users/me/bin:/usr/bin", "/usr/bin:/bin:/usr/sbin:/sbin")]
+                )
 
     def test_watch_and_reconcile_refuse_even_through_sudo(self):
         for args in (["watch", "--config", "."], ["reconcile"]):
