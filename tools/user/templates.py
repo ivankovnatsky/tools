@@ -255,7 +255,8 @@ def plan(
     changes: List[Change] = []
     held = False
     for t in templates:
-        if t.skip:
+        unmounted = fsutil.unmounted_volume(t.target)
+        if t.skip or unmounted:
             if select is not None and not select(t.target):
                 continue
             if t.target in conflicts:
@@ -263,7 +264,7 @@ def plan(
                     Change(t, "error", error=f"{t.name}: {t.target} is {conflicts[t.target]}")
                 )
             else:
-                changes.append(Change(t, "skip"))
+                changes.append(Change(t, "skip", error=unmounted))
             continue
         if select is not None and not select(t.target):
             # Reported by the plan that selects it; here it only holds removals.
@@ -342,6 +343,9 @@ def plan(
         twin = fsutil.same_file_as(target, desired_targets)
         if twin:
             blocked = f"the same file as declared {twin}"
+        volume = fsutil.unmounted_volume(target)
+        if volume and not blocked:
+            blocked = f"on an unmounted volume {volume}"
         if blocked:
             keep.append((target, blocked))
             continue
@@ -408,7 +412,8 @@ def apply(
             res.success = False
             continue
         if ch.action == "skip":
-            log(f"templates: skipped {t.target} (skip: true)", Color.YELLOW)
+            why = f"volume not mounted ({ch.error})" if ch.error else "skip: true"
+            log(f"templates: skipped {t.target} ({why})", Color.YELLOW)
             continue
         if ch.action == "unchanged":
             fsutil.refresh_dev(t.target, installed[t.target])

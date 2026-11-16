@@ -89,7 +89,7 @@ class Ownership(dict):
                 return f"the gitRepos checkout {dest}"
             if git_repos.is_checkout(dest):
                 continue
-            if os.path.lexists(dest):
+            if os.path.lexists(dest) and not git_repos._is_empty_dir(dest):
                 return f"inside gitRepos checkout {dest}, which is not a git checkout"
             if not self.clone_pending:
                 return f"inside gitRepos checkout {dest}, which is not cloned yet"
@@ -102,7 +102,9 @@ class Ownership(dict):
             return None
         real = _tree_key(path)
         for root, dest in self.repos.items():
-            if fsutil.is_within(real, root) and not os.path.lexists(dest):
+            if fsutil.is_within(real, root) and (
+                not os.path.lexists(dest) or git_repos._is_empty_dir(dest)
+            ):
                 return f"arrives with the gitRepos clone of {dest}"
         return None
 
@@ -528,7 +530,8 @@ def deploy_templates(
 def template_hooks(raw, skipped: bool = False) -> set:
     """Every onChange in the raw templates config, parseable or not.
 
-    Templates with ``skip: true`` count only with ``skipped`` (and then only they do).
+    Templates with ``skip: true`` or a path on an unmounted volume count only with
+    ``skipped`` (and then only they do).
     """
     if not isinstance(raw, Mapping):
         return set()
@@ -537,8 +540,15 @@ def template_hooks(raw, skipped: bool = False) -> set:
         for s in raw.values()
         if isinstance(s, Mapping)
         and isinstance(s.get("onChange"), str)
-        and (s.get("skip") is True) == skipped
+        and _template_skipped(s) == skipped
     }
+
+
+def _template_skipped(spec: Mapping) -> bool:
+    if spec.get("skip") is True:
+        return True
+    path = spec.get("path")
+    return isinstance(path, str) and bool(path and fsutil.unmounted_volume(path))
 
 
 def run_template_hooks(raw, state: Dict) -> bool:

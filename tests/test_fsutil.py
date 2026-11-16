@@ -176,3 +176,15 @@ class TrashTest(unittest.TestCase):
 
     def test_trash_error_is_an_oserror(self):
         self.assertTrue(issubclass(fsutil.TrashError, OSError))
+
+
+class UnmountedVolumeTest(unittest.TestCase):
+    def test_only_paths_under_an_unmounted_volume(self):
+        self.assertIsNone(fsutil.volume_of("/Users/x", "/Volumes"))
+        self.assertIsNone(fsutil.volume_of("/Volumes", "/Volumes"))
+        self.assertEqual(fsutil.volume_of("/Volumes/S/a/b", "/Volumes"), "/Volumes/S")
+        self.assertEqual(
+            fsutil.unmounted_volume("/Volumes/S/a", "/Volumes", lambda _p: False), "/Volumes/S"
+        )
+        self.assertIsNone(fsutil.unmounted_volume("/Volumes/S/a", "/Volumes", lambda _p: True))
+        self.assertIsNone(fsutil.unmounted_volume("/Users/x", "/Volumes", lambda _p: False))

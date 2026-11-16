@@ -53,6 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
 from tools import fsutil, privilege
+from tools.fsutil import atomic_write, unmounted_volume
 from tools.log import Color, debug, log
 from tools.user import sops
 from tools.user.files import _parse_mode
@@ -741,14 +742,6 @@ def parse_launchd(
 # --------------------------------------------------------------------------
 
 
-def volume_of(path: str, volumes_root: str) -> Optional[str]:
-    """`<volumes_root>/<name>` when path lives on that external volume, else None."""
-    rel = os.path.relpath(path, volumes_root)
-    if rel == "." or rel.startswith(".."):
-        return None
-    return os.path.join(volumes_root, rel.split(os.sep, 1)[0])
-
-
 def _script(svc: Service, log_dir: Optional[str] = None, secrets_dir: Optional[str] = None) -> str:
     """The inline starter body, structured like nix-config's local.launchd starter."""
     lines = ["set -e", 'export PATH="/bin:/usr/bin:$PATH"']
@@ -1166,16 +1159,7 @@ def _write_plist(path: str, data: bytes, domain: str, env: Env, mode: int = 0o64
     try:
         if domain == "user":
             os.makedirs(parent, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tools-", suffix=".plist")
-            try:
-                os.fchmod(fd, mode)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                os.replace(tmp, path)
-            except BaseException:
-                if os.path.lexists(tmp):
-                    os.unlink(tmp)
-                raise
+            atomic_write(path, data, mode)
             return True
 
         # Root-only dir, not $TMPDIR: a user-writable temp file could be swapped
@@ -1319,8 +1303,8 @@ def _ensure_logs(item: "Item", settings: Settings, env: Env) -> bool:
         return True
     wanted = []
     for p, generated in specs:
-        volume = volume_of(p, env.volumes_root)
-        if volume and not env.ismount(volume):
+        volume = unmounted_volume(p, env.volumes_root, env.ismount)
+        if volume:
             # mkdir here would plant a plain dir that shadows the real mount point.
             log(f"launchd: {svc.label}: {volume} is not mounted; not creating {p}", Color.YELLOW)
             continue
@@ -1366,8 +1350,8 @@ def workdir_block(svc: Service, env: Env) -> Optional[str]:
     wd = svc.working_directory
     if svc.domain != "system" or svc.disabled or wd is None or _dir_exists(wd, svc.domain, env):
         return None
-    volume = volume_of(wd, env.volumes_root)
-    if volume and not env.ismount(volume):
+    volume = unmounted_volume(wd, env.volumes_root, env.ismount)
+    if volume:
         return None
     if _root_mkdir_ok(wd, env):
         why = root_dir_error(wd, env) if env.root else None
@@ -1405,8 +1389,8 @@ def program_block(svc: Service, env: Env) -> Optional[str]:
         return None
     if any(not env.exists(p) for p in svc.wait_for_paths):
         return None
-    volume = volume_of(program, env.volumes_root)
-    if volume and not env.ismount(volume):
+    volume = unmounted_volume(program, env.volumes_root, env.ismount)
+    if volume:
         return None
     return f"program {program} not found; not starting it"
 
@@ -1418,8 +1402,8 @@ def _ensure_workdir(svc: Service, settings: Settings, env: Env) -> bool:
     wd = svc.working_directory
     if wd is None or os.path.isdir(wd) or not can_change(svc.domain, env):
         return True
-    volume = volume_of(wd, env.volumes_root)
-    if volume and not env.ismount(volume):
+    volume = unmounted_volume(wd, env.volumes_root, env.ismount)
+    if volume:
         log(f"launchd: {svc.label}: {volume} is not mounted; not creating {wd}", Color.YELLOW)
         return True
     if svc.domain == "user":

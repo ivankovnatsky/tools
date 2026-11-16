@@ -16,6 +16,7 @@ from tools.fsutil import (
     same_file_as,
     same_identity,
     trash,
+    unmounted_volume,
 )
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
@@ -421,7 +422,7 @@ def is_system_entry(entry) -> bool:
     if not isinstance(entry, dict) or "dir" in entry or "target" not in entry:
         return False
     target = os.path.normpath(os.path.expanduser(str(entry["target"])))
-    if not os.path.isabs(target):
+    if not os.path.isabs(target) or unmounted_volume(target):
         return False
     inv = privilege.invoker()
     path, st, reached = _decision_dir(target, entry.get("directory") is True, inv)
@@ -511,22 +512,31 @@ class Entry(NamedTuple):
     skip: bool = False
     backup: bool = True
     restart_units: Tuple[str, ...] = ()
+    unmounted: Optional[str] = None
 
 
 def declared_hooks(entries, skipped: bool = False) -> set:
     """Every onChange in the raw config, including entries that fail to resolve.
 
-    Entries with ``skip: true`` count only with ``skipped`` (and then only they do).
+    Entries with ``skip: true`` or a target on an unmounted volume count only with
+    ``skipped`` (and then only they do).
     """
     if not isinstance(entries, list):
         return set()
     return {
         e["onChange"]
         for e in entries
-        if isinstance(e, dict)
-        and isinstance(e.get("onChange"), str)
-        and (e.get("skip") is True) == skipped
+        if isinstance(e, dict) and isinstance(e.get("onChange"), str) and _skipped(e) == skipped
     }
+
+
+def _skipped(entry: Dict) -> bool:
+    if entry.get("skip") is True:
+        return True
+    target = entry.get("target")
+    return (
+        "dir" not in entry and isinstance(target, str) and bool(target and unmounted_volume(target))
+    )
 
 
 def _ordered(resolved: List[Entry]) -> List[Entry]:
@@ -740,6 +750,8 @@ def _resolve_entries(
 
         errors.append(f"entry must have either `dir` or both `source` and `target`: {entry!r}")
 
+    file_pairs = [_unmounted_skip(e) for e in file_pairs]
+
     # Dedupe by target, later entries win — but `secrets` is sticky across
     # every collision (dir/dir, dir/file, file/file): once any entry marks a
     # target as secret, the resolved entry stays secret. Otherwise a later
@@ -751,6 +763,12 @@ def _resolve_entries(
         prev = resolved_map.get(e.target)
         resolved_map[e.target] = e._replace(secrets=e.secrets or bool(prev and prev.secrets))
     return list(resolved_map.values()), errors
+
+
+def _unmounted_skip(e: Entry) -> Entry:
+    """A target on an unmounted volume is left alone, like ``skip: true``."""
+    volume = unmounted_volume(e.target)
+    return e._replace(skip=True, unmounted=volume) if volume else e
 
 
 def _owe_restarts(
@@ -850,6 +868,11 @@ def install_files(
             if e.on_update:
                 unsettled.add(e.on_update)
             continue
+        if e.unmounted:
+            log(f"files: skipped {target}: volume not mounted ({e.unmounted})", Color.YELLOW)
+            if target in state_files:
+                held[target] = state_files[target]
+            continue
         if e.skip:
             log(f"files: skipped {target} (skip: true)", Color.YELLOW)
             if target in state_files:
@@ -912,6 +935,15 @@ def install_files(
                     )
                     kept[target] = record
                     continue
+                volume = unmounted_volume(target)
+                if volume:
+                    log(
+                        f"files: not removing {target}: volume not mounted ({volume}); "
+                        "still tracked",
+                        Color.YELLOW,
+                    )
+                    kept[target] = record
+                    continue
                 if not os.path.exists(target):
                     continue
                 unsafe = root_target_error(target) if system else None
@@ -933,6 +965,10 @@ def install_files(
                         log(f"Keeping {target}: {why}.", Color.YELLOW)
                         kept[target] = record
                         continue
+                # state.json is user-writable: root deletes only a file whose hash it recorded.
+                elif system and not (isinstance(record, dict) and record.get("hash")):
+                    log(f"files: releasing {target}: no recorded hash", Color.YELLOW)
+                    continue
                 # A file edited since then holds work this tool never authored.
                 elif not _removable(target, record):
                     log(

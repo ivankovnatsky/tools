@@ -235,6 +235,7 @@ class GitReposDestinationTest(GitReposFixture):
 
     def test_paths_in_non_git_destination_refused(self):
         os.makedirs(self.repo)
+        open(os.path.join(self.repo, "other"), "w").close()
         out = self.show_diff()
         self.assertIn(f"! not a git repo: {self.repo}", out)
         self.assertIn("which is not a git checkout", out)

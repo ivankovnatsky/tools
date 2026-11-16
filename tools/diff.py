@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 from tools import privilege, selection
 from tools.config import SECTIONS
+from tools.fsutil import respell
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
 from tools.mgmt import has_work as mgmt_has_work
@@ -28,7 +29,7 @@ from tools.user.fetch import diff_fetch
 from tools.user.fetch import has_work as fetch_has_work
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
-from tools.user.git_repos import is_checkout
+from tools.user.git_repos import _is_empty_dir, is_checkout
 from tools.user.go import _installed_path as _go_installed_path
 from tools.user.go import _resolve_go_bin
 from tools.user.launchd import diff_launchd
@@ -423,10 +424,11 @@ def _git_local_work(path: str) -> bool:
 
 def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
     changes = []
-    installed = set(state.get("gitRepos", {}).get("installed", []))
+    stored = state.get("gitRepos", {}).get("installed", [])
+    installed = set(respell(dict.fromkeys(stored), git_repos.keys()))
     for dest, _url in git_repos.items():
         expanded = os.path.expanduser(dest)
-        if not os.path.exists(expanded):
+        if not os.path.exists(expanded) or _is_empty_dir(expanded):
             changes.append(f"  + clone {dest}")
         elif not is_checkout(expanded):
             changes.append(f"  ! not a git repo: {dest} (deploy skips it)")
@@ -466,7 +468,7 @@ def _diff_files(
     ``system`` (root) covers only entries whose target directory the user cannot write;
     as the user they get a note instead.
     """
-    from tools.fsutil import aside_note, removal_blocked, respell, same_file_as
+    from tools.fsutil import aside_note, removal_blocked, same_file_as, unmounted_volume
     from tools.user.files import (
         _conflict,
         _dir_kept,
@@ -507,6 +509,11 @@ def _diff_files(
             changes.append(f"  ! refusing {target}: {reason}")
             if e.on_update:
                 held_updates.add(e.on_update)
+            continue
+        if e.unmounted:
+            changes.append(
+                f"{SKIPPED_ROW}{target} (volume not mounted: {e.unmounted}; not written)"
+            )
             continue
         if e.skip:
             changes.append(skipped_row(target))
@@ -587,6 +594,10 @@ def _diff_files(
             if blocked:
                 changes.append(f"  ~ keep {target} (is {blocked}; not removed)")
                 continue
+            volume = unmounted_volume(target)
+            if volume:
+                changes.append(f"  ~ keep {target} (volume not mounted: {volume}; not removed)")
+                continue
             if os.path.exists(target):
                 unsafe = root_target_error(target) if system else None
                 if unsafe:
@@ -604,6 +615,9 @@ def _diff_files(
                     if why:
                         changes.append(f"  ~ keep {target} ({why}; not removed)")
                         continue
+                elif system and not (isinstance(record, dict) and record.get("hash")):
+                    changes.append(f"  ~ release {target} (no recorded hash; left in place)")
+                    continue
                 elif not _removable(target, record):
                     changes.append(
                         f"  ~ keep {target} (modified since tools wrote it; not removed)"

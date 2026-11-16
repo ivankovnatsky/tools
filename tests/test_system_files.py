@@ -7,8 +7,8 @@ from unittest import mock
 
 import trash_fake
 
-from tools import cli, diff, privilege
-from tools.user import files
+from tools import cli, diff, fsutil, privilege
+from tools.user import fetch, files, secrets_flow, templates
 
 setUpModule = trash_fake.start
 tearDownModule = trash_fake.stop
@@ -345,6 +345,138 @@ class OtherRunRecordTest(SystemFilesBase):
         self.assertTrue(ok, out)
         self.assertTrue(os.path.exists(target))
         self.assertIn(target, state["files"])
+
+
+class UnmountedVolumeTest(SystemFilesBase):
+    """A target on /Volumes/<name> while that volume is not mounted."""
+
+    def setUp(self):
+        super().setUp()
+        self.volumes = os.path.join(self.tmp, "Volumes")
+        os.makedirs(self.volumes)
+        self.root_dirs.add(self.volumes)
+        patch = mock.patch.object(fsutil, "VOLUMES_ROOT", self.volumes)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.target = os.path.join(self.volumes, "Storage", "caddy", "build.env")
+        self.ran = os.path.join(self.tmp, "ran")
+        self.entries = [
+            {"source": "etc/shells", "target": self.target, "onChange": f"touch {self.ran}"}
+        ]
+        self.record = {"files": {self.target: {"hash": "h"}}}
+
+    def test_never_a_system_entry(self):
+        self.assertFalse(files.is_system_entry(self.entries[0]))
+
+    def test_user_run_skips_and_keeps_the_record(self):
+        rows, _ = _quiet(diff._diff_files, self.entries, self.config_dir, self.record)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith(f"  = skip {self.target} (volume not mounted"), rows)
+        ok, out = _quiet(files.install_files, self.entries, self.config_dir, self.record)
+        self.assertTrue(ok, out)
+        self.assertIn("volume not mounted", out)
+        self.assertFalse(os.path.exists(os.path.join(self.volumes, "Storage")))
+        self.assertFalse(os.path.exists(self.ran))
+        self.assertEqual(self.record["files"], {self.target: {"hash": "h"}})
+
+    def test_root_run_writes_nothing_and_keeps_the_record(self):
+        with self.as_root():
+            ok, out = _quiet(
+                files.install_files, self.entries, self.config_dir, self.record, system=True
+            )
+        self.assertTrue(ok, out)
+        self.assertFalse(os.path.exists(os.path.join(self.volumes, "Storage")))
+        self.assertFalse(os.path.exists(self.ran))
+        self.assertIn(self.target, self.record["files"])
+
+    def test_undeclared_records_are_kept_not_forgotten(self):
+        for system in (False, True):
+            state = {"files": {self.target: {"hash": "h"}}}
+            with self.as_root():
+                ok, out = _quiet(files.install_files, [], self.config_dir, state, system=system)
+            self.assertTrue(ok, out)
+            self.assertIn("volume not mounted", out)
+            self.assertIn(self.target, state["files"])
+        p = fetch.plan({}, {self.target: {"hash": "h"}})
+        self.assertEqual(p.forget, [])
+        self.assertEqual(p.keep[0][0], self.target)
+        p = templates.plan([], [], {self.target: {}}, None)
+        self.assertEqual(p.forget, [])
+        self.assertEqual(p.keep[0][0], self.target)
+
+    def test_declared_fetch_and_template_write_nothing(self):
+        state = {"fetch": {"installed": {self.target: {"hash": "h"}}}}
+        raw = {self.target: "https://example.com/f"}
+        rows = fetch.diff_fetch(raw, state)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("  = skip "), rows)
+        opener = mock.Mock(side_effect=AssertionError("downloaded"))
+        ok, out = _quiet(fetch.install_fetch, raw, state, None, False, opener)
+        self.assertTrue(ok, out)
+        self.assertIn("volume not mounted", out)
+        self.assertEqual(state["fetch"]["installed"], {self.target: {"hash": "h"}})
+
+        t = templates.Template("t", self.target, "json", {"a": 1})
+        installed = {self.target: {"name": "t"}}
+        p = templates.plan([t], [], installed, None)
+        self.assertEqual([c.action for c in p.changes], ["skip"])
+        self.assertEqual(p.remove, [])
+        res, out = _quiet(templates.apply, p, installed)
+        self.assertTrue(res.success, out)
+        self.assertIn("volume not mounted", out)
+        self.assertEqual(installed, {self.target: {"name": "t"}})
+        self.assertFalse(os.path.exists(os.path.join(self.volumes, "Storage")))
+
+    def test_pending_on_change_is_held(self):
+        cmd = f"touch {self.ran}"
+        self.record["onChange"] = {"files": {cmd: [self.target]}}
+        ok, out = _quiet(files.install_files, self.entries, self.config_dir, self.record)
+        self.assertTrue(ok, out)
+        self.assertFalse(os.path.exists(self.ran))
+        self.assertEqual(self.record["onChange"], {"files": {cmd: [self.target]}})
+
+        rows, _ = _quiet(diff._diff_files, self.entries, self.config_dir, self.record)
+        self.assertFalse(any("run onChange" in r for r in rows), rows)
+
+        raw = {"t": {"path": self.target, "content": {}, "onChange": cmd}}
+        state = {"onChange": {"templates": {cmd: [self.target]}}}
+        self.assertTrue(_quiet(secrets_flow.run_template_hooks, raw, state)[0])
+        self.assertFalse(os.path.exists(self.ran))
+        self.assertEqual(state["onChange"], {"templates": {cmd: [self.target]}})
+
+    def test_diff_keeps_undeclared_record_under_a_stub_dir(self):
+        stub = os.path.dirname(self.target)
+        os.makedirs(stub)
+        _write(self.target, "x\n")
+        rows, _ = _quiet(diff._diff_files, [], self.config_dir, self.record)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith(f"  ~ keep {self.target} (volume not mounted"), rows)
+
+    def test_mounted_volume_is_deployed(self):
+        storage = os.path.join(self.volumes, "Storage")
+        os.makedirs(storage)
+        with mock.patch("os.path.ismount", side_effect=lambda p: p == storage):
+            ok, out = _quiet(files.install_files, self.entries, self.config_dir, {})
+        self.assertTrue(ok, out)
+        self.assertEqual(_read(self.target), "/bin/sh\n")
+
+
+class ForgedRootRecordTest(SystemFilesBase):
+    def test_hashless_record_is_forgotten_not_removed(self):
+        _write(self.target, "precious\n")
+        state = {"files": {self.target: {}}}
+        with self.as_root():
+            ok, out = _quiet(files.install_files, [], self.config_dir, state, system=True)
+        self.assertTrue(ok, out)
+        self.assertEqual(_read(self.target), "precious\n")
+        self.assertEqual(state["files"], {})
+
+    def test_hashless_record_is_previewed_as_released(self):
+        _write(self.target, "precious\n")
+        state = {"files": {self.target: {}}}
+        with self.as_root():
+            rows, _ = _quiet(diff._diff_files, [], self.config_dir, state, system=True)
+        self.assertEqual(rows, [f"  ~ release {self.target} (no recorded hash; left in place)"])
 
 
 class ClassifyOnceTest(unittest.TestCase):

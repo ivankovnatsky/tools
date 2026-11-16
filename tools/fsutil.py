@@ -283,6 +283,29 @@ def same_file_as(path: str, paths) -> Optional[str]:
     return None
 
 
+VOLUMES_ROOT = "/Volumes"
+
+
+def volume_of(path: str, volumes_root: Optional[str] = None) -> Optional[str]:
+    """`<volumes_root>/<name>` when path lives on that external volume, else None."""
+    root = VOLUMES_ROOT if volumes_root is None else volumes_root
+    rel = os.path.relpath(path, root)
+    if rel == "." or rel.startswith(".."):
+        return None
+    return os.path.join(root, rel.split(os.sep, 1)[0])
+
+
+def unmounted_volume(path: str, volumes_root: Optional[str] = None, ismount=None) -> Optional[str]:
+    """The external volume holding ``path`` when it is not mounted, else None.
+
+    Writing there would plant a plain directory tree on the boot disk that
+    shadows the real mount point."""
+    volume = volume_of(os.path.expanduser(path), volumes_root)
+    if volume is None:
+        return None
+    return None if (ismount or os.path.ismount)(volume) else volume
+
+
 def is_within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 

@@ -13,7 +13,7 @@ from unittest import mock
 import trash_fake
 from click.testing import CliRunner
 
-from tools import cli
+from tools import cli, fsutil
 from tools.user import launchd
 
 setUpModule = trash_fake.start
@@ -1237,7 +1237,7 @@ class ReviewRegressionTest(LaunchdTestBase):
         self.assertIn("while [ ! -e /Volumes/Storage ]", script)
         self.assertIn("/bin/mkdir -p /Volumes/Other/.s\n/bin/mkdir -p /Volumes/Storage/x", script)
         self.assertIn("/bin/mkdir -p /Volumes/Logs", script)
-        self.assertIsNone(launchd.volume_of("/Users/x", "/Volumes"))
+        self.assertIsNone(fsutil.volume_of("/Users/x", "/Volumes"))
 
     def test_bootstrap_119_on_only_attempt_still_bootstraps(self):
         self.env.bootstrap_attempts = 1

@@ -50,6 +50,7 @@ from tools import fsutil
 from tools.log import Color, debug, log
 from tools.user import files, secrets_flow
 from tools.user.files import _file_hash, _is_real_dir, _record, _removable, _tracked
+from tools.util import SKIPPED_ROW
 
 DEFAULT_MODE = 0o644
 TIMEOUT = 60
@@ -218,8 +219,8 @@ record_secret = files.record_secret
 @dataclass
 class Change:
     entry: Entry
-    action: str  # fetch | update | replace | chmod | adopt | unchanged | error
-    reason: str = ""  # replace: why the existing file is moved aside first
+    action: str  # fetch | update | replace | chmod | adopt | unchanged | skip | error
+    reason: str = ""  # replace: why the existing file is moved aside first; skip: the volume
 
 
 @dataclass
@@ -299,6 +300,10 @@ def plan(raw, installed: Mapping[str, Dict], conflicts=None, update: bool = Fals
         if reason:
             p.changes.append(Change(e, "error", f"refusing {e.target}: {reason}"))
             continue
+        volume = fsutil.unmounted_volume(e.target)
+        if volume:
+            p.changes.append(Change(e, "skip", volume))
+            continue
         record = installed.get(e.target) or {}
         kind = _kind(e.target)
         if kind is None:
@@ -321,6 +326,9 @@ def plan(raw, installed: Mapping[str, Dict], conflicts=None, update: bool = Fals
         twin = fsutil.same_file_as(target, declared)
         if twin:
             blocked = f"the same file as declared {twin}"
+        volume = fsutil.unmounted_volume(target)
+        if volume and not blocked:
+            blocked = f"on an unmounted volume {volume}"
         if blocked:
             p.keep.append((target, f"is {blocked}"))
         elif not os.path.lexists(target):
@@ -533,6 +541,8 @@ def install_fetch(
         if ch.action == "error":
             log(f"fetch: {ch.reason}", Color.RED)
             success = False
+        elif ch.action == "skip":
+            log(f"fetch: skipped {e.target}: volume not mounted ({ch.reason})", Color.YELLOW)
         elif ch.action == "unchanged":
             if e.target in installed:
                 fsutil.refresh_dev(e.target, installed[e.target])
@@ -618,6 +628,8 @@ def diff_fetch(raw, state: Dict, conflicts=None, update: bool = False) -> List[s
         e = ch.entry
         if ch.action == "error":
             rows.append(f"  ! {ch.reason}")
+        elif ch.action == "skip":
+            rows.append(f"{SKIPPED_ROW}{e.target} (volume not mounted: {ch.reason}; not written)")
         elif ch.action == "fetch":
             rows.append(f"  + fetch {e.target} <- {e.url}" + (" (install)" if e.install else ""))
         elif ch.action == "update":
