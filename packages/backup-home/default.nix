@@ -4,7 +4,6 @@
   pigz,
   curl,
   openssh,
-  rclone,
   gnutar,
 }:
 
@@ -17,7 +16,6 @@ pkgs.writeShellScriptBin "backup-home" ''
       pigz
       curl
       openssh
-      rclone
       gnutar
     ]
   }:$PATH"
