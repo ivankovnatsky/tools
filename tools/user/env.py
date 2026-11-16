@@ -36,7 +36,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from tools import fsutil
 from tools.log import Color, debug, log
-from tools.util import looks_like_secret
+from tools.util import looks_like_secret, sh_quote
 
 DEFAULT_DIR = "~/.local/state/tools/env"
 SHELLS = ("sh", "fish", "nu")
@@ -162,10 +162,6 @@ def parse(raw) -> Tuple[Optional[Spec], List[str]]:
 # --------------------------------------------------------------------------
 
 
-def _sh_quote(value: str) -> str:
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
 def _fish_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -195,10 +191,10 @@ __tools_env_prepend() {
 
 def _render_sh(spec: Spec) -> str:
     lines = [f"# {_HEADER}"]
-    lines += [f"export {name}={_sh_quote(value)}" for name, value in spec.vars.items()]
+    lines += [f"export {name}={sh_quote(value)}" for name, value in spec.vars.items()]
     if spec.path:
         lines.append(_SH_PREPEND.rstrip("\n"))
-        lines += [f"__tools_env_prepend {_sh_quote(p)}" for p in reversed(spec.path)]
+        lines += [f"__tools_env_prepend {sh_quote(p)}" for p in reversed(spec.path)]
         lines += ["unset -f __tools_env_prepend", "export PATH"]
     return "\n".join(lines) + "\n"
 

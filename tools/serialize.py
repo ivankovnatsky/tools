@@ -6,6 +6,8 @@ import math
 import re
 from typing import Any, List, Mapping
 
+from tools.util import sh_quote
+
 FORMATS = ("yaml", "json", "toml", "ini", "env", "raw")
 
 _ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -74,7 +76,7 @@ def to_env(data: Any, *, quote: bool = True) -> str:
             raise SerializeError(f"env: invalid variable name {key!r}")
         text = _scalar_text("env", key, value)
         if quote:
-            text = "'" + text.replace("'", "'\\''") + "'"
+            text = sh_quote(text)
         lines.append(f"{key}={text}")
     return "".join(f"{line}\n" for line in lines)
 

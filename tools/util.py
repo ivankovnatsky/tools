@@ -13,6 +13,11 @@ from tools.log import Color, log
 _DIFF_MAX_LINES = 200
 
 
+def sh_quote(value: str) -> str:
+    """POSIX single quotes, always, with ``'`` written ``'\\''``; sh reads it back byte for byte."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def run_command(cmd: List[str], env: Dict = None, cwd: str = None) -> tuple[int, str, str]:
     """(returncode, stdout, stderr); a command that cannot start (e.g. its runtime is
     not installed yet) is exit 127 with the reason in stderr instead of an exception."""

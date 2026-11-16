@@ -1,6 +1,6 @@
 import unittest
 
-from tools.util import version_changed
+from tools.util import sh_quote, version_changed
 
 
 class VersionChangedTest(unittest.TestCase):
@@ -37,6 +37,13 @@ class VersionChangedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShQuoteTest(unittest.TestCase):
+    def test_always_quotes_and_escapes_single_quotes(self):
+        self.assertEqual(sh_quote("plain"), "'plain'")
+        self.assertEqual(sh_quote(""), "''")
+        self.assertEqual(sh_quote("it's $HOME"), "'it'\\''s $HOME'")
 
 
 class RunCommandTest(unittest.TestCase):
