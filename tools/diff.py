@@ -928,8 +928,8 @@ def show_diff(
         if changes:
             sections.append(("users", changes))
 
-    if "plist" in active and plist_has_work(config.get("plist")):
-        changes = diff_plist(config.get("plist"))
+    if "plist" in active and plist_has_work(config.get("plist"), state):
+        changes = diff_plist(config.get("plist"), state)
         if changes:
             sections.append(("plist", changes))
 

@@ -5,7 +5,7 @@ Config shape::
 
     settingsctl:
       path: /usr/local/bin/settings              # optional; see "Finding settings" below
-      fullDiskAccess: [kitty, Terminal]          # settings fulldiskaccess --enable
+      fullDiskAccess: [kitty, Terminal]          # settings fulldiskaccess set
       accessibility: [Hammerspoon]               # settings accessibility set
       loginItems: [Hammerspoon, LosslessSwitcher]  # settings login set
       appearanceInit: true                       # settings appearance --init
@@ -18,10 +18,13 @@ Config shape::
       sleep: {computer: never, display: 10, disk: never}  # settings sleep set
       remoteLogin: true                          # settings remotelogin set on|off
 
-The lists are passed on every deploy; settingsctl decides what to change. Every other
-key is read first (`settings ... get --json`, the appearance state file) and set
-only when it differs. Root keys run in the sudo phase; as the
-user they are read and reported in a note. A key that leaves config is left as is.
+Each list is synced with `set`: an app dropped from the list loses the grant (or login
+item) settingsctl gave it. A list runs when it differs from what settingsctl last
+applied (its state files under ~/.local/state/settings) or, for login items, from
+`settings login list`. Every other key is read first (`settings ... get --json`, the
+appearance state file) and set only when it differs. Root keys run in the sudo phase;
+as the user they are read and reported in a note. A scalar key that leaves config is
+left as is.
 
 Finding settings: `path` when given; otherwise, as the user, `settings` on PATH and
 then in `paths.uvBin`. Root never searches its own PATH: it uses `path`, `paths.uvBin`
@@ -53,13 +56,15 @@ KEYS = ("path",) + USER_KEYS + ROOT_KEYS
 SLEEP_KEYS = ("computer", "display", "disk")
 ROOT_HINT = "run sudo tools deploy --scope settingsctl"
 
-APPEARANCE_STATE = "~/.local/state/settings/appearance/last-run"
+STATE_DIR = "~/.local/state/settings"
+APPEARANCE_STATE = f"{STATE_DIR}/appearance/last-run"
+LIST_STATE = {"fullDiskAccess": "fda-enabled", "accessibility": "accessibility-enabled"}
 
 
 def _command(key: str, apps: List[str]) -> List[str]:
     joined = ",".join(apps)
     if key == "fullDiskAccess":
-        return ["fulldiskaccess", "--enable", joined]
+        return ["fulldiskaccess", "set", joined]
     if key == "accessibility":
         return ["accessibility", "set", joined]
     return ["login", "set", joined]
@@ -284,6 +289,38 @@ def plan_root(spec: Dict, runner: Runner) -> Tuple[List[Tuple[str, List[str]]], 
     return todo, errors
 
 
+def _read_state(name: str) -> Optional[str]:
+    try:
+        with open(os.path.join(os.path.expanduser(STATE_DIR), name)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _login_items(runner: Optional[Runner]) -> Optional[List[str]]:
+    """Current login item names, or None when they cannot be read."""
+    if not runner:
+        return None
+    rc, stdout, _ = runner.run([runner.cli, "login", "list"])
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return [] if lines == ["No login items found."] else lines
+
+
+def _list_now(key: str, apps: List[str], runner: Optional[Runner]) -> Tuple[bool, Optional[str]]:
+    """(already applied, what is there now) for a list key; settingsctl's own skip rule."""
+    if key == "loginItems":
+        current = _login_items(runner)
+        if current is None:
+            return False, None
+        want = {os.path.splitext(os.path.basename(a))[0] if "/" in a else a for a in apps}
+        return set(current) == want, ",".join(sorted(current))
+    names = [a.partition("=")[0].strip() for a in apps]
+    applied = _read_state(LIST_STATE[key])
+    return applied == ",".join(sorted(names)), applied
+
+
 def plan_user(
     spec: Dict,
     runner: Optional[Runner],
@@ -293,9 +330,16 @@ def plan_user(
     todo: List[Tuple[str, List[str]]] = []
     errors: List[str] = []
     for key in LIST_KEYS:
-        if key in spec:
-            args = _command(key, spec[key])
-            todo.append((f"  ~ settings {' '.join(args[:-1])} {args[-1]!r}", args))
+        if key not in spec:
+            continue
+        done, now = _list_now(key, spec[key], runner)
+        if done:
+            continue
+        args = _command(key, spec[key])
+        row = f"  ~ settings {' '.join(args[:-1])} {args[-1]!r}"
+        if now is not None:
+            row += f" (now {now!r})" if now else " (now none)"
+        todo.append((row, args))
     if spec.get("appearanceInit") and not exists(os.path.expanduser(APPEARANCE_STATE)):
         todo.append(("  ~ settings appearance --init", ["appearance", "--init"]))
     if "defaultBrowser" in spec and runner:
@@ -368,7 +412,7 @@ def diff_settingsctl(
         return [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]
     rows: List[str] = []
     needs = _needs_cli_as_user(spec)
-    if needs and not runner and "defaultBrowser" in spec:
+    if needs and not runner:
         rows.append(f"  ? `settings` not found (looked in {looked})")
     todo, read_errors = plan_user(spec, runner, exists)
     rows += [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]

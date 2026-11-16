@@ -860,9 +860,10 @@ def _run_sections(
     if "users" in active and users_has_work(config.get("users")):
         success &= install_users(config.get("users"))
 
-    # After brew, which installs the apps whose files these are.
-    if "plist" in active and plist_has_work(config.get("plist")):
-        success &= install_plist(config.get("plist"))
+    # After brew, which installs the apps whose files these are. Gated on state
+    # too, so dropping the last key still restores what tools wrote.
+    if "plist" in active and plist_has_work(config.get("plist"), state):
+        success &= install_plist(config.get("plist"), state, persist)
 
     # After files, so restartOn hashes see files written in this run.
     units = secrets_flow.pending_restarts(state)
@@ -951,7 +952,7 @@ def deploy(config, scope, only, approve, update):
 
     Under `sudo`, everything but system work runs as the invoking user first, then system
     work (system files, launchd daemons, system defaults, settingsctl host settings) as root,
-    then mgmt as the user.
+    then launchd agents and mgmt as the user.
     """
     inv = _invoker()
     scope, only = _selection(scope, only)

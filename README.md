@@ -261,8 +261,8 @@ Notable keys:
   `deploy --update` with `files` in scope, after the section converges, whether
   or not the entry changed: once per distinct command, however many entries or
   `dir:` files declare it. It is skipped when any entry declaring it was refused
-  or failed to write, or when an `onChange` in the section failed. Plain deploy, `tools diff` and `watch` never run it,
-  and diff does not list it. A failing command fails the deploy; it is not kept
+  or failed to write, or when an `onChange` in the section failed. Plain deploy, `tools diff` and `watch` never run it.
+  `tools diff` does not list it; the `deploy --update` preview does. A failing command fails the deploy; it is not kept
   pending and runs again on the next `--update`. Use it to drive an app's own
   plugin manager, with `onChange` installing what a new config declares.
 - `restartUnits: [launchd:<label>]` (on user `files:` entries) restarts that
@@ -753,8 +753,8 @@ the cleanup removals are skipped (deploy reports failure) and diff shows
 
 `agents` (user domain, `gui/<uid>`) and `daemons` (system domain). macOS only.
 Agents mirror nix-config's home `local.launchd`, daemons its darwin one; see the differences below.
-`tools deploy` manages agents; `sudo tools deploy` manages agents as the user, then
-daemons as root (see "Running with sudo").
+`tools deploy` manages agents; `sudo tools deploy` manages daemons as root, then agents
+as the user (see "Running with sudo").
 
 ```yaml
 launchd:
@@ -990,14 +990,16 @@ written, restored or deleted, and Dock tiles added, changed or removed
 ## settingsctl
 
 `settingsctl:` drives settingsctl (`settings`, from `packages/settingsctl`) on
-macOS only. Each declared list is passed as is on every deploy; settingsctl
-decides what to change. Every other key is read first and set only when it
-differs; `diff` shows the commands deploy would run and the current values.
+macOS only. Each declared list is synced with `set` when it differs from what
+settingsctl last applied (its state files under `~/.local/state/settings`) or,
+for login items, from the current login items. Every other key is read first
+and set only when it differs; `diff` shows the commands deploy would run and
+the current values.
 
 ```yaml
 settingsctl:
   path: /usr/local/bin/settings               # optional, see below
-  fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess --enable
+  fullDiskAccess: [kitty, Terminal]           # settings fulldiskaccess set
   accessibility: [Hammerspoon, kitty]         # settings accessibility set
   loginItems: [Hammerspoon, LosslessSwitcher] # settings login set
   appearanceInit: true    # settings appearance --init, while its state file is missing
@@ -1026,7 +1028,19 @@ settingsctl:
   binary the user can replace, as with any other command in this config.
 - `appearanceInit` switches to dark mode once; settingsctl then writes
   `~/.local/state/settings/appearance/last-run` and later toggles are yours.
-- A key that leaves config is left as is. Any config error holds the section.
+- Lists are declarative: an app dropped from `fullDiskAccess` is turned off,
+  one dropped from `accessibility` is removed from the pane, and a login item
+  not listed is removed. Entries settingsctl never managed in the privacy panes
+  are left alone. settingsctl exits non-zero, failing the deploy, when the pane
+  cannot be read or a listed app is missing or stays off; its state file then
+  records only the apps it still grants, so the next deploy retries. Apps
+  not yet in a pane are added once by hand with the whole list, as `set` syncs
+  to it: `settings fulldiskaccess set "A,B,NEW" --add-missing` (needs
+  authentication).
+- Without `settings` on the machine, `diff` reports it whenever a user key is
+  declared, since deploy fails then.
+- A scalar key that leaves config is left as is. Any config error holds the
+  section.
 
 ## users
 
@@ -1088,7 +1102,11 @@ plist:
   and mode are kept. Values compare type-strictly, as in `defaults`.
 - A file that does not exist yet is skipped (`diff` shows `= skip`): the app
   creates it on first launch and a later deploy sets the keys.
-- A key that leaves config is left as is. Runs as the user.
+- The first write of a key records its prior value in state. A key that leaves
+  config (or whose file leaves config) gets its prior value back, or is deleted
+  if it did not exist before tools; `diff` shows `- restore` or `- delete`. A
+  key changed by hand since tools wrote it, or whose file is gone, is left as
+  is and forgotten. Runs as the user.
 
 ## mgmt
 

@@ -102,6 +102,126 @@ class PlistTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(spec[self.path]), 3)
 
+    def test_dropped_key_gets_its_prior_value_back(self):
+        self.write({"General": {"showMenuBarItem": True, "other": 1}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        self.assertEqual(self.read()[0]["General"]["showMenuBarItem"], False)
+        self.assertTrue(plist.has_work(None, state))
+        self.assertEqual(
+            plist.diff_plist(None, state),
+            [f"  - restore {self.path} General:showMenuBarItem -> true"],
+        )
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"General": {"showMenuBarItem": True, "other": 1}})
+        self.assertEqual(state, {})
+        self.assertFalse(plist.has_work(None, state))
+
+    def test_dropped_key_that_was_absent_is_deleted(self):
+        self.write({"General": {"other": 1}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        other = {self.path: {"General:other": 1}}
+        self.assertEqual(
+            plist.diff_plist(other, state), [f"  - delete {self.path} General:showMenuBarItem"]
+        )
+        self.assertTrue(plist.install_plist(other, state))
+        self.assertEqual(self.read()[0], {"General": {"other": 1}})
+        self.assertEqual(state, {})
+
+    def test_key_changed_by_hand_is_left_and_forgotten(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        self.write({"General": {"showMenuBarItem": "mine"}})
+        self.assertEqual(
+            plist.diff_plist(None, state),
+            [f"  ~ forget {self.path} General:showMenuBarItem (changed by hand; left as is)"],
+        )
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"General": {"showMenuBarItem": "mine"}})
+        self.assertEqual(state, {})
+
+    def test_gone_file_is_forgotten_not_created(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        os.remove(self.path)
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(state, {})
+
+    def test_value_change_keeps_first_prior(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        self.assertTrue(plist.install_plist({self.path: {"General:showMenuBarItem": 5}}, state))
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"General": {"showMenuBarItem": True}})
+
+    def test_hand_set_new_value_is_adopted_before_removal(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        self.write({"General": {"showMenuBarItem": 5}})
+        self.assertTrue(plist.install_plist({self.path: {"General:showMenuBarItem": 5}}, state))
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"General": {"showMenuBarItem": True}})
+
+    def test_unreadable_file_keeps_state(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        self.assertTrue(plist.install_plist(self.raw, state))
+        with open(self.path, "w") as f:
+            f.write("not a plist")
+        self.assertFalse(plist.install_plist(None, state))
+        self.assertTrue(plist.has_work(None, state))
+
+    def test_failed_write_does_not_record_ownership(self):
+        self.write({"General": {"showMenuBarItem": True}})
+        state = {}
+        with mock.patch.object(plist.fsutil, "atomic_write", side_effect=OSError("boom")):
+            self.assertFalse(plist.install_plist(self.raw, state))
+        self.assertEqual(state, {})
+
+    def test_parent_key_moving_to_child_keeps_new_value(self):
+        self.write({"other": 1})
+        state = {}
+        self.assertTrue(plist.install_plist({self.path: {"A": {"B": 1}}}, state))
+        child = {self.path: {"A:B": 2}}
+        self.assertEqual(
+            plist.diff_plist(child, state),
+            [f"  + write {self.path} A:B = 2", f"  - delete {self.path} A"],
+        )
+        self.assertTrue(plist.install_plist(child, state))
+        self.assertEqual(self.read()[0], {"other": 1, "A": {"B": 2}})
+        self.assertEqual(plist.diff_plist(child, state), [])
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"other": 1, "A": {}})
+
+    def test_child_key_moving_to_parent_keeps_new_value(self):
+        self.write({"A": {"C": 3}})
+        state = {}
+        self.assertTrue(plist.install_plist({self.path: {"A:B": 1}}, state))
+        parent = {self.path: {"A": {"B": 2}}}
+        self.assertTrue(plist.install_plist(parent, state))
+        self.assertEqual(self.read()[0], {"A": {"B": 2}})
+        self.assertEqual(plist.diff_plist(parent, state), [])
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(self.read()[0], {"A": {"C": 3}})
+
+    def test_prior_xml_cannot_hold_is_kept_and_restored(self):
+        self.write({"General": {"showMenuBarItem": plistlib.UID(7)}, "n": {"k": None}})
+        state = {}
+        raw = {self.path: {"General:showMenuBarItem": False, "n": 1}}
+        self.assertTrue(plist.install_plist(raw, state))
+        self.assertEqual(self.read()[0], {"General": {"showMenuBarItem": False}, "n": 1})
+        self.assertTrue(plist.install_plist(None, state))
+        self.assertEqual(
+            self.read()[0], {"General": {"showMenuBarItem": plistlib.UID(7)}, "n": {"k": None}}
+        )
+        self.assertEqual(state, {})
+
     def test_tilde_expands(self):
         with mock.patch.dict(os.environ, {"HOME": self.dir}):
             spec, errors = plist.parse({"~/config.plist": {"k": 1}})
@@ -116,17 +236,30 @@ class WiringTest(unittest.TestCase):
         self.assertIn("plist", TOP_LEVEL_KEYS)
         self.assertNotIn("plist", privilege.ROOT_SECTIONS)
 
-    def test_deploy_runs_declared_section(self):
-        raw = {"/tmp/x.plist": {"k": 1}}
+    def _deploy(self, config, state):
         with (
-            mock.patch.object(cli, "load_json", return_value={}),
+            mock.patch.object(cli, "load_json", return_value=state),
             mock.patch.object(cli, "migrate_state_file"),
             mock.patch.object(cli, "save_json"),
             mock.patch.object(cli, "state_lock"),
             mock.patch.object(cli, "install_plist", return_value=True) as inst,
         ):
-            self.assertTrue(cli._deploy({"plist": raw}, "/tmp"))
-        inst.assert_called_once_with(raw)
+            self.assertTrue(cli._deploy(config, "/tmp"))
+        return inst
+
+    def test_deploy_runs_declared_section(self):
+        raw = {"/tmp/x.plist": {"k": 1}}
+        inst = self._deploy({"plist": raw}, {})
+        inst.assert_called_once()
+        self.assertEqual(inst.call_args.args[0], raw)
+        self.assertIsInstance(inst.call_args.args[1], dict)
+
+    def test_deploy_runs_on_state_alone(self):
+        state = {"plist": {"managed": {"/tmp/x.plist": {"k": {"prior": None}}}}}
+        inst = self._deploy({}, state)
+        inst.assert_called_once()
+        self.assertIsNone(inst.call_args.args[0])
+        self._deploy({}, {}).assert_not_called()
 
 
 if __name__ == "__main__":

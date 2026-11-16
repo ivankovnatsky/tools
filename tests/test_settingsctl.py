@@ -15,20 +15,31 @@ MINI = {
 
 class SettingsctlTest(unittest.TestCase):
     def setUp(self):
-        patch = mock.patch.object(settingsctl.sys, "platform", "darwin")
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.applied = {}
+        self.login_items = ""
+        for patch in (
+            mock.patch.object(settingsctl.sys, "platform", "darwin"),
+            mock.patch.object(settingsctl, "_read_state", self.applied.get),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def fake_run(self, cmd, env=None, cwd=None):
+        self.commands.append(cmd)
+        if cmd[1:] == ["login", "list"]:
+            return 0, self.login_items, ""
+        return self.rc, "", ""
 
     def _install(self, raw, rc=0):
-        commands = []
-
-        def run(cmd, env=None, cwd=None):
-            commands.append(cmd)
-            return rc, "", ""
-
-        with mock.patch.object(settingsctl, "run_command", run):
+        self.commands, self.rc = [], rc
+        with mock.patch.object(settingsctl, "run_command", self.fake_run):
             ok = settingsctl.install_settingsctl(raw, which=lambda _: "/bin/settings")
-        return ok, commands
+        return ok, [c for c in self.commands if c[1:] != ["login", "list"]]
+
+    def diff(self, raw, which=lambda _: "/bin/settings"):
+        self.commands, self.rc = [], 0
+        with mock.patch.object(settingsctl, "run_command", self.fake_run):
+            return settingsctl.diff_settingsctl(raw, which=which, executable=lambda _: False)
 
     def test_runs_each_declared_list(self):
         ok, commands = self._install(MINI)
@@ -36,7 +47,7 @@ class SettingsctlTest(unittest.TestCase):
         self.assertEqual(
             commands,
             [
-                ["/bin/settings", "fulldiskaccess", "--enable", "kitty,Terminal"],
+                ["/bin/settings", "fulldiskaccess", "set", "kitty,Terminal"],
                 ["/bin/settings", "accessibility", "set", "Hammerspoon"],
                 ["/bin/settings", "login", "set", "Hammerspoon,LosslessSwitcher"],
             ],
@@ -48,14 +59,45 @@ class SettingsctlTest(unittest.TestCase):
         self.assertEqual(len(commands), 1)
 
     def test_diff_shows_commands(self):
+        self.applied["fda-enabled"] = "Terminal,determinate-nixd,kitty"
+        self.login_items = "Hammerspoon\n"
         self.assertEqual(
-            settingsctl.diff_settingsctl(MINI),
+            self.diff(MINI),
             [
-                "  ~ settings fulldiskaccess --enable 'kitty,Terminal'",
+                "  ~ settings fulldiskaccess set 'kitty,Terminal'"
+                " (now 'Terminal,determinate-nixd,kitty')",
                 "  ~ settings accessibility set 'Hammerspoon'",
-                "  ~ settings login set 'Hammerspoon,LosslessSwitcher'",
+                "  ~ settings login set 'Hammerspoon,LosslessSwitcher' (now 'Hammerspoon')",
             ],
         )
+
+    def test_applied_lists_are_clean(self):
+        self.applied["fda-enabled"] = "Terminal,kitty"
+        self.applied["accessibility-enabled"] = "Hammerspoon"
+        self.login_items = "LosslessSwitcher\nHammerspoon\n"
+        self.assertEqual(self.diff(MINI), [])
+        ok, commands = self._install(MINI)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [])
+
+    def test_app_paths_compare_by_name(self):
+        self.applied["accessibility-enabled"] = "Muxy"
+        self.login_items = "Home App\n"
+        raw = {
+            "accessibility": ["Muxy=/Applications/Muxy.app"],
+            "loginItems": ["/Users/me/Applications/Home App.app"],
+        }
+        self.assertEqual(self.diff(raw), [])
+
+    def test_no_login_items_reads_as_empty(self):
+        self.login_items = "No login items found.\n"
+        self.assertEqual(
+            self.diff({"loginItems": ["A"]}), ["  ~ settings login set 'A' (now none)"]
+        )
+
+    def test_missing_cli_is_reported_for_any_user_key(self):
+        rows = self.diff({"accessibility": ["A"]}, which=lambda _: None)
+        self.assertIn("`settings` not found", rows[0])
 
     def test_invalid_config_runs_nothing(self):
         raw = {"accessibility": ["A,B"], "camera": []}
