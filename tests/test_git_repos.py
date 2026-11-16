@@ -273,7 +273,7 @@ class GitReposSpellingTest(unittest.TestCase):
                 mock.patch.object(git_repos, "system_bin", return_value="git"),
                 mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
                 mock.patch.object(git_repos, "run_command", fake.run),
-                mock.patch.object(git_repos.shutil, "rmtree", side_effect=removed.append),
+                mock.patch.object(git_repos.fsutil, "trash", side_effect=removed.append),
             ):
                 self.assertTrue(git_repos.install_git_repos({"~/r": "u"}, state))
 
