@@ -20,14 +20,15 @@ Config shape::
 
 Every command runs as `settings --no-state ...`, so settingsctl keeps no state of its
 own; state.json under `settingsctl` records what tools granted. A privacy list with
-names not yet recorded reads the pane (`settings <pane> list --json`) and enables the
+names not recorded as granted reads the pane (`settings <pane> list --json`) and enables the
 ones not on; login items are read with `settings login list` every run and missing
 ones added with `settings login add`. A recorded name that leaves its list (or the key
 or section goes, or the list is `[]`) is revoked: `settings <pane> revoke` for privacy
 panes, `settings login remove` per login item. Names tools never recorded are left
-alone. After a failed step the live list is read again and the names it shows granted
-are recorded; when it cannot be read, failed revokes stay recorded and failed applies
-record their targets.
+alone. The record lists every name tools granted or tried to grant, so revokes cover
+them all; `settingsctl.unconfirmed` holds the ones a failed step left unverified, which
+count as not granted until a live read or an apply confirms them. Names whose revoke
+failed stay recorded. An unreadable login item list fails the section.
 
 `appearanceInit` runs `settings appearance --init` once and records it. Every other
 key is read first (`settings ... get --json`) and set only when it differs. Root keys
@@ -68,6 +69,7 @@ ROOT_HINT = "run sudo tools deploy --scope settingsctl"
 NO_STATE = "--no-state"
 SUDO_VARS = ("SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND")
 APPEARANCE_INIT = ["appearance", "--init"]
+REVOKE_DELETES = ("accessibility",)
 PANE = {"fullDiskAccess": "fulldiskaccess", "accessibility": "accessibility"}
 ENABLE = {
     "fullDiskAccess": ["fulldiskaccess", "--enable"],
@@ -318,40 +320,43 @@ def plan_root(spec: Dict, runner: Runner) -> Tuple[List[Tuple[str, List[str]]], 
     return todo, errors
 
 
-def _login_items(runner: Optional[Runner]) -> Optional[List[str]]:
-    """Current login item names, or None when they cannot be read."""
-    if not runner:
-        return None
-    rc, stdout, _ = runner.call("login", "list")
+def _login_items(runner: Runner) -> List[str]:
+    """Current login item names; RuntimeError when they cannot be read."""
+    rc, stdout, stderr = runner.call("login", "list")
     if rc != 0:
-        return None
+        raise RuntimeError(f"settings login list: {(stderr or stdout).strip() or rc}")
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     return [] if lines == ["No login items found."] else lines
 
 
-def _live(key: str, runner: Optional[Runner]) -> Optional[set]:
-    """Names granted now (enabled pane rows, or login items); None when unreadable."""
-    if key == "loginItems":
-        items = _login_items(runner)
-        return None if items is None else set(items)
+def _read(key: str, runner: Optional[Runner]) -> Optional[Tuple[set, set]]:
+    """(names granted now, names still revocable) for key; None when unreadable."""
     if not runner:
         return None
+    if key == "loginItems":
+        try:
+            items = set(_login_items(runner))
+        except RuntimeError:
+            return None
+        return items, items
     try:
         items = runner.get(PANE[key], "list").get("items")
     except RuntimeError:
         return None
     if not isinstance(items, list):
         return None
-    return {
-        item["name"]
-        for item in items
-        if isinstance(item, dict) and item.get("enabled") and isinstance(item.get("name"), str)
-    }
+    rows = [i for i in items if isinstance(i, dict) and isinstance(i.get("name"), str)]
+    granted = {i["name"] for i in rows if i.get("enabled")}
+    return granted, ({i["name"] for i in rows} if key in REVOKE_DELETES else granted)
 
 
-def recorded(state: Optional[Dict]) -> Dict[str, List[str]]:
-    """{list key: names tools granted} from state.json."""
-    section = (state or {}).get("settingsctl")
+def _live(key: str, runner: Optional[Runner]) -> Optional[set]:
+    """Names granted now (enabled pane rows, or login items); None when unreadable."""
+    read = _read(key, runner)
+    return None if read is None else read[0]
+
+
+def _lists(section) -> Dict[str, List[str]]:
     if not isinstance(section, dict):
         return {}
     return {
@@ -359,6 +364,17 @@ def recorded(state: Optional[Dict]) -> Dict[str, List[str]]:
         for key, names in section.items()
         if key in LIST_KEYS and isinstance(names, list) and names
     }
+
+
+def recorded(state: Optional[Dict]) -> Dict[str, List[str]]:
+    """{list key: names tools granted or tried to grant} from state.json."""
+    return _lists((state or {}).get("settingsctl"))
+
+
+def unconfirmed(state: Optional[Dict]) -> Dict[str, List[str]]:
+    """{list key: recorded names a failed step left unverified} from state.json."""
+    section = (state or {}).get("settingsctl")
+    return _lists(section.get("unconfirmed") if isinstance(section, dict) else None)
 
 
 def _legacy_appearance_marker() -> str:
@@ -382,46 +398,60 @@ class ListStep:
     key: str
     row: str
     args: List[str]
-    revoke: List[str]  # names this step revokes; empty for an apply
+    revoke: List[str]
+    grant: List[str]
 
 
-def _step(key: str, sign: str, args: List[str], revoke: List[str]) -> ListStep:
-    return ListStep(key, f"  {sign} settings {_shown(args)}", args, revoke)
+def _step(key: str, sign: str, args: List[str], revoke: List[str], grant: List[str]) -> ListStep:
+    return ListStep(key, f"  {sign} settings {_shown(args)}", args, revoke, grant)
 
 
 def plan_lists(
-    spec: Dict, runner: Optional[Runner], record: Dict[str, List[str]]
-) -> List[ListStep]:
-    """Applies and revokes for the list keys; reads only. Only recorded names are
-    revoked; live reads decide which targets still need an apply."""
+    spec: Dict,
+    runner: Optional[Runner],
+    record: Dict[str, List[str]],
+    doubtful: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[List[ListStep], List[str]]:
+    """(applies and revokes for the list keys, read errors); reads only. Every recorded
+    name is revocable; unconfirmed ones count as not granted. Live reads decide which
+    targets still need an apply."""
     steps: List[ListStep] = []
+    errors: List[str] = []
     for key in LIST_KEYS:
         apps = spec.get(key) or []
         had = set(record.get(key) or [])
+        granted = had - set((doubtful or {}).get(key) or [])
         dropped = sorted(had - set(_names(key, apps)))
         if key == "loginItems":
             if not apps and not dropped:
                 continue
-            current = _live(key, runner)
-            known = had if current is None else current
+            current = None
+            if runner:
+                try:
+                    current = set(_login_items(runner))
+                except RuntimeError as e:
+                    errors.append(f"loginItems: {e}")
+            known = granted if current is None else current
             for app in apps:
-                if _name(key, app) not in known:
-                    steps.append(_step(key, "+", ["login", "add", app], []))
+                name = _name(key, app)
+                if name not in known:
+                    steps.append(_step(key, "+", ["login", "add", app], [], [name]))
             for name in dropped:
                 if current is None or name in current:
-                    steps.append(_step(key, "-", ["login", "remove", name], [name]))
+                    steps.append(_step(key, "-", ["login", "remove", name], [name], []))
             continue
-        pending = [a for a in apps if _name(key, a) not in had]
+        pending = [a for a in apps if _name(key, a) not in granted]
         if pending:
             current = _live(key, runner)
             if current is not None:
                 pending = [a for a in apps if _name(key, a) not in current]
         if pending:
-            steps.append(_step(key, "+", [*ENABLE[key], ",".join(pending)], []))
+            args = [*ENABLE[key], ",".join(pending)]
+            steps.append(_step(key, "+", args, [], _names(key, pending)))
         if dropped:
             args = [PANE[key], "revoke", ",".join(dropped)]
-            steps.append(_step(key, "-", args, dropped))
-    return steps
+            steps.append(_step(key, "-", args, dropped, []))
+    return steps, errors
 
 
 def plan_user(
@@ -429,11 +459,12 @@ def plan_user(
     runner: Optional[Runner],
     record: Optional[Dict[str, List[str]]] = None,
     inited: bool = False,
+    doubtful: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
     """([(diff row, settings args)], read errors) for user keys and recorded lists."""
+    steps, list_errors = plan_lists(spec, runner, record or {}, doubtful)
     todo, errors = plan_other(spec, runner, inited)
-    lists = [(step.row, step.args) for step in plan_lists(spec, runner, record or {})]
-    return lists + todo, errors
+    return [(step.row, step.args) for step in steps] + todo, list_errors + errors
 
 
 def plan_other(
@@ -517,7 +548,7 @@ def diff_settingsctl(
     record = recorded(state)
     if _needs_cli_as_user(spec, record) and not runner:
         rows.append(f"  ? `settings` not found (looked in {looked})")
-    todo, read_errors = plan_user(spec, runner, record, _init_done(state))
+    todo, read_errors = plan_user(spec, runner, record, _init_done(state), unconfirmed(state))
     rows += [f"  ? {e}" for e in read_errors] + [row for row, _ in todo]
     if has_root and not privilege.UNDER_SUDO:
         if not runner:
@@ -549,38 +580,56 @@ def _apply(runner: Runner, todo: List[Tuple[str, List[str]]]) -> bool:
 def _still_recorded(
     key: str,
     spec: Dict,
-    record: Dict[str, List[str]],
+    doubtful: Dict[str, List[str]],
     results: List[Tuple[ListStep, bool]],
     runner: Runner,
-) -> List[str]:
-    """Names tools granted for key after this run. When a step failed, the ones the live
-    list shows granted; when that cannot be read, the targets plus dropped names whose
-    revoke failed."""
+) -> Tuple[List[str], List[str]]:
+    """(names tools own for key after this run, those not confirmed granted). Owned are
+    the targets plus dropped names whose revoke failed and the live list still shows
+    (any Accessibility row, since its revoke deletes rows), or all of them when it
+    cannot be read. After a failed step the targets the live list lacks are unconfirmed;
+    when it cannot be read, the targets of failed applies and earlier unconfirmed ones
+    no apply confirmed."""
     target = set(_names(key, spec.get(key) or []))
     steps = [(step, ok) for step, ok in results if step.key == key]
     if all(ok for _step, ok in steps):
-        return sorted(target)
-    had = set(record.get(key) or [])
-    live = _live(key, runner)
-    if live is not None:
-        return sorted((had | target) & live)
-    failed = {name for step, ok in steps if not ok for name in step.revoke}
-    return sorted(target | failed)
+        return sorted(target), []
+    unrevoked = {name for step, ok in steps if not ok for name in step.revoke}
+    read = _read(key, runner)
+    if read is not None:
+        live, present = read
+        return sorted(target | (unrevoked & present)), sorted(target - live)
+    owned = target | unrevoked
+    failed = {name for step, ok in steps if not ok for name in step.grant}
+    applied = {name for step, ok in steps if ok for name in step.grant}
+    earlier = set(doubtful.get(key) or []) - applied
+    return sorted(owned), sorted((failed | earlier) & target)
 
 
-def _store(state: Optional[Dict], lists: Optional[Dict[str, List[str]]], inited: bool) -> None:
+def _store(
+    state: Optional[Dict],
+    lists: Optional[Dict[str, Tuple[List[str], List[str]]]],
+    inited: bool,
+) -> None:
     """Write the `settingsctl` record; lists None keeps the recorded lists."""
     if state is None:
         return
     section = state.get("settingsctl")
     section = section if isinstance(section, dict) else {}
-    for key in LIST_KEYS:
-        if lists is None:
-            continue
-        if lists.get(key):
-            section[key] = lists[key]
+    if lists is not None:
+        doubtful = {}
+        for key in LIST_KEYS:
+            owned, unsure = lists.get(key) or ([], [])
+            if owned:
+                section[key] = owned
+            else:
+                section.pop(key, None)
+            if unsure:
+                doubtful[key] = unsure
+        if doubtful:
+            section["unconfirmed"] = doubtful
         else:
-            section.pop(key, None)
+            section.pop("unconfirmed", None)
     if inited:
         section["appearanceInit"] = True
     else:
@@ -632,8 +681,10 @@ def install_settingsctl(
         for err in read_errors:
             log(f"settingsctl: {err}", Color.RED)
         return _apply(runner, todo) and not read_errors
-    plan = plan_lists(spec, runner, record)
-    todo, read_errors = plan_other(spec, runner, inited)
+    doubtful = unconfirmed(state)
+    plan, list_errors = plan_lists(spec, runner, record, doubtful)
+    todo, other_errors = plan_other(spec, runner, inited)
+    read_errors = list_errors + other_errors
     for err in read_errors:
         log(f"settingsctl: {err}", Color.RED)
     results = [(step, _apply(runner, [(step.row, step.args)])) for step in plan]
@@ -644,6 +695,6 @@ def install_settingsctl(
         if args == APPEARANCE_INIT and ok:
             inited = True
     if state is not None:
-        lists = {key: _still_recorded(key, spec, record, results, runner) for key in LIST_KEYS}
+        lists = {key: _still_recorded(key, spec, doubtful, results, runner) for key in LIST_KEYS}
         _store(state, lists, inited)
     return success and not read_errors

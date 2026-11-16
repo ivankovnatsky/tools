@@ -348,7 +348,7 @@ class ListRecordTest(SettingsctlCase):
         self.assertEqual(commands, expected)
         self.assertEqual(state["settingsctl"], {"accessibility": ["A", "B"]})
 
-    def test_partial_enable_records_live_grants(self):
+    def test_partial_enable_leaves_failed_names_unconfirmed(self):
         self.grant("fullDiskAccess", "old", "Z")
         self.fake.stuck.add("B")
         state = {"settingsctl": {"fullDiskAccess": ["old", "Z"]}}
@@ -358,25 +358,102 @@ class ListRecordTest(SettingsctlCase):
             commands,
             [["fulldiskaccess", "--enable", "A,B"], ["fulldiskaccess", "revoke", "old"]],
         )
-        self.assertEqual(state["settingsctl"], {"fullDiskAccess": ["A", "Z"]})
+        self.assertEqual(
+            state["settingsctl"],
+            {"fullDiskAccess": ["A", "B", "Z"], "unconfirmed": {"fullDiskAccess": ["B"]}},
+        )
 
-    def test_failed_enable_with_unreadable_pane_records_its_targets(self):
+    def test_failed_enable_with_unreadable_pane_is_retried(self):
         self.fake.unreadable.add("accessibility")
         self.fake.stuck.add("A")
-        state = {}
-        ok, commands = self._install({"accessibility": ["A"]}, state=state)
+        raw = {"accessibility": ["A", "C"]}
+        state = {"settingsctl": {"accessibility": ["C"]}}
+        ok, commands = self._install(raw, state=state)
         self.assertFalse(ok)
         self.assertEqual(commands, [["accessibility", "enable", "A"]])
+        self.assertEqual(
+            state["settingsctl"],
+            {"accessibility": ["A", "C"], "unconfirmed": {"accessibility": ["A"]}},
+        )
+        retry = [["accessibility", "enable", "A"]]
+        self.assert_preview_matches(raw, state, retry)
+        ok, commands = self._install(raw, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(commands, retry)
+        self.fake.stuck.clear()
+        self.assert_preview_matches(raw, state, retry)
+        ok, commands = self._install(raw, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, retry)
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A", "C"]})
+        self.assertEqual(self.diff(raw, state=state), [])
+
+    def test_unconfirmed_names_are_revoked_when_dropped(self):
+        self.grant("accessibility", "A", on=False)
+        state = {"settingsctl": {"accessibility": ["A"], "unconfirmed": {"accessibility": ["A"]}}}
+        expected = [["accessibility", "revoke", "A"]]
+        self.assert_preview_matches(None, state, expected)
+        ok, commands = self._install(None, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, expected)
+        self.assertNotIn("settingsctl", state)
+
+    def test_unconfirmed_name_seen_live_is_confirmed(self):
+        self.grant("accessibility", "A")
+        state = {"settingsctl": {"accessibility": ["A"], "unconfirmed": {"accessibility": ["A"]}}}
+        self.assertEqual(self.diff({"accessibility": ["A"]}, state=state), [])
+        ok, commands = self._install({"accessibility": ["A"]}, state=state)
+        self.assertTrue(ok)
+        self.assertEqual(commands, [])
         self.assertEqual(state["settingsctl"], {"accessibility": ["A"]})
 
-    def test_failed_login_add_records_from_current_items(self):
+    def test_failed_accessibility_revoke_of_disabled_row_stays_recorded(self):
+        self.grant("accessibility", "A", on=False)
+        self.fake.stuck.add("A")
+        state = {"settingsctl": {"accessibility": ["A"]}}
+        ok, commands = self._install(None, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(commands, [["accessibility", "revoke", "A"]])
+        self.assertEqual(state["settingsctl"], {"accessibility": ["A"]})
+        self.assertEqual(self.diff(None, state=state), ["  - settings accessibility revoke A"])
+
+    def test_failed_login_add_leaves_it_unconfirmed(self):
         self.fake.login = ["L2"]
         self.fake.stuck.add("N2")
         state = {"settingsctl": {"loginItems": ["L2"]}}
-        ok, _ = self._install({"loginItems": ["N1", "N2"]}, state=state)
+        raw = {"loginItems": ["N1", "N2"]}
+        ok, _ = self._install(raw, state=state)
         self.assertFalse(ok)
-        self.assertEqual(state["settingsctl"], {"loginItems": ["N1"]})
+        self.assertEqual(
+            state["settingsctl"],
+            {"loginItems": ["N1", "N2"], "unconfirmed": {"loginItems": ["N2"]}},
+        )
         self.assertEqual(self.fake.login, ["N1"])
+        self.assertEqual(self.diff(raw, state=state), ["  + settings login add N2"])
+
+    def test_unreadable_login_items_fail_the_section(self):
+        self.fake.unreadable.add("login")
+        raw = {"loginItems": ["L1", "L2"]}
+        state = {"settingsctl": {"loginItems": ["L1", "L2"]}}
+        rows = self.diff(raw, state=state)
+        self.assertEqual(rows, ["  ? loginItems: settings login list: could not read"])
+        ok, commands = self._install(raw, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(commands, [])
+        self.assertEqual(state["settingsctl"], {"loginItems": ["L1", "L2"]})
+
+    def test_unreadable_login_items_still_retry_unconfirmed(self):
+        self.fake.unreadable.add("login")
+        raw = {"loginItems": ["L1", "L2"]}
+        state = {"settingsctl": {"loginItems": ["L1", "L2"], "unconfirmed": {"loginItems": ["L2"]}}}
+        self.assertEqual(
+            self.diff(raw, state=state),
+            ["  ? loginItems: settings login list: could not read", "  + settings login add L2"],
+        )
+        ok, commands = self._install(raw, state=state)
+        self.assertFalse(ok)
+        self.assertEqual(commands, [["login", "add", "L2"]])
+        self.assertEqual(state["settingsctl"], {"loginItems": ["L1", "L2"]})
 
     def test_login_items_already_gone_are_forgotten(self):
         self.fake.login = ["L1"]
