@@ -8,6 +8,7 @@ import click
 
 from accessibility_state import (
     accessibility_enable,
+    accessibility_revoke,
     accessibility_set,
 )
 from accessibility_ui import (
@@ -26,7 +27,7 @@ def register(cli):
     @click.argument(
         "action",
         required=False,
-        type=click.Choice(["list", "add", "remove", "toggle", "open", "enable", "set"]),
+        type=click.Choice(["list", "add", "remove", "toggle", "open", "enable", "set", "revoke"]),
     )
     @click.argument("app", required=False)
     @click.option(
@@ -48,6 +49,7 @@ def register(cli):
                                   APP may be NAME=/path; --add-missing adds
                                   unlisted apps from that path (default: NAME.app
                                   in /Applications, /System/Applications, ~/Applications)
+          revoke "APP1,APP2,..."  Remove these apps and forget them; others untouched
           open                    Open the Accessibility pane in System Settings
         """
         if not is_macos():
@@ -74,6 +76,15 @@ def register(cli):
                 print("Error: specify app list", file=sys.stderr)
                 sys.exit(1)
             if not accessibility_enable(apps, add_missing):
+                sys.exit(1)
+            return
+
+        if action == "revoke":
+            names = list(parse_app_specs(app or ""))
+            if not names:
+                print("Error: specify app list", file=sys.stderr)
+                sys.exit(1)
+            if not accessibility_revoke(names):
                 sys.exit(1)
             return
 

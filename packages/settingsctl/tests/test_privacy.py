@@ -157,6 +157,57 @@ class PaneTest(unittest.TestCase):
         self.assertFalse(accessibility_state.accessibility_enable({"kitty": None}))
         self.assertEqual(self.state("accessibility-enabled"), "x")
 
+    def test_fda_revoke_turns_off_only_listed_apps(self):
+        (Path(self.dir.name) / "fda-enabled").write_text("Terminal,old")
+        self.assertEqual(self.cli("fulldiskaccess", "revoke", "old,gone"), 0)
+        self.assertEqual(self.pane.rows, {"kitty": False, "Terminal": True, "old": False})
+        self.assertEqual(self.state("fda-enabled"), "Terminal")
+
+    def test_fda_revoke_failure_keeps_state(self):
+        (Path(self.dir.name) / "fda-enabled").write_text("Terminal,old")
+        self.pane.sticks = False
+        self.assertEqual(self.cli("fulldiskaccess", "revoke", "old"), 1)
+        self.assertEqual(self.state("fda-enabled"), "Terminal,old")
+        self.assertEqual(self.cli("fulldiskaccess", "revoke", ""), 1)
+
+    def test_accessibility_revoke_removes_only_listed_apps(self):
+        (Path(self.dir.name) / "accessibility-enabled").write_text("Terminal,old")
+        with mock.patch.object(accessibility_state, "accessibility_remove") as remove:
+            remove.side_effect = lambda app: self.pane.rows.pop(app, None) is not None
+            self.assertTrue(accessibility_state.accessibility_revoke(["old", "gone"]))
+        remove.assert_called_once_with("old")
+        self.assertEqual(self.pane.rows, {"kitty": False, "Terminal": True})
+        self.assertEqual(self.state("accessibility-enabled"), "Terminal")
+
+    def test_accessibility_revoke_failures(self):
+        (Path(self.dir.name) / "accessibility-enabled").write_text("old")
+        with mock.patch.object(accessibility_state, "accessibility_remove", return_value=False):
+            self.assertFalse(accessibility_state.accessibility_revoke(["old"]))
+        self.assertEqual(self.state("accessibility-enabled"), "old")
+        self.pane.rows = None
+        self.assertFalse(accessibility_state.accessibility_revoke(["old"]))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoginListTest(unittest.TestCase):
+    def cli(self, osascript_rc, stdout=""):
+        import login
+
+        done = mock.Mock(returncode=osascript_rc, stdout=stdout, stderr="boom")
+        with (
+            mock.patch.object(login, "is_macos", lambda: True),
+            mock.patch.object(login.subprocess, "run", return_value=done),
+        ):
+            return CliRunner().invoke(settings.cli, ["login", "list"])
+
+    def test_unreadable_login_items_fail_instead_of_looking_empty(self):
+        result = self.cli(1)
+        self.assertEqual(result.exit_code, 1)
+        self.assertNotIn("No login items found.", result.output)
+
+    def test_empty_and_listed_login_items(self):
+        self.assertIn("No login items found.", self.cli(0, "\n").output)
+        self.assertEqual(self.cli(0, "A, B\n").output.split(), ["A", "B"])

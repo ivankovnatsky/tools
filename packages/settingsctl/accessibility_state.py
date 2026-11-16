@@ -106,3 +106,28 @@ def accessibility_set(apps: dict[str, str | None], add_missing: bool = False) ->
     elif (kept := partial_state(previous, gone, on)) != sorted(previous):
         _record(kept)
     return ok
+
+
+def accessibility_revoke(names: list[str]) -> bool:
+    """Remove these apps from the pane and the state file; apps not listed are done."""
+    listed = list_apps(ACCESSIBILITY_URL)
+    if listed is None:
+        print("Could not read the accessibility list", file=sys.stderr)
+        return False
+    current = {item["name"] for item in listed}
+    done = {name for name in names if name not in current}
+    ok = True
+    for app in sorted(set(names) - done):
+        if accessibility_remove(app):
+            done.add(app)
+            print(f"Removed accessibility entry: {app}")
+            if quit_app(app):
+                print(f"Quit running app: {app}")
+        else:
+            print(f"Could not remove accessibility entry: {app}", file=sys.stderr)
+            ok = False
+    previous = accessibility_previous_state()
+    kept = [a for a in previous if a not in done]
+    if kept != previous:
+        _record(kept)
+    return ok

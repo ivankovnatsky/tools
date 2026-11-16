@@ -106,6 +106,16 @@ def fda_set(apps: dict[str, str | None], add_missing: bool = False) -> bool:
     return ok
 
 
+def fda_revoke(names: list[str]) -> bool:
+    """Turn these apps off and drop them from the state file; apps not listed are off."""
+    ok, off = ensure_disabled(FDA_URL, "Full Disk Access", names)
+    previous = fda_previous_state()
+    kept = [a for a in previous if not off.get(a)]
+    if kept != previous:
+        _record(kept)
+    return ok
+
+
 def register(cli):
     @cli.command()
     @click.option(
@@ -119,7 +129,7 @@ def register(cli):
         help="With --enable/set: add unlisted apps via + (needs you to authenticate).",
     )
     @click.argument(
-        "action", required=False, type=click.Choice(["list", "toggle", "open", "set"])
+        "action", required=False, type=click.Choice(["list", "toggle", "open", "set", "revoke"]),
     )
     @click.argument("app", required=False)
     def fulldiskaccess(enable_apps, add_missing, action, app):
@@ -131,6 +141,7 @@ def register(cli):
           toggle APP          Toggle an app's enabled state
           set "APP1,APP2,..." Declaratively sync to list; turns off previously
                               managed apps no longer in the list
+          revoke "APP1,..."   Turn these apps off and forget them; others untouched
           open                Open the Full Disk Access pane in System Settings
         """
         if not is_macos():
@@ -154,6 +165,15 @@ def register(cli):
                 )
                 sys.exit(1)
             if not fda_set(parse_app_specs(app), add_missing):
+                sys.exit(1)
+            return
+
+        if action == "revoke":
+            names = list(parse_app_specs(app or ""))
+            if not names:
+                print("Error: specify app list", file=sys.stderr)
+                sys.exit(1)
+            if not fda_revoke(names):
                 sys.exit(1)
             return
 

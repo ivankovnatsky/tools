@@ -141,7 +141,10 @@ def register(cli):
             sys.exit(1)
 
         if action == "list":
-            items = login_list()
+            ok, items = login_list_status()
+            if not ok:
+                print("Could not read login items", file=sys.stderr)
+                sys.exit(1)
             if not items:
                 print("No login items found.")
             else:
