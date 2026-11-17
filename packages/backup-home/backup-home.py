@@ -50,19 +50,19 @@ SOPS_SECRETS = {
 }
 
 
-def default_secrets_dir() -> Path:
-    """tools-rendered secrets when present, else the sops-nix ones."""
-    tools_dir = Path.home() / ".local/state/tools/secrets"
-    if tools_dir.is_dir():
-        return tools_dir
-    return Path.home() / ".config/sops-nix/secrets"
+def secret_path(name: str) -> Path:
+    """The tools-rendered secret ``name`` when present, else the sops-nix one."""
+    tools_path = Path.home() / ".local/state/tools/secrets" / name
+    if tools_path.exists():
+        return tools_path
+    return Path.home() / ".config/sops-nix/secrets" / name
 
 
 def _read_secret(name: str) -> str | None:
     """Read secret from a sops-rendered file."""
     sops_name = SOPS_SECRETS.get(name)
     if sops_name:
-        sops_path = default_secrets_dir() / sops_name
+        sops_path = secret_path(sops_name)
         try:
             return sops_path.read_text().strip()
         except OSError:
@@ -495,7 +495,8 @@ def main(
     miniserve_pass = _read_secret("MINISERVE_PASS")
     if not miniserve_user or not miniserve_pass:
         click.echo(
-            f"Error: miniserve secrets not found in {default_secrets_dir()}/",
+            f"Error: miniserve secrets not found ({secret_path('miniserve-username')}, "
+            f"{secret_path('miniserve-password')})",
             err=True,
         )
         sys.exit(1)

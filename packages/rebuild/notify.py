@@ -13,16 +13,16 @@ from machines import current_hostname
 CATEGORY = "rebuild"
 
 
-def default_secrets_dir() -> Path:
-    """tools-rendered secrets when present, else the sops-nix ones."""
-    tools_dir = Path.home() / ".local/state/tools/secrets"
-    if tools_dir.is_dir():
-        return tools_dir
-    return Path.home() / ".config/sops-nix/secrets"
+def secret_path(name: str) -> Path:
+    """The tools-rendered secret ``name`` when present, else the sops-nix one."""
+    tools_path = Path.home() / ".local/state/tools/secrets" / name
+    if tools_path.exists():
+        return tools_path
+    return Path.home() / ".config/sops-nix/secrets" / name
 
 
 def default_discord_webhook_file() -> Path:
-    return default_secrets_dir() / "discord-webhook-rebuild"
+    return secret_path("discord-webhook-rebuild")
 
 
 # Lines to include before/after the last nix `error:` marker when extracting
@@ -96,8 +96,7 @@ def send_failure_notification(webhook_file=None, exit_code=None, log_excerpt=Non
     The failure is not posted to Discord immediately; it is held in the shared
     digest store and posted in a batch by `notifications digest-flush` at 21:00,
     unless a later successful rebuild clears it first. Stores the webhook
-    *file path* (defaults to discord-webhook-rebuild under
-    default_secrets_dir()) so the flush can read
+    *file path* (defaults to secret_path("discord-webhook-rebuild")) so the flush can read
     the URL at send time. Silently skips if the file is missing — never fails
     the rebuild.
     """

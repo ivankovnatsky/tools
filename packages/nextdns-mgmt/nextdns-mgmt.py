@@ -17,17 +17,19 @@ API_BASE = f"https://{API_HOST}"
 USER_AGENT = "nextdns-mgmt/1.0.0"
 
 
-def default_secrets_dir() -> str:
-    """tools-rendered secrets when present, else the sops-nix ones."""
-    tools_dir = "~/.local/state/tools/secrets"
-    if os.path.isdir(os.path.expanduser(tools_dir)):
-        return tools_dir
-    return "~/.config/sops-nix/secrets"
+TOOLS_SECRETS_DIR = "~/.local/state/tools/secrets"
+SOPS_NIX_SECRETS_DIR = "~/.config/sops-nix/secrets"
 
 
-DEFAULT_SECRETS_PATH = default_secrets_dir()
-DEFAULT_API_KEY_PATH = f"{DEFAULT_SECRETS_PATH}/nextdns-api-key"
-DEFAULT_PROFILE_ID_PATH_TEMPLATE = f"{DEFAULT_SECRETS_PATH}/nextdns-profile-{{name}}"
+def secret_path(name: str) -> str:
+    """The tools-rendered secret ``name`` when present, else the sops-nix one."""
+    tools_path = f"{TOOLS_SECRETS_DIR}/{name}"
+    if os.path.exists(os.path.expanduser(tools_path)):
+        return tools_path
+    return f"{SOPS_NIX_SECRETS_DIR}/{name}"
+
+
+DEFAULT_API_KEY_PATH = secret_path("nextdns-api-key")
 
 
 def _read_file(path: str) -> str | None:
@@ -338,7 +340,7 @@ def update(name, profile_file, api_key_file, profile_id_file, dry_run):
             sys.exit(1)
         click.echo(f"Using profile id from {profile_id_file}", err=True)
     elif name:
-        id_path = DEFAULT_PROFILE_ID_PATH_TEMPLATE.format(name=name)
+        id_path = secret_path(f"nextdns-profile-{name}")
         profile_id = _read_file(id_path)
         if profile_id:
             click.echo(f"Using profile id from sops file for '{name}'", err=True)

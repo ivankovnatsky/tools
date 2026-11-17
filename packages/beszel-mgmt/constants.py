@@ -3,15 +3,18 @@
 import os
 
 
-def default_secrets_dir() -> str:
-    """tools-rendered secrets when present, else the sops-nix ones."""
-    tools_dir = "~/.local/state/tools/secrets"
-    if os.path.isdir(os.path.expanduser(tools_dir)):
-        return tools_dir
-    return "~/.config/sops-nix/secrets"
+TOOLS_SECRETS_DIR = "~/.local/state/tools/secrets"
+SOPS_NIX_SECRETS_DIR = "~/.config/sops-nix/secrets"
 
 
-DEFAULT_SECRETS_PATH = default_secrets_dir()
-DEFAULT_EMAIL_PATH = f"{DEFAULT_SECRETS_PATH}/beszel-email"
-DEFAULT_PASSWORD_PATH = f"{DEFAULT_SECRETS_PATH}/beszel-password"
-DEFAULT_DISCORD_WEBHOOK_PATH = f"{DEFAULT_SECRETS_PATH}/discord-webhook-beszel"
+def secret_path(name: str) -> str:
+    """The tools-rendered secret ``name`` when present, else the sops-nix one."""
+    tools_path = f"{TOOLS_SECRETS_DIR}/{name}"
+    if os.path.exists(os.path.expanduser(tools_path)):
+        return tools_path
+    return f"{SOPS_NIX_SECRETS_DIR}/{name}"
+
+
+DEFAULT_EMAIL_PATH = secret_path("beszel-email")
+DEFAULT_PASSWORD_PATH = secret_path("beszel-password")
+DEFAULT_DISCORD_WEBHOOK_PATH = secret_path("discord-webhook-beszel")
