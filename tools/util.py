@@ -239,33 +239,6 @@ def version_changed(pkg: str, pkg_info, state: Dict, manager: str) -> bool:
     return declared_version != stored_version or declared_source != stored_source
 
 
-class SecretSubstitutionError(Exception):
-    """Raised when a referenced secret file cannot be read."""
-
-
-def substitute_secrets(text: str, secret_paths: Dict[str, str]) -> str:
-    """Replace @VARIABLE@ placeholders with content from secret files.
-
-    Raises SecretSubstitutionError if a referenced secret file cannot be read,
-    so callers fail fast instead of passing half-substituted text downstream.
-    """
-    result = text
-    for var_name, file_path in secret_paths.items():
-        placeholder = f"@{var_name}@"
-        if placeholder not in result:
-            continue
-        try:
-            with open(file_path, "r") as f:
-                secret_value = f.read().strip()
-        except Exception as e:
-            log(f"Failed to read secret file {file_path}: {e}", Color.RED)
-            raise SecretSubstitutionError(
-                f"cannot read secret file {file_path} for @{var_name}@: {e}"
-            ) from e
-        result = result.replace(placeholder, secret_value)
-    return result
-
-
 def _is_binary(data: bytes) -> bool:
     """Heuristic: a NUL byte in the first 8 KiB means binary."""
     return b"\x00" in data[:8192]
@@ -277,11 +250,11 @@ def _is_binary(data: bytes) -> bool:
 # pushing the BEGIN marker past any short prefix window.
 _PEM_PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 
-# Project-wide secret-substitution template marker (see substitute_secrets).
-# A file whose source carries @VAR@ placeholders is a *template* signal:
-# the resolved file would contain a credential at that position. Require
-# at least three chars between the @ delimiters so single letters and
-# common doc usages (`@A@`, `@O@example.com`) do not trip it.
+# `@VAR@` secret-substitution template marker. A file whose source carries
+# @VAR@ placeholders is a *template* signal: the resolved file would contain
+# a credential at that position. Require at least three chars between the @
+# delimiters so single letters and common doc usages (`@A@`, `@O@example.com`)
+# do not trip it.
 _SECRET_PLACEHOLDER = re.compile(rb"@[A-Z_][A-Z0-9_]{2,}@")
 
 

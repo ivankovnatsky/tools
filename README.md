@@ -391,7 +391,8 @@ templates:
 ## Ownership (files, sops, templates)
 
 - A path declared by two of `files`/`sops`/`templates`/`fetch`/`env` is refused by all of them. Moving a path between `files`, `sops`, `templates` and `fetch` moves its state record first (`~ move <path> (files -> templates)`), so the new section takes the file over in the same deploy; a file edited since tools wrote it keeps its old record and stays refused.
-- Refused as well: symlinks managed by `links`/`skills`, paths through them or inside their targets, skill copy dirs and the skills cache.
+- Refused as well: symlinks managed by `links` or still recorded by the removed
+  skills `linkTargets`, paths through them or inside their targets, skill copy dirs and the skills cache.
 - Symlinked parents and case (on case-insensitive volumes) are normalized before comparing, so aliases match.
 - A managed path may not be inside another one (for example, a secret named `rendered`).
 - An unmanaged symlink at a target is never followed; it is moved aside like a file.
@@ -445,14 +446,12 @@ skills:
       subdir: skills     # optional
     mine:
       path: ./skills     # relative to the first --config path
-  targets: [~/.agents/skills, ~/.codex/skills]   # copies
-  linkTargets: [~/.claude/skills]                 # symlinks to the first copy
+  targets: [~/.agents/skills, ~/.codex/skills]
   enable:
     - anthropic/pdf
     - mine/*             # every skill in a source
     - skill: mine/claw-only
       targets: [~/.openclaw-skills]   # only here
-      linkTargets: []                 # no links
       as: claw                        # optional install name
 ```
 
@@ -467,15 +466,9 @@ skills:
   never overwritten, a copy modified since tools wrote it is neither updated
   nor removed, and removals only run when every source fetched and every
   entry resolved.
-- `linkTargets` get `<linkTarget>/<name>` as an absolute symlink to the
-  skill's copy in its first target, made only once that copy is in place.
-  Links follow `links:` ownership: foreign files and symlinks are skipped, a
-  symlink already pointing at the copy is adopted. A path cannot be both a copy
-  and a link.
-- Moving a dir from `targets` to `linkTargets` replaces each unmodified copy
-  there with a link in one deploy; a modified copy is kept and not linked. The
-  reverse move replaces the links with copies.
-- A path tracked by `links:` is skipped here, and the other way round.
+- The `linkTargets` option was removed. Symlinks it recorded in state are
+  forgotten on the next fully resolved deploy (`~ forget` in diff) and left in
+  place on disk; manage them with `links:` or delete them by hand.
 
 ## Links
 
@@ -1273,10 +1266,6 @@ a unique temp file beside the state and are renamed into place.
   another scope cannot be removed there; it is left alone with a warning and
   remembered (`= skip` in diff) until the configured scope changes. Servers
   under other names are never touched.
-- MCP servers with secret headers substitute secrets from `secretPaths` files at
-  register time. The `claude mcp add` CLI only accepts headers as argv, so the
-  resolved secret is briefly visible in the process list while the command runs.
-  Secrets are never logged or persisted to state.
 
 ## Packages
 

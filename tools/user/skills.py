@@ -14,14 +14,11 @@ Config shape::
       targets:                               # default copy destinations
         - ~/.agents/skills
         - ~/.codex/skills
-      linkTargets:                           # default symlink destinations
-        - ~/.claude/skills
       enable:
         - anthropic/pdf
         - mine/*                             # every skill in a source
         - skill: mine/claw-only              # per-skill destinations
           targets: [~/.openclaw-skills]
-          linkTargets: []
           as: claw                           # optional install name
 
 Each enabled skill is copied to ``<target>/<name>/``. Ownership follows
@@ -30,16 +27,8 @@ content hash, and deploy never overwrites a directory it did not create,
 never updates or removes one modified since it was written, and only ever
 removes directories it recorded.
 
-Each skill is also linked as ``<linkTarget>/<name>``, an absolute symlink
-to its copy in the first of its targets. Links follow the `links:` model:
-recorded in state apart from copies, adopted when a symlink already points
-at the copy, and repointed or removed only while they still point where
-tools left them. A path cannot be both a copy and a link. When a recorded,
-unmodified copy sits where a link is now wanted (a dir moved from
-`targets` to `linkTargets`), the copy is replaced by the link; that is a
-removal, so it waits for a fully resolved run like the others. The reverse
-move replaces each tracked link with a copy. A link the `links:` section
-tracks is left to it.
+Symlinks recorded under ``links`` in state by the removed ``linkTargets``
+option are forgotten; the symlinks themselves are left in place.
 
 Git sources are cloned into ``cacheDir/<source>``. That directory belongs
 to this tool entirely, so it is fetched and force-checked-out freely. An
@@ -57,7 +46,6 @@ from typing import Dict, List, Optional, Tuple
 from tools import fsutil
 from tools.log import Color, debug, log
 from tools.system_paths import system_bin, system_dir
-from tools.user.links import _make_link, _points_to, _readlink, _tracked_source
 from tools.util import run_command
 
 DEFAULT_CACHE_DIR = "~/.cache/tools/skills"
@@ -192,16 +180,16 @@ def _normalize_entry(entry) -> Tuple[Optional[Dict], Optional[str]]:
     if isinstance(entry, str):
         return {"skill": entry}, None
     if isinstance(entry, dict) and isinstance(entry.get("skill"), str):
-        unknown = set(entry) - {"skill", "targets", "linkTargets", "as"}
+        unknown = set(entry) - {"skill", "targets", "as"}
         if unknown:
             return None, f"unknown keys {sorted(unknown)} in enable entry {entry!r}"
         return entry, None
     return None, f"enable entry must be a string or a mapping with `skill`: {entry!r}"
 
 
-def _validate_targets(targets, where: str, key: str = "targets") -> Tuple[List[str], List[str]]:
+def _validate_targets(targets, where: str) -> Tuple[List[str], List[str]]:
     if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
-        return [], [f"{where}: {key} must be a list of paths"]
+        return [], [f"{where}: targets must be a list of paths"]
     resolved, errors = [], []
     for t in targets:
         expanded = _expand(t)
@@ -214,35 +202,29 @@ def _validate_targets(targets, where: str, key: str = "targets") -> Tuple[List[s
 
 def resolve(
     skills_config: Dict, config_dir: str
-) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Tuple[str, str]], List[str], List[str]]:
+) -> Tuple[Dict[str, Tuple[str, str]], List[str], List[str]]:
     """Resolve the desired install set from config and on-disk sources.
 
-    Returns (desired, links, errors, pending):
+    Returns (desired, errors, pending):
       desired  dest_dir -> (skill_id, source_dir)
-      links    link_path -> (skill_id, dest_dir of the copy it points at)
       errors   human-readable config problems
       pending  enable entries whose git source is not fetched yet
     """
     errors: List[str] = []
     pending: List[str] = []
     desired: Dict[str, Tuple[str, str]] = {}
-    links: Dict[str, Tuple[str, str]] = {}
 
     sources = skills_config.get("sources") or {}
     errors += validate_sources(sources)
     if errors:
-        return desired, links, errors, pending
+        return desired, errors, pending
 
     default_targets, target_errors = _validate_targets(skills_config.get("targets") or [], "skills")
-    errors += target_errors
-    default_links, target_errors = _validate_targets(
-        skills_config.get("linkTargets") or [], "skills", "linkTargets"
-    )
     errors += target_errors
 
     enable = skills_config.get("enable") or []
     if not isinstance(enable, list):
-        return desired, links, errors + ["enable must be a list"], pending
+        return desired, errors + ["enable must be a list"], pending
 
     cache_dir = cache_dir_for(skills_config)
     catalogs: Dict[str, Optional[Dict[str, str]]] = {}
@@ -264,13 +246,6 @@ def resolve(
             errors += target_errors
         else:
             targets = default_targets
-        if "linkTargets" in entry:
-            link_targets, target_errors = _validate_targets(
-                entry["linkTargets"], skill, "linkTargets"
-            )
-            errors += target_errors
-        else:
-            link_targets = default_links
         if not targets:
             errors.append(f"{skill}: no targets (set skills.targets or per-entry targets)")
             continue
@@ -332,38 +307,18 @@ def resolve(
                     errors.append(f"{dest}: claimed by both {existing[0]} and {skill_id}")
                     continue
                 desired[dest] = (skill_id, src_dir)
-            copy = os.path.join(targets[0], install_name)
-            if desired.get(copy, ("",))[0] != skill_id:
-                continue  # the copy went to another skill: reported above
-            for target in link_targets:
-                link = os.path.join(target, install_name)
-                existing = links.get(link)
-                if existing:
-                    # The same skill enabled twice keeps its first copy.
-                    if existing[0] != skill_id:
-                        errors.append(f"{link}: claimed by both {existing[0]} and {skill_id}")
-                    continue
-                links[link] = (skill_id, copy)
 
-    for path in sorted(set(desired) & set(links)):
-        errors.append(f"{path}: both a copy target and a link target")
-        links.pop(path)
-
-    return desired, links, errors, pending
+    return desired, errors, pending
 
 
-def pending_paths(skills_config: Dict, pending: List[str]) -> Tuple[List[str], List[str]]:
-    """Copy and link paths of enable entries whose git source is not cloned yet.
+def pending_paths(skills_config: Dict, pending: List[str]) -> List[str]:
+    """Copy paths of enable entries whose git source is not cloned yet.
 
     Only entries naming one skill are known before the clone; ``src/*``
     expands to names nobody has seen yet.
     """
     copies: List[str] = []
-    link_paths: List[str] = []
     default_targets, _ = _validate_targets(skills_config.get("targets") or [], "skills")
-    default_links, _ = _validate_targets(
-        skills_config.get("linkTargets") or [], "skills", "linkTargets"
-    )
     enable = skills_config.get("enable") or []
     for raw in enable if isinstance(enable, list) else []:
         entry, err = _normalize_entry(raw)
@@ -382,14 +337,8 @@ def pending_paths(skills_config: Dict, pending: List[str]) -> Tuple[List[str], L
         targets = (
             _validate_targets(entry["targets"], "")[0] if "targets" in entry else default_targets
         )
-        links = (
-            _validate_targets(entry["linkTargets"], "", "linkTargets")[0]
-            if "linkTargets" in entry
-            else default_links
-        )
         copies += [os.path.join(t, name) for t in targets]
-        link_paths += [os.path.join(t, name) for t in links]
-    return copies, link_paths
+    return copies
 
 
 # --------------------------------------------------------------------------
@@ -534,9 +483,7 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
     """Compute what deploy would do against the current on-disk sources."""
     installed = state.get("skills", {}).get("installed", {}) or {}
     linked = state.get("skills", {}).get("links", {}) or {}
-    # Paths the `links:` section owns; two owners would remove each other's link.
-    owned_by_links = state.get("links", {}).get("installed", {}) or {}
-    desired, links, errors, pending = resolve(skills_config, config_dir)
+    desired, errors, pending = resolve(skills_config, config_dir)
 
     result: Dict[str, List] = {
         "errors": errors,
@@ -548,13 +495,7 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
         "remove": [],  # dest
         "forget": [],  # dest (tracked, already gone)
         "keep": [],  # dest (dropped from config but modified locally)
-        "link": [],  # (link, skill_id, copy)
-        "relink": [],  # (link, skill_id, copy), repoint a tracked link
-        "link_adopt": [],  # (link, skill_id, copy), already pointing at copy
-        "replace": [],  # (link, skill_id, copy), tracked copy -> link
-        "link_blocked": [],  # (link, reason)
-        "unlink": [],  # link
-        "link_forget": [],  # (link, reason) tracked, but gone or no longer ours
+        "link_forget": sorted(linked),  # records of the removed linkTargets option
     }
 
     for dest, (skill_id, src_dir) in sorted(desired.items()):
@@ -567,12 +508,7 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
             result["install"].append((dest, skill_id, src_dir, src_hash))
             continue
         if not tracked:
-            source = _tracked_source(linked, dest)
-            if source and dest not in links and _points_to(dest, source):
-                # A link tools made, where a copy is now wanted: replace it.
-                result["install"].append((dest, skill_id, src_dir, src_hash))
-            else:
-                result["blocked"].append((dest, "exists and is not managed by tools"))
+            result["blocked"].append((dest, "exists and is not managed by tools"))
             continue
         current = tree_hash(dest)
         if current == src_hash:
@@ -593,54 +529,9 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
         if not os.path.lexists(dest):
             result["forget"].append(dest)
         elif tree_hash(dest) == (installed[dest] or {}).get("hash"):
-            # Where a link is wanted instead, "replace" removes the copy.
-            if dest not in links:
-                result["remove"].append(dest)
+            result["remove"].append(dest)
         else:
             result["keep"].append(dest)
-
-    blocked_copies = {dest for dest, _ in result["blocked"]}
-    still_linked = set()
-    for link, (skill_id, copy) in sorted(links.items()):
-        tracked = _tracked_source(linked, link)
-        item = (link, skill_id, copy)
-        if copy in blocked_copies:
-            result["link_blocked"].append((link, f"its copy {copy} is skipped"))
-            still_linked.add(tracked)
-        elif link in owned_by_links:
-            result["link_blocked"].append((link, "managed by the links section"))
-        elif not os.path.lexists(link):
-            result["link"].append(item)
-        elif _points_to(link, copy):
-            if _entry(linked, link).get("skill") != skill_id or tracked != copy:
-                result["link_adopt"].append(item)
-        elif tracked and _points_to(link, tracked):
-            result["relink"].append(item)
-        elif link in installed and not os.path.islink(link):
-            if tree_hash(link) == (installed[link] or {}).get("hash"):
-                result["replace"].append(item)
-            else:
-                result["link_blocked"].append((link, "copy modified since tools wrote it; kept"))
-        elif os.path.islink(link):
-            reason = "changed since tools made it" if tracked else "not managed by tools"
-            result["link_blocked"].append((link, f"symlink to {_readlink(link)} {reason}"))
-        else:
-            result["link_blocked"].append((link, "exists and is not managed by tools"))
-
-    # A link left on its old copy (new one skipped) keeps that copy alive.
-    result["remove"] = [dest for dest in result["remove"] if dest not in still_linked]
-
-    # A path now wanted as a copy has its link replaced by the install.
-    for link in sorted(set(linked) - set(links) - set(desired)):
-        if _from_source(str(_entry(linked, link).get("skill", "")), pending_sources):
-            continue
-        tracked = _tracked_source(linked, link)
-        if not os.path.lexists(link):
-            result["link_forget"].append((link, "already gone"))
-        elif tracked and _points_to(link, tracked):
-            result["unlink"].append(link)
-        else:
-            result["link_forget"].append((link, "changed since tools made it; left in place"))
 
     return result
 
@@ -703,14 +594,10 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
             failed.add(name)
             success = False
 
-    p = plan(
-        skills_config,
-        config_dir,
-        {"skills": {"installed": installed, "links": linked}, "links": state.get("links", {})},
-    )
+    p = plan(skills_config, config_dir, {"skills": {"installed": installed, "links": linked}})
     # A failed fetch or checkout leaves the old ref in the cache; installing
     # from it would record the wrong content as the configured one.
-    for key in ("install", "update", "adopt", "link", "relink", "link_adopt", "replace"):
+    for key in ("install", "update", "adopt"):
         p[key] = [item for item in p[key] if not _from_source(item[1], failed)]
     for err in p["errors"]:
         log(f"skills: {err}", Color.RED)
@@ -718,7 +605,7 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
     for skill in p["pending"]:
         log(f"skills: {skill}: source not available", Color.RED)
         success = False
-    for path, reason in p["blocked"] + p["link_blocked"]:
+    for path, reason in p["blocked"]:
         log(f"skills: skipping {path}: {reason}", Color.YELLOW)
 
     for dest, skill_id, src_hash in p["adopt"]:
@@ -735,31 +622,7 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 success = False
                 continue
             installed[dest] = {"skill": skill_id, "hash": src_hash}
-            linked.pop(dest, None)  # a tools link this copy replaced
             log(f"{label} skill {skill_id}: {dest}", Color.GREEN)
-
-    def copy_ready(link: str, copy: str) -> bool:
-        if copy in installed and copy not in write_failed and os.path.isdir(copy):
-            return True
-        log(f"skills: skipping {link}: its copy {copy} is not in place", Color.YELLOW)
-        return False
-
-    def make_link(link: str, skill_id: str, copy: str, label: str) -> bool:
-        try:
-            _make_link(copy, link)
-        except OSError as e:
-            log(f"skills: failed to link {link}: {e}", Color.RED)
-            return False
-        linked[link] = {"skill": skill_id, "source": copy}
-        log(f"{label} skill {skill_id}: {link} -> {copy}", Color.GREEN)
-        return True
-
-    for link, skill_id, copy in p["link_adopt"]:
-        linked[link] = {"skill": skill_id, "source": copy}
-    for action, label in (("link", "Linked"), ("relink", "Relinked")):
-        for link, skill_id, copy in p[action]:
-            if copy_ready(link, copy):
-                success &= make_link(link, skill_id, copy, label)
 
     # Removal only on a fully resolved run: a failed fetch or a config error
     # makes skills look undesired when they are merely unresolved.
@@ -772,26 +635,10 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 "Delete it by hand if it is no longer wanted.",
                 Color.YELLOW,
             )
-        for link, reason in p["link_forget"]:
-            if reason != "already gone":
-                log(f"skills: releasing {link}: {reason}", Color.YELLOW)
+        for link in p["link_forget"]:
+            log(f"skills: forgetting {link}: linkTargets was removed; left in place", Color.YELLOW)
             linked.pop(link, None)
-        for link in p["unlink"]:
-            try:
-                os.remove(link)
-            except OSError as e:
-                log(f"skills: failed to remove {link}: {e}", Color.RED)
-                success = False
-                continue
-            linked.pop(link, None)
-            log(f"Removed skill link: {link}", Color.RED)
-
-        # Links go first, so a copy a link still points at is never removed.
-        still_linked = {_tracked_source(linked, link) for link in linked}
         for dest in p["remove"]:
-            if dest in still_linked:
-                log(f"skills: keeping {dest}: a link still points at it", Color.YELLOW)
-                continue
             try:
                 fsutil.trash(dest)
             except OSError as e:
@@ -800,20 +647,6 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 continue
             installed.pop(dest, None)
             log(f"Removed skill: {dest}", Color.RED)
-
-        # The copy goes first: the link takes its path.
-        for link, skill_id, copy in p["replace"]:
-            if not copy_ready(link, copy):
-                continue
-            try:
-                fsutil.trash(link)
-            except OSError as e:
-                log(f"skills: failed to remove {link}: {e}", Color.RED)
-                success = False
-                continue
-            installed.pop(link, None)
-            log(f"Removed skill: {link}", Color.RED)
-            success &= make_link(link, skill_id, copy, "Linked")
 
         for name in sorted(set(cached) - set(git_sources)):
             path = os.path.join(cache_dir, name)
@@ -827,13 +660,14 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 log(f"skills: dropped cache {path}", Color.RED)
             cached.pop(name, None)
 
-    if not any(
-        p[k] for k in ("install", "update", "remove", "link", "relink", "replace", "unlink")
-    ):
+    if not any(p[k] for k in ("install", "update", "remove")):
         debug("All skills up to date", Color.BLUE)
 
     section["installed"] = installed
-    section["links"] = linked
+    if linked:
+        section["links"] = linked
+    else:
+        section.pop("links", None)
     section["sources"] = cached
     return success
 
@@ -874,19 +708,14 @@ def diff_skills(
     changes += [f"  + install {sid} -> {dest}" for dest, sid, _, _ in p["install"]]
     changes += [f"  ~ update {sid} -> {dest}" for dest, sid, _, _ in p["update"]]
     changes += [f"  ! skip {dest}: {reason}" for dest, reason in p["blocked"]]
-    changes += [f"  + link {sid}: {link} -> {copy}" for link, sid, copy in p["link"]]
-    changes += [f"  ~ relink {sid}: {link} -> {copy}" for link, sid, copy in p["relink"]]
-    changes += [f"  ! skip {link}: {reason}" for link, reason in p["link_blocked"]]
     # Deploy holds every removal while anything is in error; so does the preview.
     if not p["errors"]:
         changes += [f"  - remove {dest}" for dest in p["remove"]]
         changes += [f"  ~ forget {dest}" for dest in p["forget"]]
         changes += [
-            f"  ~ replace copy with link {sid}: {link} -> {copy}"
-            for link, sid, copy in p["replace"]
+            f"  ~ forget {link} (linkTargets was removed; left in place)"
+            for link in p["link_forget"]
         ]
-        changes += [f"  - unlink {link}" for link in p["unlink"]]
-        changes += [f"  ~ forget {link} ({reason})" for link, reason in p["link_forget"]]
         for name in sorted(set(cached) - set(git_sources)):
             changes.append(f"  - drop cache {name}")
     return changes

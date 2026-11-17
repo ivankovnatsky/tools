@@ -698,7 +698,7 @@ def _run_sections(
 
     # One registry for every file-writing section, taken before any of them runs.
     conflicts = registry()
-    # sops and templates first: later sections (mcp secretPaths, ${sopsPath:}
+    # sops and templates first: later sections (${sopsPath:}
     # consumers, private gitRepos clones) read the files they write; a failed
     # secret blocks its templates. Paths inside a gitRepos destination wait
     # for the clone, which would otherwise find the directory and skip it.

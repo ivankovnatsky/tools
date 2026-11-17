@@ -845,15 +845,11 @@ class LinkOwnershipTest(TemplatesTestBase):
             "cacheDir": os.path.join(self.tmp, "cache"),
             "sources": {"remote": {"url": "https://example.test/skills.git"}},
             "targets": [os.path.join(self.tmp, "agents")],
-            "linkTargets": [os.path.join(self.tmp, "claude")],
             "enable": ["remote/pdf", {"skill": "remote/docx", "as": "word"}, "remote/*"],
         }
         ownership = self.ownership({}, links_raw=[], skills_raw=skills_raw)
         for path in ("agents/pdf/SKILL.md", "agents/word/x", "cache/remote/x"):
             self.assertIn("managed by skills", ownership[os.path.join(self.tmp, path)], path)
-        self.assertIn(
-            "a symlink managed by skills", ownership[os.path.join(self.tmp, "claude", "pdf")]
-        )
         self.assertNotIn(os.path.join(self.tmp, "agents", "other"), ownership)
 
     def test_stale_template_under_managed_link_not_removed(self):

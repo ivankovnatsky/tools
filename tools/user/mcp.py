@@ -4,7 +4,7 @@ import shutil
 from typing import Dict, Optional, Set
 
 from tools.log import Color, debug, log
-from tools.util import SecretSubstitutionError, run_command, substitute_secrets
+from tools.util import run_command
 
 
 def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Optional[Set[str]]:
@@ -40,9 +40,8 @@ def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Optional[Set
 def server_fingerprint(config: Dict) -> tuple:
     """The parts of a server definition that a re-register would change.
 
-    args/headers/secretPaths are registration inputs too: leaving them out
-    means editing them silently does nothing. Headers here are the *config
-    templates* (`@VAR@` placeholders), never resolved secrets.
+    args/headers are registration inputs too: leaving them out means editing
+    them silently does nothing.
     """
     return (
         config.get("scope"),
@@ -51,7 +50,6 @@ def server_fingerprint(config: Dict) -> tuple:
         config.get("command"),
         tuple(config.get("args") or ()),
         tuple(config.get("headers") or ()),
-        tuple(sorted((config.get("secretPaths") or {}).items())),
     )
 
 
@@ -224,31 +222,8 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                     transport,
                     server_name,
                 ]
-                # KNOWN LIMITATION: `claude mcp add` only accepts headers as
-                # argv (-H), so a resolved secret is briefly visible in
-                # /proc/<pid>/cmdline to other local users while the command
-                # runs. The CLI has no stdin/file alternative today. Secrets
-                # are never logged or persisted to state; keep secret files
-                # user-readable only and treat multi-user hosts accordingly.
-                secret_paths = server_config.get("secretPaths", {})
-                header_failed = False
                 for header in server_config.get("headers", []):
-                    try:
-                        processed_header = substitute_secrets(header, secret_paths)
-                    except SecretSubstitutionError as e:
-                        log(
-                            f"Skipping {server_name}: {e}",
-                            Color.RED,
-                        )
-                        header_failed = True
-                        break
-                    cmd.extend(["-H", processed_header])
-                if header_failed:
-                    # Not registered: recording it as installed would hide the
-                    # missing credential from every future run.
-                    success = False
-                    failed.add(server_name)
-                    continue
+                    cmd.extend(["-H", header])
                 args = server_config.get("args", [])
                 if args:
                     cmd.append("--")
@@ -310,10 +285,7 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
                 "url": config.get("url"),
                 "command": config.get("command"),
                 "args": list(config.get("args") or []),
-                # Header *templates* (@VAR@ placeholders), never resolved
-                # secret values.
                 "headers": list(config.get("headers") or []),
-                "secretPaths": dict(config.get("secretPaths") or {}),
             }
         # A tracked server whose removal failed is still registered; dropping
         # it from state would orphan it — never removed, never diffed again.

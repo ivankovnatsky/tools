@@ -133,18 +133,6 @@ class OwnershipTest(LinksTestBase):
         self.assertTrue(os.path.isdir(self.target) and not os.path.islink(self.target))
         self.assertEqual(self.installed(), {})
 
-    def test_link_owned_by_skills_is_skipped(self):
-        os.makedirs(os.path.dirname(self.target))
-        os.symlink(self.src, self.target)
-        self.state["skills"] = {"links": {self.target: {"skill": "x/jira", "source": self.src}}}
-
-        self.assertEqual(
-            self.diff([self.entry()]),
-            [f"  ! skip {self.target}: managed by skills.linkTargets"],
-        )
-        self.deploy([self.entry()])
-        self.assertEqual(self.installed(), {})
-
     def test_foreign_symlink_is_never_replaced(self):
         os.makedirs(os.path.dirname(self.target))
         os.symlink(self.src2, self.target)

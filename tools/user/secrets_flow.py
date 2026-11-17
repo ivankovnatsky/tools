@@ -173,16 +173,14 @@ def _link_owned_paths(links_raw, skills_raw, state: Dict, config_dir: str):
         trees[_norm(path)] = managed
     if isinstance(skills_raw, Mapping) and skills_raw:
         try:
-            desired, skill_links, _errors, pending = skills_section.resolve(skills_raw, config_dir)
+            desired, _errors, pending = skills_section.resolve(skills_raw, config_dir)
             trees[_norm(skills_section.cache_dir_for(skills_raw))] = managed
-            copies, pending_links = skills_section.pending_paths(skills_raw, pending)
+            copies = skills_section.pending_paths(skills_raw, pending)
         except (AttributeError, TypeError, ValueError, OSError):
             # The skills section reports its own config errors; state still guards.
-            desired, skill_links, copies, pending_links = {}, {}, [], []
+            desired, copies = {}, []
         for path in [*desired, *copies]:
             trees[_norm(path)] = managed
-        for path in [*skill_links, *pending_links]:
-            link_paths.setdefault(_norm(path), "skills")
     return link_paths, trees
 
 

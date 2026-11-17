@@ -108,8 +108,6 @@ def resolve(entries) -> Tuple[Dict[str, str], List[str]]:
 
 def plan(entries, state: Dict) -> Dict[str, List]:
     installed = state.get("links", {}).get("installed", {}) or {}
-    # Paths skills.linkTargets owns; two owners would remove each other's link.
-    owned_by_skills = state.get("skills", {}).get("links", {}) or {}
     desired, errors = resolve(entries)
     installed = fsutil.respell(dict(installed), desired)
 
@@ -129,9 +127,7 @@ def plan(entries, state: Dict) -> Dict[str, List]:
             result["missing"].append((target, source))
             continue
         tracked = _tracked_source(installed, target)
-        if target in owned_by_skills:
-            result["blocked"].append((target, "managed by skills.linkTargets"))
-        elif not os.path.lexists(target):
+        if not os.path.lexists(target):
             result["create"].append((target, source))
         elif _points_to(target, source):
             if tracked != source:

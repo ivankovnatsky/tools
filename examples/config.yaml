@@ -94,8 +94,7 @@ curlShell: {}
 gitRepos: {}
 
 # Agent Skills (dirs with SKILL.md) from git repos or local dirs, copied to
-# each target as <target>/<name>/ and symlinked into each linkTarget. See
-# README "Skills" for the full shape.
+# each target as <target>/<name>/. See README "Skills" for the full shape.
 skills:
   sources:
     anthropic:
@@ -103,8 +102,6 @@ skills:
       subdir: skills
   targets:
     - ~/.agents/skills
-  linkTargets:
-    - ~/.claude/skills
   enable: []
 
 # sops-nix style secrets. See README "Sops".
