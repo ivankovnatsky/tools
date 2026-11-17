@@ -353,6 +353,7 @@ class GitReposTest(unittest.TestCase):
             calls = []
             with (
                 mock.patch.object(git_repos, "system_bin", return_value="git"),
+                mock.patch("tools.system_paths.system_bin", return_value="git"),
                 mock.patch.object(
                     git_repos,
                     "run_command",
@@ -374,7 +375,10 @@ class GitReposTest(unittest.TestCase):
                 [f"  ~ release {d} (not a git checkout, left in place)"],
             )
             os.makedirs(os.path.join(d, ".git"))
-            with mock.patch.object(git_repos, "_has_local_work", return_value=False):
+            with (
+                mock.patch.object(git_repos, "_has_local_work", return_value=False),
+                mock.patch("tools.system_paths.system_bin", return_value="git"),
+            ):
                 self.assertEqual(
                     diff_mod._diff_git_repos({}, state), [f"  - remove {d} (deletes the checkout)"]
                 )

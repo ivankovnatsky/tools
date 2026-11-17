@@ -826,6 +826,16 @@ class FetchInstallTest(unittest.TestCase):
         self.deploy(self.app_raw())
         with open(os.path.join(self.app, "new"), "wb") as f:
             f.write(b"x")
+        if not hasattr(os.stat_result, "st_birthtime"):
+            # Linux: identity falls back to mtime, which the edit changed.
+            self.assertEqual(
+                self.diff({}),
+                [f"  ~ keep {self.app} (no longer the dir tools installed; not removed)"],
+            )
+            self.assertTrue(self.deploy({}))
+            self.assertTrue(os.path.isdir(self.app))
+            self.assertIn(self.app, self.state["fetch"]["installed"])
+            return
         self.assertTrue(self.deploy({}))
         self.assertFalse(os.path.lexists(self.app))
         self.assertEqual(self.state["fetch"]["installed"], {})
