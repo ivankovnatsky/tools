@@ -412,6 +412,30 @@ def move_aside(path: str) -> Optional[str]:
     return dest
 
 
+class RestoreSkipped(OSError):
+    """No hard links here, so the backup cannot be restored without risking an overwrite."""
+
+
+def restore_aside(path: str) -> Optional[str]:
+    """Rename ``backup_path(path)`` back to ``path`` while ``path`` is free.
+
+    Returns the backup path restored, or None when there is none or ``path``
+    is taken (never overwritten). Raises RestoreSkipped without hard links."""
+    backup = backup_path(path)
+    if not os.path.lexists(backup) or os.path.lexists(path):
+        return None
+    try:
+        os.link(backup, path, follow_symlinks=False)
+    except FileExistsError:
+        return None
+    except OSError as e:
+        if e.errno not in _NO_LINK_ERRNOS:
+            raise
+        raise RestoreSkipped(e.errno, f"hard links unsupported here ({e.strerror})") from None
+    os.unlink(backup)
+    return backup
+
+
 MACOS_TRASH = "/usr/bin/trash"
 
 
@@ -507,11 +531,12 @@ def atomic_write(
 
 
 def create_or_replace(
-    path: str, data: bytes, mode: int, uid: int = -1, gid: int = -1
+    path: str, data: bytes, mode: int, uid: int = -1, gid: int = -1, backup: bool = True
 ) -> Tuple[Optional[str], Optional[str]]:
     """Create ``path`` only while it is missing. One that appeared since
     planning is judged like an untracked file: the same bytes are rewritten,
-    anything else is moved aside once (``aside_refused``).
+    anything else is moved aside once (``aside_refused``), or overwritten
+    without ``backup``.
 
     Returns (backup path, why it was moved aside), both None for a plain create.
     """
@@ -525,11 +550,12 @@ def create_or_replace(
         raise OSError(errno.EEXIST, f"{path} appeared during this run ({current.error})")
     same = not current.symlink and current.content == data
     reason = None if same else ("a symlink" if current.symlink else "not tracked by tools")
-    if reason:
+    if reason and backup:
         refused = aside_refused(path)
         if refused:
             raise OSError(errno.EEXIST, refused)
-    return atomic_write(path, data, mode, uid, gid, backup=reason is not None), reason
+    moved = atomic_write(path, data, mode, uid, gid, backup=backup and reason is not None)
+    return moved, reason
 
 
 def describe_removals(errors, remove, forget) -> list:

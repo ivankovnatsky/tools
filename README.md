@@ -384,6 +384,7 @@ templates:
 - `${sops:}` renders from the same decryption as `sops`, so diff and deploy agree.
 - Default mode `0400`; `owner`/`group` and new dirs as in sops.
 - An existing file with different content is replaced; one tools did not write, or that changed since, is moved aside first (see Ownership).
+- `backup: false` overwrites such a file instead of moving it aside, and an earlier backup does not block it, as on `files:` entries. Use it for files an app rewrites when the config should always win (what the app wrote there is lost).
 - With an invalid `sops:` section, templates without `path` are errors; there's no fallback to the default directory.
 - Content is masked in diff/deploy output when it uses `${sops:}`, has `secrets: true`, was secret before, or looks like a key.
 - `restartUnits` works as in sops: a rewritten file restarts each `launchd:<label>` job.
@@ -399,8 +400,8 @@ templates:
 - Only tracked, unmodified files are removed; any invalid entry holds removals.
 - Nothing is removed through a managed link.
 - sops/templates state keeps device, inode and mtime, never values or hashes.
-- A target whose content differs is replaced. If tools did not write it (untracked) or it changed since tools wrote it, it is first renamed to `<target>.tools`, keeping its mode, and the backup path is logged; a file tools wrote and nobody changed is replaced without a backup. This applies to `files`, `sops`, `templates`, `fetch` and `env`. A symlink at the target is never followed: the link itself is renamed. Backups are never removed by tools.
-- `files:` entries with `backup: false` are overwritten instead (see Config).
+- A target whose content differs is replaced. If tools did not write it (untracked) or it changed since tools wrote it, it is first renamed to `<target>.tools`, keeping its mode, and the backup path is logged; a file tools wrote and nobody changed is replaced without a backup. This applies to `files`, `sops`, `templates`, `fetch` and `env`. A symlink at the target is never followed: the link itself is renamed. Backups are never removed by tools; when a `files:` entry is dropped and tools removes its target, `<target>.tools` is renamed back to `<target>` (`~ restore` in diff).
+- `files:` and `templates` entries with `backup: false` are overwritten instead (see Config).
 - A target is moved aside at most once: if it needs replacing again while `<target>.tools` already exists, that entry fails (`!` in diff) and the file is left as is; other entries proceed. Remove the backup to let tools move it aside again.
 - The replacement is written to a temp file first, so a failed write or download leaves the old file in place.
 - `tools diff` shows such a write as `~ replace <target> (<reason>; old file moved aside to <target>.tools ...)`.
@@ -767,7 +768,7 @@ launchd:
 | Option | Default | Notes |
 | --- | --- | --- |
 | `command` / `programArguments` | — | exactly one; wrapper ends `exec <command>` (as nix) or `exec "$@"` |
-| `waitForSecrets` | false | wait until `<sops.secretsDir>/.tools-rendered` exists, for agents and daemons alike (tools' sops is user-scope; a daemon's `user` must be able to reach that dir); a config error when the sops section is invalid or declares no secrets |
+| `waitForSecrets` | false | wait until `<sops.secretsDir>/.tools-rendered` exists (only the first render: the marker and secrets persist across reboots, so jobs start at boot on the last rendered secrets), for agents and daemons alike (tools' sops is user-scope; a daemon's `user` must be able to reach that dir); a config error when the sops section is invalid or declares no secrets |
 | `waitForPath` / `waitForPaths` | — | wait until each path exists |
 | `waitForMounts` | — | wait until each path is a mount point (its device differs from its parent's), so a leftover `/Volumes/<name>` directory does not pass |
 | `dataDir`, `extraDirs` | — | `mkdir -p` at start; `extraDirs` also takes `{path, mode, owner, group}` (root daemons only) |

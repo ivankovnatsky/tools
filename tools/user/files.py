@@ -6,13 +6,17 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 from tools import privilege
 from tools.fsutil import (
     FORCE_REMOVED,
+    RestoreSkipped,
     aside_refused,
     atomic_write,
+    backup_path,
     canonical_path,
+    earlier_backup,
     fingerprint,
     makedirs_secret,
     removal_blocked,
     respell,
+    restore_aside,
     same_file_as,
     same_identity,
     trash,
@@ -799,6 +803,39 @@ def _owe_restarts(
         secrets_flow.owe_restarts(state, list(dict.fromkeys(units)), source)
 
 
+def restorable_backup(target: str, managed, conflicts=None) -> Optional[str]:
+    """``<target>.tools`` when it exists and no section declares, tracks or links it."""
+    backup = earlier_backup(target)
+    if backup is None or same_file_as(backup, managed):
+        return None
+    claimed_by = getattr(conflicts, "claimed_by", None)
+    if (claimed_by is not None and claimed_by(backup)) or removal_blocked(conflicts, backup):
+        return None
+    return backup
+
+
+def _restore(target: str, managed, conflicts=None) -> Optional[bool]:
+    """Rename ``<target>.tools`` back to a removed ``target``.
+
+    True when done (or nothing to restore), None when skipped (still tracked,
+    a warning), False on failure."""
+    if restorable_backup(target, managed, conflicts) is None:
+        return True
+    try:
+        restored = restore_aside(target)
+    except RestoreSkipped as e:
+        log(
+            f"files: not restoring {backup_path(target)}: {e.strerror}; still tracked", Color.YELLOW
+        )
+        return None
+    except OSError as e:
+        log(f"files: failed to restore {backup_path(target)}: {e}", Color.RED)
+        return False
+    if restored:
+        log(f"Restored: {restored} -> {target}", Color.YELLOW)
+    return True
+
+
 def _conflict(target: str, conflicts: Optional[Dict[str, str]]) -> Optional[str]:
     if not conflicts:
         return None
@@ -918,6 +955,7 @@ def install_files(
     # Only config errors hold removals: an unparsed entry looks undesired.
     if not errors:
         kept = dict(held)
+        tracked = declared + list(state_files)
         for target in _removal_order(state_files, state_files):
             if target not in managed and target not in held and target not in released:
                 record = state_files.get(target)
@@ -943,6 +981,22 @@ def install_files(
                         Color.YELLOW,
                     )
                     kept[target] = record
+                    continue
+                if (
+                    not os.path.lexists(target)
+                    and isinstance(record, dict)
+                    and record.get("restore")
+                ):
+                    unsafe = root_target_error(target) if system else None
+                    if unsafe and restorable_backup(target, tracked, conflicts):
+                        log(f"files: not restoring {target}: {unsafe}; still tracked", Color.RED)
+                        kept[target] = record
+                        success = False
+                        continue
+                    restored = _restore(target, tracked, conflicts)
+                    if restored is not True:
+                        kept[target] = record
+                        success &= restored is None
                     continue
                 if not os.path.exists(target):
                     continue
@@ -990,6 +1044,12 @@ def install_files(
                     success = False
                     # Keep tracking it so the next run retries the cleanup.
                     kept[target] = record
+                    continue
+                restored = True if is_dir else _restore(target, tracked, conflicts)
+                if restored is not True:
+                    # Retried next run, while the target is still missing.
+                    kept[target] = {**(record or {}), "restore": True}
+                    success &= restored is None
 
         state["files"] = dict(managed)
         state["files"].update(kept)

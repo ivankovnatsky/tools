@@ -352,7 +352,12 @@ def _diff_files(
     ``system`` (root) covers only entries whose target directory the user cannot write;
     as the user they get a note instead.
     """
-    from tools.fsutil import aside_note, removal_blocked, same_file_as, unmounted_volume
+    from tools.fsutil import (
+        aside_note,
+        removal_blocked,
+        same_file_as,
+        unmounted_volume,
+    )
     from tools.user.files import (
         _conflict,
         _dir_kept,
@@ -366,6 +371,7 @@ def _diff_files(
         note_system,
         other_run_targets,
         plan_file,
+        restorable_backup,
         root_target_error,
     )
     from tools.util import pending_hooks
@@ -466,6 +472,7 @@ def _diff_files(
 
     # Deploy holds removals on config errors; a refused target stays tracked.
     removed = set()
+    tracked = declared + list(state_files)
     for target in _removal_order(state_files, state_files) if not errors else ():
         if target not in managed_targets:
             record = state_files.get(target)
@@ -481,6 +488,14 @@ def _diff_files(
             volume = unmounted_volume(target)
             if volume:
                 changes.append(f"  ~ keep {target} (volume not mounted: {volume}; not removed)")
+                continue
+            if not os.path.lexists(target) and isinstance(record, dict) and record.get("restore"):
+                backup = restorable_backup(target, tracked, conflicts)
+                unsafe = root_target_error(target) if system else None
+                if backup and unsafe:
+                    changes.append(f"  ! not restoring {target}: {unsafe}")
+                elif backup:
+                    changes.append(f"  ~ restore {backup} -> {target}")
                 continue
             if os.path.exists(target):
                 unsafe = root_target_error(target) if system else None
@@ -509,6 +524,13 @@ def _diff_files(
                     continue
                 changes.append(f"  - remove {target}")
                 removed.add(target)
+                backup = (
+                    None
+                    if isinstance(record, dict) and record.get("dir")
+                    else restorable_backup(target, tracked, conflicts)
+                )
+                if backup:
+                    changes.append(f"  ~ restore {backup} -> {target}")
 
     retried = pending_hooks(state, "files", declared_hooks(entries))
     for command in retried:

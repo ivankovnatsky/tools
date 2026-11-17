@@ -1038,6 +1038,114 @@ class MoveAsideTest(unittest.TestCase):
         self.assertEqual(_read(again), "two\n")
         self.assertEqual(_read(self.target), "fresh = 1\n")
 
+    def test_removed_entry_restores_backup(self):
+        _write(self.target, "mine\n", 0o600)
+        self.assertTrue(self.deploy(self.entries())[0])
+        [backup] = _backups(self.target)
+        self.assertEqual(
+            self.diff([]),
+            [f"  - remove {self.target}", f"  ~ restore {backup} -> {self.target}"],
+        )
+        ok, log = self.deploy([])
+        self.assertTrue(ok)
+        self.assertIn("Restored", log)
+        self.assertEqual(_read(self.target), "mine\n")
+        self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o600)
+        self.assertEqual(_backups(self.target), [])
+        self.assertNotIn(self.target, self.state["files"])
+
+    def test_removed_entry_restores_symlink_backup(self):
+        pointee = os.path.join(self.d, "pointee")
+        _write(pointee, "theirs\n")
+        os.makedirs(os.path.dirname(self.target))
+        os.symlink(pointee, self.target)
+        self.assertTrue(self.deploy(self.entries())[0])
+        self.assertTrue(self.deploy([])[0])
+        self.assertEqual(os.readlink(self.target), pointee)
+        self.assertEqual(_backups(self.target), [])
+
+    def test_kept_modified_target_keeps_backup(self):
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        [backup] = _backups(self.target)
+        _write(self.target, "edited\n")
+        self.assertTrue(self.deploy([])[0])
+        self.assertEqual(_read(self.target), "edited\n")
+        self.assertEqual(_read(backup), "mine\n")
+
+    def test_restore_failure_is_reported(self):
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        with mock.patch.object(files, "restore_aside", side_effect=OSError("denied")):
+            ok, log = self.deploy([])
+        self.assertFalse(ok)
+        self.assertIn("failed to restore", log)
+        self.assertIn(self.target, self.state["files"])
+        backup = self.target + ".tools"
+        self.assertEqual(self.diff([]), [f"  ~ restore {backup} -> {self.target}"])
+        self.assertTrue(self.deploy([])[0])
+        self.assertEqual(_read(self.target), "mine\n")
+        self.assertNotIn(self.target, self.state["files"])
+        self.assertEqual(self.diff([]), [])
+
+    def test_declared_backup_path_is_not_restored(self):
+        _write(os.path.join(self.d, "src2"), "second\n")
+        both = self.entries() + [{"source": "src2", "target": self.target + ".tools"}]
+        self.assertTrue(self.deploy(both)[0])
+        rest = both[1:]
+        self.assertEqual(self.diff(rest), [f"  - remove {self.target}"])
+        self.assertTrue(self.deploy(rest)[0])
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertEqual(_read(self.target + ".tools"), "second\n")
+        self.assertNotIn(self.target, self.state["files"])
+
+    def test_restore_skipped_without_hard_links(self):
+        import errno
+
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        with mock.patch("tools.fsutil.os.link", side_effect=OSError(errno.EXDEV, "cross")):
+            ok, log = self.deploy([])
+        self.assertTrue(ok)
+        self.assertIn("not restoring", log)
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertEqual(_read(self.target + ".tools"), "mine\n")
+        self.assertTrue(self.state["files"][self.target]["restore"])
+
+    def test_backup_claimed_by_another_section_is_not_restored(self):
+        from tools.user import secrets_flow
+
+        _write(self.target, "mine\n")
+        self.assertTrue(self.deploy(self.entries())[0])
+        backup = self.target + ".tools"
+        self.state["templates"] = {"installed": {backup: {"name": "t"}}}
+        conflicts = secrets_flow.ownership_conflicts(state=self.state, config_dir=self.d)
+        from tools.diff import _diff_files
+
+        self.assertEqual(
+            _diff_files([], self.d, self.state, conflicts), [f"  - remove {self.target}"]
+        )
+        with mock.patch("tools.user.files.log"):
+            self.assertTrue(files.install_files([], self.d, self.state, conflicts))
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertEqual(_read(backup), "mine\n")
+
+    def test_root_retry_checks_target_before_restoring(self):
+        _write(self.target + ".tools", "planted\n")
+        self.state = {"files": {self.target: {"hash": "x", "restore": True}}}
+        unsafe = "a directory the user can change"
+        with mock.patch("tools.user.files.root_target_error", return_value=unsafe):
+            with mock.patch("tools.user.files.log"):
+                ok = files.install_files([], self.d, self.state, system=True)
+            from tools.diff import _diff_files
+
+            with mock.patch("tools.user.files.note_system"):
+                rows = _diff_files([], self.d, self.state, system=True)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertIn(self.target, self.state["files"])
+        self.assertEqual(rows, [f"  ! not restoring {self.target}: {unsafe}"])
+
     def test_unrelated_backup_names_ignored(self):
         _write(self.target + ".tools-20260101-000000", "x\n")
         _write(self.target + "x.tools", "x\n")
