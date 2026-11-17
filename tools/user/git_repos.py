@@ -1,5 +1,5 @@
 import os
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 from tools import fsutil
 from tools.log import Color, debug, log
@@ -55,11 +55,14 @@ def _is_empty_dir(path: str) -> bool:
         return False
 
 
-def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
-    """Clone missing repositories; with ``update``, also pull existing ones."""
+def plan(repos: Dict[str, str], state: Dict, update: bool = False) -> Dict:
+    """What deploy does with git repos; the preview renders the same plan.
+
+    Per-path checks that the filesystem can change mid-deploy (an earlier
+    clone, a removal) are `checkout_action` and `removal_action`, which
+    deploy calls right before acting on each path.
+    """
     stored = set(state.get("gitRepos", {}).get("installed", []))
-    if not repos and not stored:
-        return True
     # State keys match declared paths by file identity, not spelling.
     installed = set(fsutil.respell(dict.fromkeys(stored), repos.keys()))
     desired = set(repos.keys())
@@ -71,12 +74,55 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
         or not os.path.exists(os.path.expanduser(d))
         or _is_empty_dir(os.path.expanduser(d))
     }
-    to_remove = installed - desired
     to_update = (
         {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}
         if update
         else set()
     )
+    return {
+        "stored": stored,
+        "installed": installed,
+        "to_install": to_install,
+        "to_remove": installed - desired,
+        "to_update": to_update,
+    }
+
+
+def checkout_action(dest: str, installed, update: bool) -> Optional[str]:
+    """ "clone", "not_repo", "track", "pull", or None when nothing is due."""
+    expanded = os.path.expanduser(dest)
+    if not os.path.exists(expanded) or _is_empty_dir(expanded):
+        return "clone"
+    # Only a real checkout gets pulled and recorded. An arbitrary directory at
+    # that path is not a repo we manage, and marking it installed would make
+    # it a removal candidate later.
+    if not is_checkout(expanded):
+        return "not_repo"
+    if dest not in installed:
+        return "track"
+    return "pull" if update else None
+
+
+def removal_action(dest: str, has_local_work: Callable[[str], bool]) -> str:
+    """ "release" (not a checkout), "keep" (local work), or "remove"."""
+    expanded = os.path.expanduser(dest)
+    # git -C on a dir that lost its .git interrogates the enclosing repo,
+    # which can read clean (e.g. a `**` .gitignore).
+    if os.path.exists(expanded) and not is_checkout(expanded):
+        return "release"
+    if os.path.exists(expanded) and has_local_work(expanded):
+        return "keep"
+    return "remove"
+
+
+def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
+    """Clone missing repositories; with ``update``, also pull existing ones."""
+    p = plan(repos, state, update)
+    stored = p["stored"]
+    if not repos and not stored:
+        return True
+    installed = p["installed"]
+    to_install, to_remove, to_update = p["to_install"], p["to_remove"], p["to_update"]
 
     if not to_install and not to_remove and not to_update:
         debug("All git repos already installed", Color.BLUE)
@@ -94,24 +140,23 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
 
     for dest_path in to_remove:
         expanded_path = os.path.expanduser(dest_path)
+        action = removal_action(dest_path, lambda path: _has_local_work(git_bin, path, env))
+        if action == "release":
+            log(
+                f"Releasing {dest_path}: no longer a git checkout, left in place.",
+                Color.YELLOW,
+            )
+            installed.discard(dest_path)
+            state_changed = True
+            continue
+        if action == "keep":
+            log(
+                f"Keeping {dest_path}: uncommitted or unpushed work. "
+                "Remove it by hand once the work is safe.",
+                Color.YELLOW,
+            )
+            continue
         if os.path.exists(expanded_path):
-            # git -C on a dir that lost its .git interrogates the enclosing
-            # repo, which can read clean (e.g. a `**` .gitignore).
-            if not is_checkout(expanded_path):
-                log(
-                    f"Releasing {dest_path}: no longer a git checkout, left in place.",
-                    Color.YELLOW,
-                )
-                installed.discard(dest_path)
-                state_changed = True
-                continue
-            if _has_local_work(git_bin, expanded_path, env):
-                log(
-                    f"Keeping {dest_path}: uncommitted or unpushed work. "
-                    "Remove it by hand once the work is safe.",
-                    Color.YELLOW,
-                )
-                continue
             log(f"Removing git repo: {dest_path}", Color.RED)
             try:
                 fsutil.trash(expanded_path)
@@ -127,24 +172,21 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
     for dest_path in sorted(to_install | to_update):
         repo_url = repos[dest_path]
         expanded_path = os.path.expanduser(dest_path)
+        action = checkout_action(dest_path, installed, update)
 
-        if os.path.exists(expanded_path) and not _is_empty_dir(expanded_path):
-            # Only a real checkout gets pulled and recorded. An arbitrary
-            # directory at that path is not a repo we manage, and marking it
-            # installed would make it a removal candidate later.
-            if not is_checkout(expanded_path):
-                log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
+        if action == "not_repo":
+            log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
+            success = False
+            continue
+        if action != "clone" and update:
+            log(f"Updating git repo: {dest_path}", Color.BLUE)
+            cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
+            returncode, stdout, stderr = run_command(cmd, env)
+            if returncode != 0:
+                log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
                 success = False
-                continue
-            if update:
-                log(f"Updating git repo: {dest_path}", Color.BLUE)
-                cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
-                returncode, stdout, stderr = run_command(cmd, env)
-                if returncode != 0:
-                    log(f"Failed to update {dest_path}: {stderr}", Color.YELLOW)
-                    success = False
-            else:
-                log(f"Tracking existing git repo: {dest_path}", Color.BLUE)
+        elif action != "clone":
+            log(f"Tracking existing git repo: {dest_path}", Color.BLUE)
         else:
             log(f"Cloning git repo: {repo_url} -> {dest_path}", Color.GREEN)
             parent_dir = os.path.dirname(expanded_path)

@@ -38,11 +38,56 @@ def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
     return bool(binary) and not os.path.exists(os.path.join(os.path.expanduser(bin_dir), binary))
 
 
+def _context(paths: Dict, state: Dict):
+    """(context, (old context, packages tracked there) when it moved, live tracked names)."""
+    state_packages = set(state.get("uv", {}).get("packages", {}).keys())
+    if not (paths.get("uvBin") and paths.get("uvToolDir")):
+        return None, None, state_packages
+    context = f"{paths['uvBin']}|{paths['uvToolDir']}"
+    old = state.get("uv", {}).get("context", context)
+    if old != context:
+        return context, (old, state_packages), set()
+    return context, None, state_packages
+
+
+def plan_removals(packages: Dict, paths: Dict, state: Dict) -> Dict:
+    context, released, state_packages = _context(paths, state)
+    return {
+        "context": context,
+        "released": released,
+        "remove": sorted(state_packages - set(packages)),
+    }
+
+
+def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """Run after removals: a removal can take a binary another package declares."""
+    _, _, state_packages = _context(paths, state)
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif version_changed(pkg, pkg_info, state, "uv"):
+            actions.append((pkg, "update"))
+        elif paths.get("uvBin") and binary_missing(pkg_info, paths["uvBin"]):
+            actions.append((pkg, "reinstall"))
+        elif update and pkg_unpinned(pkg_info):
+            actions.append((pkg, "upgrade"))
+    units, unit_errors = secrets_flow.parse_package_units("uv", packages)
+    return {"actions": actions, "units": units, "unit_errors": unit_errors}
+
+
+def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """What deploy does with uv packages; the preview renders the same plan."""
+    return {
+        **plan_removals(packages, paths, state),
+        **plan_installs(packages, paths, state, update),
+    }
+
+
 def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     packages, ok = checked_packages("uv", packages)
     if not ok:
         return False
-    desired = set(packages.keys())
 
     # Fail with a clear message instead of a KeyError traceback when the
     # paths a reconcile would need are not configured.
@@ -59,8 +104,9 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
     # (see bun/npm prefix): after a relocation, uninstalling by name would hit
     # whatever occupies the new location, and "already installed" entries
     # would never materialize there.
-    context = f"{paths['uvBin']}|{paths['uvToolDir']}"
-    if state.get("uv", {}).get("context", context) != context:
+    p = plan_removals(packages, paths, state)
+    context = p["context"]
+    if p["released"]:
         log("uv tool dir changed, releasing previously tracked packages", Color.YELLOW)
         state.setdefault("uv", {})["packages"] = {}
 
@@ -81,7 +127,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
 
     # CLEANUP: uv tool uninstall is keyed by package name. Keep failed removals
     # tracked so the next run retries them.
-    to_remove = sorted(pkg for pkg in state_packages if pkg not in desired)
+    to_remove = p["remove"]
     if to_remove:
         log(f"Removing UV packages: {', '.join(to_remove)}", Color.RED)
         for pkg in to_remove:
@@ -97,22 +143,12 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
     # Install missing packages, reinstall on version change or when a declared
     # binary is gone. Persist each success so a later failure does not discard
     # progress.
-    to_install = [
-        pkg
-        for pkg, pkg_info in packages.items()
-        if pkg not in state_packages
-        or version_changed(pkg, pkg_info, state, "uv")
-        or binary_missing(pkg_info, paths["uvBin"])
-    ]
-    units: Dict[str, list] = {}
-    for pkg, pkg_info in packages.items():
-        try:
-            units[pkg] = secrets_flow.parse_restart_units(
-                pkg_info.get("restartUnits"), f"uv.packages.{pkg}"
-            )
-        except ValueError as e:
-            log(str(e), Color.RED)
-            success = False
+    p = plan_installs(packages, paths, state, update)
+    to_install = [pkg for pkg, kind in p["actions"] if kind != "upgrade"]
+    units = p["units"]
+    for err in p["unit_errors"].values():
+        log(err, Color.RED)
+        success = False
     if to_install:
         log(f"Installing UV packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
@@ -141,8 +177,8 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         debug("All UV packages already installed", Color.BLUE)
 
     if update:
-        for pkg, pkg_info in packages.items():
-            if pkg in tracked and pkg not in to_install and pkg in units and pkg_unpinned(pkg_info):
+        for pkg in (pkg for pkg, kind in p["actions"] if kind == "upgrade"):
+            if pkg in units:
                 log(f"Upgrading UV package: {pkg}", Color.BLUE)
                 cmd = [f"{paths['uv']}/uv", "tool", "upgrade", pkg]
                 returncode, _, stderr = run_command(cmd, env)

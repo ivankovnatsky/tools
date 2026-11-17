@@ -24,6 +24,49 @@ def binary_missing(pkg_info: Dict, bin_dir: str) -> bool:
     return bool(binary) and not os.path.exists(os.path.join(os.path.expanduser(bin_dir), binary))
 
 
+def _prefix(paths: Dict, state: Dict):
+    """((old prefix, packages tracked there) when the prefix moved, live tracked names)."""
+    state_packages = set(state.get("npm", {}).get("packages", {}).keys())
+    old = state.get("npm", {}).get("prefix", paths.get("npmBin"))
+    if old != paths.get("npmBin"):
+        return (old, state_packages), set()
+    return None, state_packages
+
+
+def plan_removals(packages: Dict, paths: Dict, state: Dict) -> Dict:
+    released, state_packages = _prefix(paths, state)
+    return {
+        "released": released,
+        "state_packages": state_packages,
+        "remove": sorted(state_packages - set(packages)),
+    }
+
+
+def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """Run after removals: a removal can take a binary another package declares."""
+    _, state_packages = _prefix(paths, state)
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif version_changed(pkg, pkg_info, state, "npm"):
+            actions.append((pkg, "update"))
+        elif paths.get("npmBin") and binary_missing(pkg_info, paths["npmBin"]):
+            actions.append((pkg, "reinstall"))
+        elif update and pkg_unpinned(pkg_info):
+            actions.append((pkg, "upgrade"))
+    units, unit_errors = secrets_flow.parse_package_units("npm", packages)
+    return {"actions": actions, "units": units, "unit_errors": unit_errors}
+
+
+def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """What deploy does with npm packages; the preview renders the same plan."""
+    return {
+        **plan_removals(packages, paths, state),
+        **plan_installs(packages, paths, state, update),
+    }
+
+
 def install_npm_packages(
     packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False
 ):
@@ -38,18 +81,18 @@ def install_npm_packages(
         log(f"npm: {CONFIG_FILE_REMOVED}", Color.RED)
         return False
 
-    desired = set(packages.keys())
     # Packages recorded against a different global prefix live somewhere we no
     # longer manage; uninstalling by name would hit whatever occupies the new
     # prefix under the same name.
-    if state.get("npm", {}).get("prefix", paths.get("npmBin")) != paths.get("npmBin"):
+    p = plan_removals(packages, paths, state)
+    if p["released"]:
         log("npm prefix changed, releasing previously tracked packages", Color.YELLOW)
         state.setdefault("npm", {})["packages"] = {}
     state_packages = set(state.get("npm", {}).get("packages", {}).keys())
 
     # Fail with a clear message instead of a KeyError traceback when the
     # paths a reconcile would need are not configured.
-    if desired or state_packages:
+    if packages or state_packages:
         missing = [k for k in ("nodejs", "npmBin") if not paths.get(k)]
         if missing:
             log(
@@ -70,7 +113,7 @@ def install_npm_packages(
     # Keep failed removals in state so the next run retries them instead of
     # forgetting a package that is still installed.
     state_pkgs = state.get("npm", {}).get("packages", {})
-    to_remove = sorted(pkg for pkg in state_packages if pkg not in desired)
+    to_remove = p["remove"]
     failed_removals: Dict[str, Dict] = {}
 
     if to_remove:
@@ -83,27 +126,18 @@ def install_npm_packages(
             success = False
         state_changed = True
 
-    units: Dict[str, list] = {}
-    for pkg, pkg_info in packages.items():
-        try:
-            units[pkg] = secrets_flow.parse_restart_units(
-                pkg_info.get("restartUnits"), f"npm.packages.{pkg}"
-            )
-        except ValueError as e:
-            log(str(e), Color.RED)
-            success = False
+    p = plan_installs(packages, paths, state, update)
+    units = p["units"]
+    for err in p["unit_errors"].values():
+        log(err, Color.RED)
+        success = False
 
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
     to_install_names = []
-    for pkg, pkg_info in packages.items():
-        if pkg in units and (
-            pkg not in state_packages
-            or version_changed(pkg, pkg_info, state, "npm")
-            or binary_missing(pkg_info, paths["npmBin"])
-            or (update and pkg_unpinned(pkg_info))
-        ):
-            to_install.append(pkg_spec_full(pkg, pkg_info))
+    for pkg, _ in p["actions"]:
+        if pkg in units:
+            to_install.append(pkg_spec_full(pkg, packages[pkg]))
             to_install_names.append(pkg)
     # Entries with invalid restartUnits are not (re)installed: keep their old state.
     install_failed = {pkg for pkg in packages if pkg not in units}

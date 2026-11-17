@@ -14,6 +14,46 @@ from tools.util import (
 )
 
 
+def _prefix(paths: Dict, state: Dict):
+    """((old prefix, packages tracked there) when the prefix moved, live tracked names)."""
+    state_packages = set(state.get("bun", {}).get("packages", {}).keys())
+    old = state.get("bun", {}).get("prefix", paths.get("bunBin"))
+    if old != paths.get("bunBin"):
+        return (old, state_packages), set()
+    return None, state_packages
+
+
+def plan_removals(packages: Dict, paths: Dict, state: Dict) -> Dict:
+    released, state_packages = _prefix(paths, state)
+    return {
+        "released": released,
+        "state_packages": state_packages,
+        "remove": sorted(state_packages - set(packages)),
+    }
+
+
+def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    _, state_packages = _prefix(paths, state)
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif version_changed(pkg, pkg_info, state, "bun"):
+            actions.append((pkg, "update"))
+        elif update and pkg_unpinned(pkg_info):
+            actions.append((pkg, "upgrade"))
+    units, unit_errors = secrets_flow.parse_package_units("bun", packages)
+    return {"actions": actions, "units": units, "unit_errors": unit_errors}
+
+
+def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """What deploy does with bun packages; the preview renders the same plan."""
+    return {
+        **plan_removals(packages, paths, state),
+        **plan_installs(packages, paths, state, update),
+    }
+
+
 def install_bun_packages(
     packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update: bool = False
 ):
@@ -28,18 +68,18 @@ def install_bun_packages(
         log(f"bun: {CONFIG_FILE_REMOVED}", Color.RED)
         return False
 
-    desired = set(packages.keys())
     # See npm: ownership is only meaningful against the prefix it was recorded
     # for, so a changed prefix releases the old entries rather than acting on
     # whatever now sits there under the same names.
-    if state.get("bun", {}).get("prefix", paths.get("bunBin")) != paths.get("bunBin"):
+    p = plan_removals(packages, paths, state)
+    if p["released"]:
         log("bun prefix changed, releasing previously tracked packages", Color.YELLOW)
         state.setdefault("bun", {})["packages"] = {}
     state_packages = set(state.get("bun", {}).get("packages", {}).keys())
 
     # Fail with a clear message instead of a KeyError traceback when the
     # paths a reconcile would need are not configured.
-    if desired or state_packages:
+    if packages or state_packages:
         missing = [k for k in ("bun", "nodejs") if not paths.get(k)]
         if missing:
             log(
@@ -59,7 +99,7 @@ def install_bun_packages(
     # truth; bun remove is keyed by package name, not a binary path). Keep
     # failed removals in state so the next run retries them.
     state_pkgs = state.get("bun", {}).get("packages", {})
-    to_remove = sorted(pkg for pkg in state_packages if pkg not in desired)
+    to_remove = p["remove"]
     failed_removals: Dict[str, Dict] = {}
 
     if to_remove:
@@ -72,26 +112,18 @@ def install_bun_packages(
             success = False
         state_changed = True
 
-    units: Dict[str, list] = {}
-    for pkg, pkg_info in packages.items():
-        try:
-            units[pkg] = secrets_flow.parse_restart_units(
-                pkg_info.get("restartUnits"), f"bun.packages.{pkg}"
-            )
-        except ValueError as e:
-            log(str(e), Color.RED)
-            success = False
+    p = plan_installs(packages, paths, state, update)
+    units = p["units"]
+    for err in p["unit_errors"].values():
+        log(err, Color.RED)
+        success = False
 
     # 2. INSTALL: Ensure all declared packages exist at correct version
     to_install = []
     to_install_names = []
-    for pkg, pkg_info in packages.items():
-        if pkg in units and (
-            pkg not in state_packages
-            or version_changed(pkg, pkg_info, state, "bun")
-            or (update and pkg_unpinned(pkg_info))
-        ):
-            to_install.append(pkg_spec_full(pkg, pkg_info))
+    for pkg, _ in p["actions"]:
+        if pkg in units:
+            to_install.append(pkg_spec_full(pkg, packages[pkg]))
             to_install_names.append(pkg)
     # Entries with invalid restartUnits are not (re)installed: keep their old state.
     install_failed = {pkg for pkg in packages if pkg not in units}

@@ -3,7 +3,7 @@
 import os
 import stat
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from tools import privilege, selection
 from tools.config import SECTIONS
@@ -13,11 +13,17 @@ from tools.mgmt import diff_mgmt
 from tools.mgmt import has_work as mgmt_has_work
 from tools.mgmt import released_rows as mgmt_released_rows
 from tools.mgmt.keys import key_path as mgmt_key_path
+from tools.user import bun as bun_section
+from tools.user import cargo as cargo_section
+from tools.user import git_repos as git_repos_section
+from tools.user import go as go_section
+from tools.user import npm as npm_section
+from tools.user import pi as pi_section
 from tools.user import secrets_flow
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
+from tools.user import uv as uv_section
 from tools.user.brew import diff_brew
-from tools.user.cargo import CrateRecordError, _crate_name, _resolve_cargo_bin
 from tools.user.curl_shell import diff_curl_shell
 from tools.user.defaults import diff_defaults
 from tools.user.defaults import has_work as defaults_has_work
@@ -29,14 +35,11 @@ from tools.user.fetch import diff_fetch
 from tools.user.fetch import has_work as fetch_has_work
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
-from tools.user.git_repos import _is_empty_dir, is_checkout
-from tools.user.go import _installed_path as _go_installed_path
-from tools.user.go import _resolve_go_bin
 from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
-from tools.user.npm import CONFIG_FILE_REMOVED, binary_missing
+from tools.user.npm import CONFIG_FILE_REMOVED
 from tools.user.ollama_models import diff_ollama_models
 from tools.user.plist import diff_plist
 from tools.user.plist import has_work as plist_has_work
@@ -56,9 +59,7 @@ from tools.util import (
     looks_like_secret,
     package_entries,
     pkg_install_spec,
-    pkg_unpinned,
     skipped_row,
-    version_changed,
 )
 
 ALL_SECTIONS = SECTIONS
@@ -91,15 +92,6 @@ def _bad_packages(section: str, packages) -> List[str]:
     return [f"  ! {err}" for err in package_entries(section, packages)[1]]
 
 
-def _units_error(section: str, pkg: str, pkg_info) -> Optional[str]:
-    """Why deploy skips (re)installing ``pkg``: its restartUnits do not parse."""
-    try:
-        secrets_flow.parse_restart_units(pkg_info.get("restartUnits"), f"{section}.packages.{pkg}")
-    except ValueError as e:
-        return str(e)
-    return None
-
-
 def _released(key: str, old, new, tracked, desired) -> List[str]:
     """Rows for a changed install location: deploy forgets what it tracked there."""
     rows = [f"  ~ {key} changed ({old} -> {new}); releasing tracked packages"]
@@ -107,69 +99,69 @@ def _released(key: str, old, new, tracked, desired) -> List[str]:
     return rows
 
 
-def _diff_js(section: str, packages: Dict, state: Dict, prefix_key: str, paths: Dict):
-    """bun/npm removal rows and the tracked names deploy still acts on."""
-    changes: List[str] = []
-    desired = set(packages.keys())
-    state_packages = set(state.get(section, {}).get("packages", {}).keys())
-    old = state.get(section, {}).get("prefix", paths.get(prefix_key))
-    if old != paths.get(prefix_key):
-        if state_packages:
-            changes += _released(
-                f"{section} prefix", old, paths.get(prefix_key), state_packages, desired
-            )
-        state_packages = set()
+def _action_rows(section: str, p: Dict, packages: Dict, pkg: str, kind: str, by_source: bool):
+    """Row for one planned install/update, or the restartUnits error that keeps
+    deploy from acting on that package."""
+    pkg_info = packages[pkg]
+    err = p["unit_errors"].get(pkg)
+    if err:
+        return [f"  ! {err}"]
+    if kind == "install":
+        row = f"  + install {(get_pkg_source(pkg_info) if by_source else None) or pkg}"
+    elif kind == "update":
+        row = f"  ~ update {pkg}"
+    elif kind == "reinstall":
+        row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
+    elif kind == "relocate":
+        row = f"  ~ reinstall {pkg} ({section} install dir changed)"
+    else:
+        row = f"  ~ upgrade {pkg}"
+    return [row] + _notify_rows(pkg_info)
 
-    for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
-    return changes, state_packages
+
+def _package_rows(section: str, p: Dict, packages: Dict, by_source: bool = True) -> List[str]:
+    changes: List[str] = []
+    for pkg, kind in p["actions"]:
+        changes += _action_rows(section, p, packages, pkg, kind, by_source)
+    return changes
+
+
+def _diff_js(section: str, p: Dict, packages: Dict, paths: Dict, prefix_key: str):
+    """bun/npm release and removal rows."""
+    changes: List[str] = []
+    if p["released"]:
+        old, tracked = p["released"]
+        if tracked:
+            changes += _released(
+                f"{section} prefix", old, paths.get(prefix_key), tracked, set(packages)
+            )
+    changes += [f"  - remove {pkg}" for pkg in p["remove"]]
+    return changes
 
 
 def _diff_bun(packages: Dict, paths: Dict, state: Dict, bun_config: Dict, update: bool = False):
     if bun_config.get("configFile") is not None:
         return [f"  ! {CONFIG_FILE_REMOVED}"]
-    changes, state_packages = _diff_js("bun", packages, state, "bunBin", paths)
-
-    for pkg, pkg_info in packages.items():
-        row = None
-        if pkg not in state_packages:
-            row = f"  + install {pkg}"
-        elif version_changed(pkg, pkg_info, state, "bun"):
-            row = f"  ~ update {pkg}"
-        elif update and pkg_unpinned(pkg_info):
-            row = f"  ~ upgrade {pkg}"
-        if row:
-            err = _units_error("bun", pkg, pkg_info)
-            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
-
-    return changes
+    p = bun_section.plan(packages, paths, state, update)
+    changes = _diff_js("bun", p, packages, paths, "bunBin")
+    return changes + _package_rows("bun", p, packages, by_source=False)
 
 
 def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update: bool = False):
     if npm_config.get("configFile") is not None:
         return [f"  ! {CONFIG_FILE_REMOVED}"]
-    changes: List[str] = []
-    rows, state_packages = _diff_js("npm", packages, state, "npmBin", paths)
-    changes += rows
-    stored = state.get("npm", {}).get("packages", {}) if state_packages else {}
+    p = npm_section.plan(packages, paths, state, update)
+    changes = _diff_js("npm", p, packages, paths, "npmBin")
+    stored = state.get("npm", {}).get("packages", {}) if p["state_packages"] else {}
+    actions = dict(p["actions"])
 
     npm_bin = paths.get("npmBin")
     npm_lib = Path(npm_bin).parent / "lib" / "node_modules" if npm_bin else None
     for pkg, pkg_info in packages.items():
-        row = None
-        if pkg not in state_packages:
-            row = f"  + install {pkg}"
-        elif version_changed(pkg, pkg_info, state, "npm"):
-            row = f"  ~ update {pkg}"
-        elif npm_bin and binary_missing(pkg_info, npm_bin):
-            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
-        elif update and pkg_unpinned(pkg_info):
-            row = f"  ~ upgrade {pkg}"
         installing = False
-        if row:
-            err = _units_error("npm", pkg, pkg_info)
-            installing = not err
-            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
+        if pkg in actions:
+            installing = pkg not in p["unit_errors"]
+            changes += _action_rows("npm", p, packages, pkg, actions[pkg], False)
         if npm_lib is None:
             continue
         pkg_dir = npm_lib / pkg
@@ -205,167 +197,60 @@ def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update
 
 
 def _diff_uv(packages: Dict, paths: Dict, state: Dict, update: bool = False):
-    changes = []
-    desired = set(packages.keys())
-    state_packages = set(state.get("uv", {}).get("packages", {}).keys())
-    if paths.get("uvBin") and paths.get("uvToolDir"):
-        context = f"{paths['uvBin']}|{paths['uvToolDir']}"
-        old = state.get("uv", {}).get("context", context)
-        if old != context:
-            if state_packages:
-                changes += _released("uv tool dir", old, context, state_packages, desired)
-            state_packages = set()
-
-    for pkg, pkg_info in packages.items():
-        row = None
-        if pkg not in state_packages:
-            source = get_pkg_source(pkg_info)
-            spec = source if source else pkg
-            row = f"  + install {spec}"
-        elif version_changed(pkg, pkg_info, state, "uv"):
-            row = f"  ~ update {pkg}"
-        elif paths.get("uvBin") and binary_missing(pkg_info, paths["uvBin"]):
-            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
-        elif update and pkg_unpinned(pkg_info):
-            row = f"  ~ upgrade {pkg}"
-        if row:
-            err = _units_error("uv", pkg, pkg_info)
-            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
-
-    for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
-
+    p = uv_section.plan(packages, paths, state, update)
+    changes: List[str] = []
+    if p["released"]:
+        old, tracked = p["released"]
+        if tracked:
+            changes += _released("uv tool dir", old, p["context"], tracked, set(packages))
+    changes += _package_rows("uv", p, packages)
+    changes += [f"  - remove {pkg}" for pkg in p["remove"]]
     return changes
 
 
 def _diff_go(packages: Dict, paths: Dict, state: Dict, update: bool = False):
-    changes = []
-    desired = set(packages.keys())
-    state_pkgs = state.get("go", {}).get("packages", {})
-    state_packages = set(state_pkgs.keys())
-    context = f"{paths.get('goBin') or ''}|{paths.get('goPath') or ''}"
-    context_changed = state.get("go", {}).get("context", context) != context
-    go_bin = None
-    if any(pkg_info.get("binary") for pkg_info in packages.values()):
-        go_bin = _resolve_go_bin(paths)
-
-    for pkg, pkg_info in packages.items():
-        row = None
-        if pkg not in state_packages:
-            source = get_pkg_source(pkg_info) or pkg
-            row = f"  + install {source}"
-        elif context_changed:
-            row = f"  ~ reinstall {pkg} (go install dir changed)"
-        elif version_changed(pkg, pkg_info, state, "go"):
-            row = f"  ~ update {pkg}"
-        elif (
-            go_bin
-            and pkg_info.get("binary")
-            and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
-        ):
-            row = f"  ~ reinstall {pkg} (binary {pkg_info['binary']} missing)"
-        elif update and pkg_unpinned(pkg_info):
-            row = f"  ~ upgrade {pkg}"
-        if row:
-            err = _units_error("go", pkg, pkg_info)
-            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
-
-    # Same rules as install_go_packages: without a known path, or while another
-    # package still uses the binary, the entry is only forgotten.
-    legacy_bin = None
-    if not context_changed and (paths.get("goBin") or paths.get("goPath")):
-        legacy_bin = _resolve_go_bin(paths)
-    kept_paths = {
-        _go_installed_path(pkg, entry, legacy_bin)
-        for pkg, entry in state_pkgs.items()
-        if pkg in desired and isinstance(entry, dict)
-    }
-    for pkg in sorted(state_packages - desired):
-        entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
-        path = _go_installed_path(pkg, entry, legacy_bin)
-        if path and path in kept_paths:
+    p = go_section.plan(packages, paths, state, update)
+    changes = _package_rows("go", p, packages)
+    for pkg, kind, path in p["removals"]:
+        if kind == "shared":
             changes.append(f"  ~ forget {pkg} (binary {path} still in use)")
-        elif not path:
+        elif kind == "unknown":
             changes.append(f"  ~ forget {pkg} (install path unknown, binary not removed)")
         else:
             changes.append(f"  - remove {pkg}")
-
     return changes
 
 
 def _diff_cargo(packages: Dict, paths: Dict, state: Dict, update: bool = False):
-    changes = []
-    desired = set(packages.keys())
-    state_pkgs = state.get("cargo", {}).get("packages", {})
-    state_packages = set(state_pkgs.keys())
-    context = f"{paths.get('cargoRoot') or ''}|{paths.get('cargoHome') or ''}"
-    root = os.path.dirname(_resolve_cargo_bin(paths))
-    context_changed = (
-        state.get("cargo", {}).get("context", context) != context
-        or state.get("cargo", {}).get("root", root) != root
-    )
-
-    for pkg, pkg_info in packages.items():
-        row = None
-        if pkg not in state_packages:
-            source = get_pkg_source(pkg_info) or pkg
-            row = f"  + install {source}"
-        elif context_changed:
-            row = f"  ~ reinstall {pkg} (cargo install dir changed)"
-        elif version_changed(pkg, pkg_info, state, "cargo"):
-            row = f"  ~ update {pkg}"
-        elif update and pkg_unpinned(pkg_info):
-            row = f"  ~ upgrade {pkg}"
-        if row:
-            err = _units_error("cargo", pkg, pkg_info)
-            changes += [f"  ! {err}"] if err else [row] + _notify_rows(pkg_info)
-
-    for pkg in sorted(state_packages - desired):
-        if context_changed:
+    p = cargo_section.plan(packages, paths, state, update)
+    changes = _package_rows("cargo", p, packages)
+    for pkg in p["orphaned"]:
+        if p["context_changed"]:
             changes.append(f"  ~ forget {pkg} (cargo install dir changed; binary left behind)")
             continue
-        entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
-        try:
-            name = _crate_name(pkg, entry, paths, (state_packages | desired) - {pkg})
-        except CrateRecordError as e:
-            changes.append(f"  ! cannot remove {pkg}: {e}")
-            continue
-        if not name:
+        kind, detail = cargo_section.removal(pkg, packages, paths, state)
+        if kind == "error":
+            changes.append(f"  ! cannot remove {pkg}: {detail}")
+        elif kind == "forget":
             changes.append(f"  ~ forget {pkg} (not in cargo's install record)")
         else:
             changes.append(f"  - remove {pkg}")
-
     return changes
 
 
 def _diff_pi(packages: Dict, paths: Dict, state: Dict):
-    changes = []
-    desired = set(packages.keys())
-    state_packages = set(state.get("pi", {}).get("packages", {}).keys())
-
-    for pkg in sorted(state_packages - desired):
-        changes.append(f"  - remove {pkg}")
-
-    for pkg, pkg_info in packages.items():
-        if pkg not in state_packages:
-            source = get_pkg_source(pkg_info)
-            spec = source if source else pkg
-            changes.append(f"  + install {spec}")
-        elif version_changed(pkg, pkg_info, state, "pi"):
+    p = pi_section.plan(packages, state)
+    changes = [f"  - remove {pkg}" for pkg in p["remove"]]
+    for pkg, kind in p["actions"]:
+        if kind == "install":
+            changes.append(f"  + install {get_pkg_source(packages[pkg]) or pkg}")
+        else:
             changes.append(f"  ~ update {pkg}")
-
     return changes
 
 
 def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
-    from tools.user.mcp import (
-        build_mcp_env,
-        config_scope,
-        foreign_servers,
-        get_installed_mcp_servers,
-        resolve_claude_cli,
-        server_fingerprint,
-    )
+    from tools.user import mcp as mcp_section
 
     changes = []
     desired = set(servers.keys())
@@ -375,17 +260,17 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
     if not desired and not managed:
         return changes
 
-    claude = resolve_claude_cli(paths)
+    claude = mcp_section.resolve_claude_cli(paths)
     if not claude:
         return ["  ? claude CLI not found, cannot diff MCP servers"]
 
     # Same resolver and parser as deploy, or the two disagree about what is
     # installed and the diff never matches what gets applied.
-    current = get_installed_mcp_servers(claude, build_mcp_env(paths))
+    current = mcp_section.get_installed_mcp_servers(claude, mcp_section.build_mcp_env(paths))
     if current is None:
         return ["  ? failed to list MCP servers, cannot diff"]
-    tracked_cfg = state.get("mcp", {}).get("servers", {})
-    foreign = foreign_servers(servers, state, current)
+    p = mcp_section.plan(servers, state, current)
+    foreign = p["foreign"]
     for name in sorted(foreign):
         changes.append(
             f"{SKIPPED_ROW}{name} (registered outside tools, not in scope {foreign[name]}; "
@@ -393,17 +278,16 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
         )
     for name in sorted(desired - current - set(foreign)):
         changes.append(f"  + install {name}")
-    for name in sorted(desired & managed & current):
-        if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name]):
-            changes.append(f"  ~ re-register {name}")
-    for name in sorted((desired & current) - managed - set(foreign)):
+    for name in sorted(p["changed"]):
+        changes.append(f"  ~ re-register {name}")
+    for name in sorted(p["adopted"]):
         changes.append(
             f"  ~ re-register {name} (registered outside tools; adopted if it is in scope "
-            f"{config_scope(servers[name])}, otherwise left alone)"
+            f"{mcp_section.config_scope(servers[name])}, otherwise left alone)"
         )
     for name in sorted((managed & current) - desired):
         changes.append(f"  - remove {name}")
-    for name in sorted(managed - current - desired):
+    for name in sorted(p["forget"]):
         changes.append(f"  ~ forget {name}")
 
     return changes
@@ -412,7 +296,6 @@ def _diff_mcp(servers: Dict, paths: Dict, state: Dict):
 def _git_local_work(path: str) -> bool:
     """Read-only git queries deploy runs before trashing a checkout; any failure keeps it."""
     from tools.system_paths import system_bin, system_dir
-    from tools.user.git_repos import _has_local_work
 
     try:
         git_bin = system_bin("git")
@@ -420,31 +303,31 @@ def _git_local_work(path: str) -> bool:
         return True
     env = os.environ.copy()
     env["PATH"] = f"{system_dir('git')}:{env.get('PATH', '')}"
-    return _has_local_work(git_bin, path, env)
+    return git_repos_section._has_local_work(git_bin, path, env)
 
 
 def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
     changes = []
-    stored = state.get("gitRepos", {}).get("installed", [])
-    installed = set(respell(dict.fromkeys(stored), git_repos.keys()))
-    for dest, _url in git_repos.items():
-        expanded = os.path.expanduser(dest)
-        if not os.path.exists(expanded) or _is_empty_dir(expanded):
+    p = git_repos_section.plan(git_repos, state, update)
+    installed = p["installed"]
+    for dest in git_repos:
+        action = git_repos_section.checkout_action(dest, installed, update)
+        if action == "clone":
             changes.append(f"  + clone {dest}")
-        elif not is_checkout(expanded):
+        elif action == "not_repo":
             changes.append(f"  ! not a git repo: {dest} (deploy skips it)")
-        elif dest not in installed:
+        elif action == "track":
             changes.append(f"  + track {dest}")
-        elif update:
+        elif action == "pull":
             changes.append(f"  ~ pull {dest}")
     # Removal trashes the whole checkout, so it must never reach the
     # user as a surprise — this is the one section where a missing preview
     # line costs data rather than a confusing diff.
-    for dest in sorted(installed - set(git_repos)):
-        expanded = os.path.expanduser(dest)
-        if os.path.exists(expanded) and not is_checkout(expanded):
+    for dest in sorted(p["to_remove"]):
+        action = git_repos_section.removal_action(dest, _git_local_work)
+        if action == "release":
             changes.append(f"  ~ release {dest} (not a git checkout, left in place)")
-        elif os.path.exists(expanded) and _git_local_work(expanded):
+        elif action == "keep":
             changes.append(
                 f"  ~ keep {dest} (uncommitted or unpushed work, or git cannot read it; "
                 "not removed)"

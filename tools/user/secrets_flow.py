@@ -712,6 +712,20 @@ def parse_restart_units(value, where: str) -> List[str]:
     return list(units)
 
 
+def parse_package_units(section: str, packages: Dict) -> Tuple[Dict[str, list], Dict[str, str]]:
+    """`<section>.packages.*.restartUnits`: parsed units, and errors by package."""
+    units: Dict[str, list] = {}
+    errors: Dict[str, str] = {}
+    for pkg, pkg_info in packages.items():
+        try:
+            units[pkg] = parse_restart_units(
+                pkg_info.get("restartUnits"), f"{section}.packages.{pkg}"
+            )
+        except ValueError as e:
+            errors[pkg] = str(e)
+    return units, errors
+
+
 def _valid_entry(entry) -> bool:
     return (
         isinstance(entry, dict)

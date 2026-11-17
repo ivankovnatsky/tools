@@ -64,19 +64,67 @@ def _cargo_entry(pkg_info: Dict) -> Dict:
     return entry
 
 
-def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
-    packages, ok = checked_packages("cargo", packages)
-    if not ok:
-        return False
-    desired = set(packages.keys())
-
-    # Unchanged packages still need reinstalling into a changed install dir.
+def _context(paths: Dict, state: Dict):
     context = f"{paths.get('cargoRoot') or ''}|{paths.get('cargoHome') or ''}"
     context_changed = state.get("cargo", {}).get("context", context) != context
     # Without configured paths the root comes from the environment, which can
     # move between runs while the context above stays the same.
     root = os.path.dirname(_resolve_cargo_bin(paths))
     context_changed = context_changed or state.get("cargo", {}).get("root", root) != root
+    return context, root, context_changed
+
+
+def removal(pkg: str, packages: Dict, paths: Dict, state: Dict):
+    """How an orphaned ``pkg`` is removed: ("remove", crate), ("forget", None) when
+    cargo's install record lacks it, or ("error", message)."""
+    state_pkgs = state.get("cargo", {}).get("packages", {})
+    entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+    try:
+        others = (set(state_pkgs) | set(packages)) - {pkg}
+        name = _crate_name(pkg, entry, paths, others)
+    except CrateRecordError as e:
+        return "error", str(e)
+    return ("remove", name) if name else ("forget", None)
+
+
+def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """What deploy does with cargo packages; the preview renders the same plan.
+
+    Deploy resolves each removal with `removal()` right before acting on it,
+    since an earlier `cargo uninstall` rewrites the install record."""
+    context, root, context_changed = _context(paths, state)
+    state_packages = set(state.get("cargo", {}).get("packages", {}).keys())
+    orphaned = sorted(state_packages - set(packages))
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif context_changed:
+            actions.append((pkg, "relocate"))
+        elif version_changed(pkg, pkg_info, state, "cargo"):
+            actions.append((pkg, "update"))
+        elif update and pkg_unpinned(pkg_info):
+            actions.append((pkg, "upgrade"))
+    units, unit_errors = secrets_flow.parse_package_units("cargo", packages)
+    return {
+        "context": context,
+        "root": root,
+        "context_changed": context_changed,
+        "orphaned": orphaned,
+        "actions": actions,
+        "units": units,
+        "unit_errors": unit_errors,
+    }
+
+
+def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
+    packages, ok = checked_packages("cargo", packages)
+    if not ok:
+        return False
+
+    # Unchanged packages still need reinstalling into a changed install dir.
+    p = plan(packages, paths, state, update)
+    context, root, context_changed = p["context"], p["root"], p["context_changed"]
     if context_changed:
         log(
             "cargo install dir changed; reinstalling desired packages there "
@@ -85,7 +133,6 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
         )
 
     state_pkgs = state.get("cargo", {}).get("packages", {})
-    state_packages = set(state_pkgs.keys())
     # tracked mirrors what is installed; persist each success so a later
     # failure keeps progress (state is the only record of installed tools).
     tracked = dict(state_pkgs)
@@ -93,7 +140,7 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
 
     # After an install dir change the binary sits in the old root, which
     # `cargo uninstall` no longer looks at, so it is only forgotten.
-    orphaned = sorted(state_packages - desired)
+    orphaned = p["orphaned"]
     if orphaned and context_changed:
         log(
             "Dropping cargo packages from state (binaries remain in the previous "
@@ -115,15 +162,12 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
         else:
             cargo_env = _cargo_env(paths)
             for pkg in orphaned:
-                entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
-                try:
-                    others = (set(state_pkgs) | set(packages)) - {pkg}
-                    name = _crate_name(pkg, entry, paths, others)
-                except CrateRecordError as e:
-                    log(f"Failed to remove cargo package {pkg}: {e}", Color.RED)
+                kind, name = removal(pkg, packages, paths, state)
+                if kind == "error":
+                    log(f"Failed to remove cargo package {pkg}: {name}", Color.RED)
                     success = False
                     continue
-                if not name:
+                if kind == "forget":
                     log(
                         f"Dropping cargo package {pkg} from state (not in cargo's "
                         "install record, nothing to uninstall)",
@@ -140,24 +184,12 @@ def install_cargo_packages(packages: Dict, paths: Dict, state: Dict, update: boo
                 log(f"Removed: {name}", Color.GREEN)
                 tracked.pop(pkg, None)
 
-    units: Dict[str, list] = {}
-    for pkg, pkg_info in packages.items():
-        try:
-            units[pkg] = secrets_flow.parse_restart_units(
-                pkg_info.get("restartUnits"), f"cargo.packages.{pkg}"
-            )
-        except ValueError as e:
-            log(str(e), Color.RED)
-            success = False
+    units = p["units"]
+    for err in p["unit_errors"].values():
+        log(err, Color.RED)
+        success = False
 
-    to_install = [
-        pkg
-        for pkg, pkg_info in packages.items()
-        if pkg not in state_packages
-        or context_changed
-        or version_changed(pkg, pkg_info, state, "cargo")
-        or (update and pkg_unpinned(pkg_info))
-    ]
+    to_install = [pkg for pkg, _ in p["actions"]]
 
     if to_install:
         cargo_cmd = shutil.which("cargo")

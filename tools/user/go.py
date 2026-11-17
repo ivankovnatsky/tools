@@ -105,17 +105,90 @@ def _installed_path(pkg: str, entry: Dict, go_bin: Optional[str]) -> Optional[st
     return None
 
 
+def _context(paths: Dict, state: Dict):
+    context = f"{paths.get('goBin') or ''}|{paths.get('goPath') or ''}"
+    return context, state.get("go", {}).get("context", context) != context
+
+
+def plan_removals(packages: Dict, paths: Dict, state: Dict) -> Dict:
+    """Go has no `go uninstall`: removing a tool means deleting the binary it
+    installed. Without a known path, or while another package still uses that
+    binary, it is only forgotten."""
+    context, context_changed = _context(paths, state)
+    state_pkgs = state.get("go", {}).get("packages", {})
+    orphaned = sorted(set(state_pkgs) - set(packages))
+    removals = []  # (pkg, "remove" | "shared" | "unknown", path)
+    if orphaned:
+        legacy_bin = None
+        if not context_changed and (paths.get("goBin") or paths.get("goPath")):
+            legacy_bin = _resolve_go_bin(paths)
+        kept_paths = {
+            _installed_path(pkg, entry, legacy_bin)
+            for pkg, entry in state_pkgs.items()
+            if pkg in packages and isinstance(entry, dict)
+        }
+        for pkg in orphaned:
+            entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
+            path = _installed_path(pkg, entry, legacy_bin)
+            if path and path in kept_paths:
+                removals.append((pkg, "shared", path))
+            elif not path:
+                removals.append((pkg, "unknown", path))
+            else:
+                removals.append((pkg, "remove", path))
+    return {
+        "context": context,
+        "context_changed": context_changed,
+        "orphaned": orphaned,
+        "removals": removals,
+    }
+
+
+def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """Run after removals: a removed binary may be one a desired package declares."""
+    _, context_changed = _context(paths, state)
+    state_packages = set(state.get("go", {}).get("packages", {}).keys())
+    go_bin = None
+    if any(pkg_info.get("binary") for pkg_info in packages.values()):
+        go_bin = _resolve_go_bin(paths)
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif context_changed:
+            actions.append((pkg, "relocate"))
+        elif version_changed(pkg, pkg_info, state, "go"):
+            actions.append((pkg, "update"))
+        elif (
+            go_bin
+            and pkg_info.get("binary")
+            and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
+        ):
+            actions.append((pkg, "reinstall"))
+        elif update and pkg_unpinned(pkg_info):
+            actions.append((pkg, "upgrade"))
+    units, unit_errors = secrets_flow.parse_package_units("go", packages)
+    return {"actions": actions, "units": units, "unit_errors": unit_errors}
+
+
+def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+    """What deploy does with go packages; the preview renders the same plan."""
+    return {
+        **plan_removals(packages, paths, state),
+        **plan_installs(packages, paths, state, update),
+    }
+
+
 def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
     packages, ok = checked_packages("go", packages)
     if not ok:
         return False
-    desired = set(packages.keys())
 
     # Go has no uninstall, so a changed install dir cannot "release" anything
     # — but unchanged packages still need reinstalling into the new location,
     # or they are simply absent there while state claims them installed.
-    context = f"{paths.get('goBin') or ''}|{paths.get('goPath') or ''}"
-    context_changed = state.get("go", {}).get("context", context) != context
+    p = plan_removals(packages, paths, state)
+    context, context_changed = p["context"], p["context_changed"]
     if context_changed:
         log(
             "go install dir changed; reinstalling desired packages there "
@@ -124,84 +197,44 @@ def install_go_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
         )
 
     state_pkgs = state.get("go", {}).get("packages", {})
-    state_packages = set(state_pkgs.keys())
     # tracked mirrors what is installed; persist each success so a later
     # failure keeps progress (state is the only record of installed tools).
     tracked = dict(state_pkgs)
     success = True
 
-    # Go has no `go uninstall`: removing a tool means deleting the binary it
-    # installed. Without a known path it is only forgotten.
-    orphaned = sorted(state_packages - desired)
-    if orphaned:
-        legacy_bin = None
-        if not context_changed and (paths.get("goBin") or paths.get("goPath")):
-            legacy_bin = _resolve_go_bin(paths)
-        kept_paths = {
-            _installed_path(pkg, entry, legacy_bin)
-            for pkg, entry in state_pkgs.items()
-            if pkg in desired and isinstance(entry, dict)
-        }
-        for pkg in orphaned:
-            entry = state_pkgs[pkg] if isinstance(state_pkgs[pkg], dict) else {}
-            path = _installed_path(pkg, entry, legacy_bin)
-            if path and path in kept_paths:
-                log(
-                    f"Dropping Go package {pkg} from state (binary {path} still in use)",
-                    Color.YELLOW,
-                )
-                tracked.pop(pkg, None)
-                continue
-            if not path:
-                log(
-                    f"Dropping Go package {pkg} from state (install path unknown, "
-                    "binary not removed)",
-                    Color.YELLOW,
-                )
-                tracked.pop(pkg, None)
-                continue
-            try:
-                fsutil.trash(path)
-            except OSError as e:
-                # Keep it tracked so the next run retries the removal.
-                log(f"Failed to remove Go package {pkg} ({path}): {e}", Color.RED)
-                success = False
-                continue
-            log(f"Removed: {pkg} ({path})", Color.GREEN)
-            tracked.pop(pkg, None)
-
-    units: Dict[str, list] = {}
-    for pkg, pkg_info in packages.items():
-        try:
-            units[pkg] = secrets_flow.parse_restart_units(
-                pkg_info.get("restartUnits"), f"go.packages.{pkg}"
+    orphaned = p["orphaned"]
+    for pkg, kind, path in p["removals"]:
+        if kind == "shared":
+            log(
+                f"Dropping Go package {pkg} from state (binary {path} still in use)",
+                Color.YELLOW,
             )
-        except ValueError as e:
-            log(str(e), Color.RED)
+            tracked.pop(pkg, None)
+            continue
+        if kind == "unknown":
+            log(
+                f"Dropping Go package {pkg} from state (install path unknown, binary not removed)",
+                Color.YELLOW,
+            )
+            tracked.pop(pkg, None)
+            continue
+        try:
+            fsutil.trash(path)
+        except OSError as e:
+            # Keep it tracked so the next run retries the removal.
+            log(f"Failed to remove Go package {pkg} ({path}): {e}", Color.RED)
             success = False
+            continue
+        log(f"Removed: {pkg} ({path})", Color.GREEN)
+        tracked.pop(pkg, None)
 
-    # A declared binary that is gone from the install dir is reinstalled.
-    missing_binary = set()
-    if any(pkg_info.get("binary") for pkg_info in packages.values()):
-        go_bin = _resolve_go_bin(paths)
-        if go_bin:
-            missing_binary = {
-                pkg
-                for pkg, pkg_info in packages.items()
-                if pkg in state_packages
-                and pkg_info.get("binary")
-                and not os.path.exists(os.path.join(go_bin, pkg_info["binary"]))
-            }
+    p = plan_installs(packages, paths, state, update)
+    units = p["units"]
+    for err in p["unit_errors"].values():
+        log(err, Color.RED)
+        success = False
 
-    to_install = [
-        pkg
-        for pkg, pkg_info in packages.items()
-        if pkg not in state_packages
-        or context_changed
-        or pkg in missing_binary
-        or version_changed(pkg, pkg_info, state, "go")
-        or (update and pkg_unpinned(pkg_info))
-    ]
+    to_install = [pkg for pkg, _ in p["actions"]]
 
     if to_install:
         # Only now do we need the install dir; resolving lazily means a pure

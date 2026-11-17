@@ -114,6 +114,40 @@ def not_in_scope(name: str, output: str) -> bool:
     return f'No MCP server named "{name}" in ' in output
 
 
+def plan(servers: Dict, state: Dict, current: Set[str]) -> Dict:
+    """What deploy does with MCP servers given the registered set `current`;
+    the preview renders the same plan."""
+    desired = set(servers.keys())
+    tracked_cfg = state.get("mcp", {}).get("servers", {})
+    tracked = set(tracked_cfg.keys())
+    # A server is identified by name, so a changed url/transport/scope/command
+    # is invisible to `claude mcp list`. Re-register those, or editing config
+    # silently does nothing.
+    changed = {
+        name
+        for name in desired & tracked & current
+        if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name])
+    }
+    # Registered outside tools under a configured name: tools owns it now. Its live
+    # definition is never read, so it is re-registered from config once. Only one
+    # registered in the configured scope is adopted: removing it there must succeed.
+    foreign_recs = foreign_records(servers, state, current)
+    foreign = {n: r["scope"] for n, r in foreign_recs.items()}
+    adopted = (desired & current) - tracked - set(foreign)
+    reregister = changed | adopted
+    return {
+        "foreign_recs": foreign_recs,
+        "foreign": foreign,
+        "changed": changed,
+        "adopted": adopted,
+        "to_install": (desired - current) | reregister,
+        # Only servers we installed are ours to remove. `current - desired` would
+        # take anything registered by hand or by another tool.
+        "to_remove": ((tracked & current) - desired) | reregister,
+        "forget": tracked - current - desired,
+    }
+
+
 def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
     claude_cli = resolve_claude_cli(paths)
 
@@ -129,28 +163,12 @@ def install_mcp_servers(servers: Dict, paths: Dict, state: Dict):
         log("Cannot reconcile MCP servers without a server list, skipping", Color.RED)
         return False
     tracked_cfg = state.get("mcp", {}).get("servers", {})
-    tracked = set(tracked_cfg.keys())
-    # A server is identified by name, so a changed url/transport/scope/command
-    # is invisible to `claude mcp list`. Re-register those, or editing config
-    # silently does nothing.
-    changed_cfg = {
-        name
-        for name in desired & tracked & current
-        if server_fingerprint(servers[name]) != server_fingerprint(tracked_cfg[name])
-    }
-    # Registered outside tools under a configured name: tools owns it now. Its live
-    # definition is never read, so it is re-registered from config once. Only one
-    # registered in the configured scope is adopted: removing it there must succeed.
-    foreign_recs = foreign_records(servers, state, current)
-    foreign = {n: r["scope"] for n, r in foreign_recs.items()}
-    adopted = (desired & current) - tracked - set(foreign)
+    p = plan(servers, state, current)
+    foreign_recs, foreign, adopted = p["foreign_recs"], p["foreign"], p["adopted"]
     for name in sorted(adopted):
         log(f"Adopting {name}, registered outside tools", Color.YELLOW)
-    changed_cfg |= adopted
-    to_install = (desired - current) | changed_cfg
-    # Only servers we installed are ours to remove. `current - desired` would
-    # take anything registered by hand or by another tool.
-    to_remove = ((tracked & current) - desired) | changed_cfg
+    to_install = p["to_install"]
+    to_remove = p["to_remove"]
     state_changed = False
     success = True
     failed: set = set()

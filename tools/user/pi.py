@@ -39,6 +39,18 @@ def build_pi_env(paths: Dict) -> Dict[str, str]:
     return env
 
 
+def plan(packages: Dict, state: Dict) -> Dict:
+    """What deploy does with pi packages; the preview renders the same plan."""
+    state_packages = set(state.get("pi", {}).get("packages", {}).keys())
+    actions = []
+    for pkg, pkg_info in packages.items():
+        if pkg not in state_packages:
+            actions.append((pkg, "install"))
+        elif version_changed(pkg, pkg_info, state, "pi"):
+            actions.append((pkg, "update"))
+    return {"remove": sorted(state_packages - set(packages)), "actions": actions}
+
+
 def install_pi_packages(packages: Dict, paths: Dict, state: Dict) -> bool:
     """Declarative pi package management.
 
@@ -64,7 +76,8 @@ def install_pi_packages(packages: Dict, paths: Dict, state: Dict) -> bool:
     success = True
 
     # 1. CLEANUP: Remove packages no longer in config
-    to_remove = sorted(pkg for pkg in state_packages if pkg not in desired)
+    p = plan(packages, state)
+    to_remove = p["remove"]
     if to_remove:
         log(f"Removing Pi packages: {', '.join(to_remove)}", Color.RED)
         for pkg in to_remove:
@@ -81,11 +94,7 @@ def install_pi_packages(packages: Dict, paths: Dict, state: Dict) -> bool:
                 tracked.pop(pkg, None)
 
     # 2. INSTALL: Ensure all declared packages exist at correct version/source
-    to_install = [
-        pkg
-        for pkg, pkg_info in packages.items()
-        if pkg not in state_packages or version_changed(pkg, pkg_info, state, "pi")
-    ]
+    to_install = [pkg for pkg, _ in p["actions"]]
     if to_install:
         log(f"Installing Pi packages: {', '.join(to_install)}", Color.GREEN)
         for pkg in to_install:
