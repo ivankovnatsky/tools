@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 
 import click
 
@@ -74,6 +75,22 @@ def shorten_path_to_fit(path, prefix, cols):
     return parts[0]
 
 
+def format_limit(limit, reset_fmt):
+    """Format a rate_limits window as "22% · 20:20"; None when absent."""
+    if not isinstance(limit, dict):
+        return None
+    try:
+        text = f"{float(limit['used_percentage']):.0f}%"
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        reset = datetime.fromtimestamp(float(limit["resets_at"]))
+        text += f" · {reset.strftime(reset_fmt)}"
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        pass
+    return text
+
+
 def output(line, cols):
     if cols > 0:
         click.echo(truncate_line(line, cols), color=True)
@@ -130,6 +147,20 @@ def main(input_file):
         line1 += f" {DIM}|{RESET} {MAGENTA}{branch}{RESET}"
 
     output(line1, cols)
+
+    # Plan usage: present only for claude.ai subscribers, per window
+    rate_limits = data.get("rate_limits") or {}
+    if not isinstance(rate_limits, dict):
+        rate_limits = {}
+    usage = []
+    session = format_limit(rate_limits.get("five_hour"), "%H:%M")
+    if session:
+        usage.append(f"{DIM}5h:{RESET} {session}")
+    week = format_limit(rate_limits.get("seven_day"), "%a %H:%M")
+    if week:
+        usage.append(f"{DIM}week:{RESET} {week}")
+    if usage:
+        output(f" {DIM}|{RESET} ".join(usage), cols)
 
     # Show both pwd and cwd only when different, otherwise just cwd
     pwd_prefix = f"{DIM}pwd:{RESET} "
