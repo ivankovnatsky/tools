@@ -63,6 +63,8 @@ class Ownership(dict):
         self.clone_pending = clone_pending
         # State-only `files:` directories holding another section's path (canonical keys).
         self.release_dirs: Set[str] = set()
+        # Every file-writing section's declared or tracked paths (canonical key -> sections).
+        self.claims: Dict[str, Set[str]] = {}
 
     def __bool__(self) -> bool:
         return bool(len(self) or self.links or self.trees or self.repos)
@@ -133,6 +135,11 @@ class Ownership(dict):
             if fsutil.is_within(real, root):
                 return f"inside {spelled}, {owner}"
         return None
+
+    def claimed_by(self, path: str) -> Optional[str]:
+        """Sections (files, sops, templates, env, fetch) declaring or tracking ``path``."""
+        sections = self.claims.get(_link_key(_norm(path)))
+        return " and ".join(sorted(sections)) if sections else None
 
     def __contains__(self, path) -> bool:
         return isinstance(path, str) and self.reason(path) is not None
@@ -392,6 +399,7 @@ def ownership_conflicts(
     repos = [_norm(d) for d in _mapping(git_repos_raw) if isinstance(d, str) and d]
     ownership = Ownership(exact, link_paths, trees, repos, clone_pending)
     ownership.release_dirs = release_dirs
+    ownership.claims = claims
     return ownership
 
 
@@ -658,7 +666,8 @@ def rendered_in_state(sops_raw, templates_raw, state: Dict) -> bool:
 
 def mark_rendered(sops_raw) -> bool:
     """Create sops.RENDERED_MARKER in secretsDir (when a secret lives there) after sops and
-    templates rendered completely; launchd's waitForSecrets waits on it."""
+    templates rendered completely; launchd's waitForSecrets waits on it. The marker
+    persists across reboots like the secrets, so it gates only the first render."""
     secrets_dir = sops.secrets_dir_kwargs(sops_raw)["secrets_dir"]
     if not secrets_dir:
         return True
