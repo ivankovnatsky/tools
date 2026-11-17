@@ -654,6 +654,54 @@ class RenderTest(TemplatesTestBase):
         with open(again) as f:
             self.assertEqual(f.read(), "two")
 
+    def test_backup_false_overwrites_app_rewrite_despite_earlier_backup(self):
+        os.makedirs(os.path.dirname(self.target))
+        with open(self.target, "w") as f:
+            f.write("one")
+        self.assertTrue(self.deploy(self.tpl({"a": 1}))[0])
+        [backup] = backups(self.target)
+        os.chmod(self.target, 0o600)
+        with open(self.target, "w") as f:
+            f.write("app rewrote it")
+        raw = self.tpl({"a": 1}, backup=False)
+        self.assertEqual(
+            self.diff(raw),
+            [
+                f"  ~ replace {self.target} (modified since tools wrote it; "
+                "overwritten, backup: false; content not shown)"
+            ],
+        )
+        ok, out = self.deploy(raw)
+        self.assertTrue(ok, out)
+        self.assertIn(
+            f"Overwritten (modified since tools wrote it; backup: false): {self.target}", out
+        )
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        self.assertEqual(backups(self.target), [backup])
+        with open(backup) as f:
+            self.assertEqual(f.read(), "one")
+        self.assertEqual(self.diff(raw), [])
+
+    def test_backup_false_overwrites_untracked_target(self):
+        os.makedirs(os.path.dirname(self.target))
+        with open(self.target, "w") as f:
+            f.write("mine")
+        ok, _ = self.deploy(self.tpl({"a": 1}, backup=False))
+        self.assertTrue(ok)
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        self.assertEqual(backups(self.target), [])
+
+    def test_backup_false_target_appearing_after_plan_is_overwritten(self):
+        with self._appearing("raced"):
+            ok, _ = self.deploy(self.tpl({"a": 1}, backup=False))
+        self.assertTrue(ok)
+        self.assertEqual(json.loads(self.read()), {"a": 1})
+        self.assertEqual(backups(self.target), [])
+
+    def test_backup_must_be_bool(self):
+        _, errors = templates.parse_templates(self.tpl({"a": 1}, backup="no"))
+        self.assertIn("backup must be a bool", errors[0])
+
     def test_once_key_is_unknown(self):
         _, errors = templates.parse_templates(self.tpl({"a": 1}, once=True))
         self.assertIn("unknown keys ['once']", errors[0])

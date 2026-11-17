@@ -12,6 +12,7 @@ Input is plain, already-resolved data keyed by template name::
         "restartUnits": ["launchd:org.example.app"],
         "onChange": "shell command",         # run once after a write
         "skip": False,                       # keep declared, but do not write
+        "backup": True,                      # false: overwrite instead of moving aside
       },
     }
 
@@ -47,6 +48,7 @@ _KEYS = {
     "quote",
     "onChange",
     "skip",
+    "backup",
 }
 DEFAULT_MODE = 0o400
 
@@ -67,6 +69,7 @@ class Template:
     quote: bool = True
     on_change: Optional[str] = None
     skip: bool = False
+    backup: bool = True
 
 
 def parse_templates(
@@ -137,6 +140,9 @@ def parse_templates(
             skip = spec.get("skip", False)
             if not isinstance(skip, bool):
                 raise ValueError(f"{name}: skip must be a bool")
+            backup = spec.get("backup", True)
+            if not isinstance(backup, bool):
+                raise ValueError(f"{name}: backup must be a bool")
             mode = fsutil.parse_mode(spec.get("mode"), f"templates.{name}")
             fsutil.check_owner(spec.get("owner"), f"{name}: owner")
             fsutil.check_owner(spec.get("group"), f"{name}: group")
@@ -158,6 +164,7 @@ def parse_templates(
                 quote=quote,
                 on_change=on_change,
                 skip=skip,
+                backup=backup,
             )
         )
     return result, errors
@@ -328,7 +335,7 @@ def plan(
             ch.secret = secret or bool(record.get("secret"))
         elif not tracked:
             ch.action = "adopt"
-        if ch.action == "replace":
+        if ch.action == "replace" and t.backup:
             refused = fsutil.aside_refused(t.target)
             if refused:
                 ch.action, ch.error = "error", f"{t.name}: {refused}"
@@ -431,14 +438,21 @@ def apply(
                 fsutil.makedirs_secret(os.path.dirname(t.target), private_root, created_dirs)
                 if ch.action != "create":
                     moved = fsutil.atomic_write(
-                        t.target, ch.desired, ch.mode, uid, gid, backup=ch.action == "replace"
+                        t.target,
+                        ch.desired,
+                        ch.mode,
+                        uid,
+                        gid,
+                        backup=ch.action == "replace" and t.backup,
                     )
                 else:
                     moved, ch.aside = fsutil.create_or_replace(
-                        t.target, ch.desired, ch.mode, uid, gid
+                        t.target, ch.desired, ch.mode, uid, gid, backup=t.backup
                     )
                 if moved:
                     log(f"Moved aside ({ch.aside}): {t.target} -> {moved}", Color.YELLOW)
+                elif ch.aside:
+                    log(f"Overwritten ({ch.aside}; backup: false): {t.target}", Color.YELLOW)
         except (OSError, KeyError, ValueError) as e:
             log(f"templates: failed to write {t.target}: {e}", Color.RED)
             res.success = False
@@ -490,7 +504,11 @@ def describe(p: Plan) -> List[str]:
         elif ch.action == "create":
             rows.append(f"  + render {t.target}{' (secret)' if ch.secret else ''}")
         elif ch.action == "replace":
-            note = fsutil.aside_note(t.target, ch.aside)
+            note = (
+                fsutil.aside_note(t.target, ch.aside)
+                if t.backup
+                else f"{ch.aside}; overwritten, backup: false"
+            )
             rows.append(f"  ~ replace {t.target} ({note}; content not shown)")
         elif ch.action == "update":
             if ch.masked:
