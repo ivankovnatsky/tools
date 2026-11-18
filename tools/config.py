@@ -32,6 +32,7 @@ SECTIONS = (
     "defaults",
     "dock",
     "mgmt",
+    "nixDarwin",
 )
 
 # Top-level keys that are not sections. `include` is consumed per file by

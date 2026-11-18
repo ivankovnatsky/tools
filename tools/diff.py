@@ -39,6 +39,8 @@ from tools.user.launchd import diff_launchd
 from tools.user.launchd import has_work as launchd_has_work
 from tools.user.links import diff_links
 from tools.user.links import has_work as links_has_work
+from tools.user.nix_darwin import diff_nix_darwin
+from tools.user.nix_darwin import has_work as nix_darwin_has_work
 from tools.user.npm import CONFIG_FILE_REMOVED
 from tools.user.ollama_models import diff_ollama_models
 from tools.user.plist import diff_plist
@@ -844,6 +846,11 @@ def show_diff(
         if changes:
             sections.append(("plist", changes))
 
+    if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
+        changes = diff_nix_darwin(config.get("nixDarwin"), state, root=False)
+        if changes:
+            sections.append(("nixDarwin", changes))
+
     units = secrets_flow.pending_restarts(state)
     if "launchd" in active and (launchd_has_work(config.get("launchd"), state) or units):
         changes = diff_launchd(
@@ -901,6 +908,10 @@ def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
     settings; nothing in user space."""
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
+    if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
+        changes = diff_nix_darwin(config.get("nixDarwin"), state, root=True)
+        if changes:
+            sections.append(("nixDarwin", changes))
     if "files" in active and files_has_system_work(config.get("files"), state):
         changes = _diff_files(config.get("files") or [], config_dir, state, system=True)
         if changes:

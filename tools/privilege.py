@@ -17,7 +17,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
-ROOT_SECTIONS = ("launchd", "defaults", "files", "settingsctl", "users")
+ROOT_SECTIONS = ("launchd", "defaults", "files", "settingsctl", "users", "nixDarwin")
 
 SUDO_USER_ERROR = (
     "tools must not run as root directly; run it as your user, "

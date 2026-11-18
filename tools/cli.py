@@ -67,6 +67,8 @@ from tools.user.links import has_work as links_has_work
 from tools.user.links import install_links
 from tools.user.links import resolve as links_resolve
 from tools.user.mcp import install_mcp_servers
+from tools.user.nix_darwin import has_work as nix_darwin_has_work
+from tools.user.nix_darwin import install_nix_darwin
 from tools.user.npm import install_npm_packages
 from tools.user.ollama_models import install_ollama_models
 from tools.user.pi import install_pi_packages
@@ -604,6 +606,9 @@ def _run_root_sections(
     settings; nothing in user space. ``owed`` is the user's state: daemons it owes a
     restartUnits restart are restarted here, once, and settled there."""
     success = True
+    # First: nix-darwin's /etc links and daemons go before files and daemons replace them.
+    if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
+        success &= install_nix_darwin(config.get("nixDarwin"), state, root=True)
     # Before daemons, whose restartOn may name these files.
     if "files" in active and files_has_system_work(config.get("files"), state):
         success &= install_files(config.get("files") or [], config_dir, state, system=True)
@@ -869,6 +874,10 @@ def _run_sections(
     # too, so dropping the last key still restores what tools wrote.
     if "plist" in active and plist_has_work(config.get("plist"), state):
         success &= install_plist(config.get("plist"), state, persist)
+
+    # Before launchd: nix-darwin's agents free the labels and plist paths tools writes.
+    if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
+        success &= install_nix_darwin(config.get("nixDarwin"), state, root=False)
 
     # After files, so restartOn hashes see files written in this run.
     units = secrets_flow.pending_restarts(state)
