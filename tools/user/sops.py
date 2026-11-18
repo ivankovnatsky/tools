@@ -336,7 +336,9 @@ def ensure_ssh_key(settings: Settings, runner: Runner = default_runner) -> bool:
     if path is None:
         return True
     try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        parent = os.path.dirname(path)
+        if parent:  # a bare relative name lives in the cwd
+            os.makedirs(parent, mode=0o700, exist_ok=True)
         rc, _out, err = runner(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path], dict(os.environ)
         )

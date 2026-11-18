@@ -1180,6 +1180,21 @@ class GenerateSshKeyTest(unittest.TestCase):
             self.assertIn("boom", out.getvalue())
             self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
 
+    def test_bare_relative_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                calls = []
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ok = sops.ensure_ssh_key(
+                        self.settings("id"), lambda cmd, env: calls.append(cmd) or (1, b"", "")
+                    )
+            finally:
+                os.chdir(cwd)
+            self.assertFalse(ok)
+            self.assertEqual(calls[0][-1], "id")
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen not available")
     def test_generates_missing_key_and_logs_recipient(self):
         with tempfile.TemporaryDirectory() as tmp:
