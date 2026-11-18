@@ -23,6 +23,7 @@ import os
 import plistlib
 import sys
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+from xml.parsers.expat import ExpatError
 
 from tools import fsutil
 from tools.log import Color, log
@@ -123,7 +124,7 @@ def nix_jobs(directory: str, owned: Iterable[str] = ()) -> List[Tuple[str, str]]
         try:
             with open(path, "rb") as f:
                 plist = plistlib.load(f)
-        except (OSError, plistlib.InvalidFileException, ValueError):
+        except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, OverflowError):
             continue
         label = plist.get("Label") if isinstance(plist, dict) else None
         if (

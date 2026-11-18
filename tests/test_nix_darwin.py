@@ -91,6 +91,13 @@ class PlanTest(unittest.TestCase):
             ],
         )
 
+    def test_malformed_plist_skipped(self):
+        with open(os.path.join(self.jobs, "broken.plist"), "wb") as f:
+            f.write(b"<?xml version=\"1.0\"?><plist><dict><key>Label")
+        state = {"launchd": {"services": {"com.example.ours": {}}}}
+        labels = [label for _, _, label in self.plan(root=False, state=state)]
+        self.assertEqual(labels, ["org.nixos.activate-system"])
+
     def test_user_plan_only_jobs(self):
         kinds = {kind for kind, _, _ in self.plan(root=False)}
         self.assertEqual(kinds, {"job"})
