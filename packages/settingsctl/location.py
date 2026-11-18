@@ -113,7 +113,7 @@ def register(cli):
     @click.option(
         "--init",
         is_flag=True,
-        help="Enable Location Services if not already enabled (idempotent, for activation scripts)",
+        help="Report when Location Services is off (idempotent, for activation scripts)",
     )
     @click.argument("mode", required=False, type=click.Choice(["on", "off"]))
     def location(status, init, mode):
