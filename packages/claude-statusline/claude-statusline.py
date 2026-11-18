@@ -134,7 +134,7 @@ def main(input_file):
     else:
         ctx_fmt = f"{ctx_size // 1000}k"
 
-    # Line 1: model | context remaining | ctx size | cost | git
+    # Line 1: model | context remaining | ctx size | cost | git | plan usage
     line1 = (
         f"{CYAN}{model_id}{RESET} "
         f"{DIM}|{RESET} {remaining}% remaining "
@@ -146,21 +146,18 @@ def main(input_file):
     if branch:
         line1 += f" {DIM}|{RESET} {MAGENTA}{branch}{RESET}"
 
-    output(line1, cols)
-
     # Plan usage: present only for claude.ai subscribers, per window
     rate_limits = data.get("rate_limits") or {}
     if not isinstance(rate_limits, dict):
         rate_limits = {}
-    usage = []
     session = format_limit(rate_limits.get("five_hour"), "%H:%M")
     if session:
-        usage.append(f"{DIM}5h:{RESET} {session}")
+        line1 += f" {DIM}|{RESET} {DIM}5h:{RESET} {session}"
     week = format_limit(rate_limits.get("seven_day"), "%a %H:%M")
     if week:
-        usage.append(f"{DIM}week:{RESET} {week}")
-    if usage:
-        output(f" {DIM}|{RESET} ".join(usage), cols)
+        line1 += f" {DIM}|{RESET} {DIM}week:{RESET} {week}"
+
+    output(line1, cols)
 
     # Show both pwd and cwd only when different, otherwise just cwd
     pwd_prefix = f"{DIM}pwd:{RESET} "
