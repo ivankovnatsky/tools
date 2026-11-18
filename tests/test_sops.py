@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -1130,6 +1131,67 @@ class FixesTest(SopsTestBase):
         path = os.path.join(self.secrets_dir, "t")
         rows = self.diff(self.config({"bad": {"key": "x", "mode": 1}}))
         self.assertIn(f"  ~ hold {path} (would remove; held until config errors are fixed)", rows)
+
+
+class GenerateSshKeyTest(unittest.TestCase):
+    def settings(self, path, generate=True):
+        p = sops.parse_sops({"age": {"sshKeyPaths": [path], "generateSshKey": generate}})
+        self.assertEqual(p.errors, [])
+        return p.settings
+
+    def test_parse(self):
+        base = {"secretsDir": "/s"}
+        self.assertFalse(
+            sops.parse_sops({**base, "age": {"sshKeyPaths": ["/a"]}}).settings.generate_ssh_key
+        )
+        for age, why in (
+            ({"sshKeyPaths": ["/a"], "generateSshKey": "yes"}, "true or false"),
+            ({"generateSshKey": True}, "needs a path"),
+        ):
+            p = sops.parse_sops({**base, "age": age})
+            self.assertIn(why, p.errors[0], age)
+
+    def test_existing_key_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "id")
+            with open(path, "w") as f:
+                f.write("x")
+            runner = mock.Mock()
+            self.assertIsNone(sops.ssh_key_to_generate(self.settings(path)))
+            self.assertTrue(sops.ensure_ssh_key(self.settings(path), runner))
+            runner.assert_not_called()
+            with open(path) as f:
+                self.assertEqual(f.read(), "x")
+
+    def test_disabled_does_nothing(self):
+        runner = mock.Mock()
+        settings = self.settings("/nonexistent/id", generate=False)
+        self.assertIsNone(sops.ssh_key_to_generate(settings))
+        self.assertTrue(sops.ensure_ssh_key(settings, runner))
+        runner.assert_not_called()
+
+    def test_keygen_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ssh", "id")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ok = sops.ensure_ssh_key(self.settings(path), lambda cmd, env: (1, b"", "boom\n"))
+            self.assertFalse(ok)
+            self.assertIn("boom", out.getvalue())
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen not available")
+    def test_generates_missing_key_and_logs_recipient(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ssh", "id_ed25519")
+            settings = self.settings(path)
+            self.assertEqual(sops.ssh_key_to_generate(settings), path)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertTrue(sops.ensure_ssh_key(settings))
+            self.assertTrue(os.path.isfile(path) and os.path.isfile(path + ".pub"))
+            self.assertRegex(out.getvalue(), r"age public key: age1[0-9a-z]{58}")
+            self.assertIsNone(sops.ssh_key_to_generate(settings))
 
 
 if __name__ == "__main__":

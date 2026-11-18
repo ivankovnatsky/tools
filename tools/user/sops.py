@@ -4,7 +4,7 @@ Input is plain, already-resolved data (see ``parse_sops``)::
 
     {
       "binary": None,                     # else `sops` from PATH
-      "age": {"keyFile": "...", "sshKeyPaths": ["..."]},
+      "age": {"keyFile": "...", "sshKeyPaths": ["..."], "generateSshKey": False},
       "secretsDir": "~/.local/state/tools/secrets",
       "defaultSopsFile": "/abs/secrets.yaml",
       "defaultSopsFormat": "yaml",        # yaml | json | dotenv | ini | binary
@@ -14,6 +14,10 @@ Input is plain, already-resolved data (see ``parse_sops``)::
         "<name>": {"generate": {"length": 64, "charset": "alnum"}},
       },
     }
+
+``age.generateSshKey`` creates the first ``sshKeyPaths`` entry with
+``ssh-keygen -t ed25519`` when it is missing (never overwrites) and logs its
+age recipient, like nix-config's home-manager ``generateSshKey``.
 
 Option names and defaults follow sops-nix: ``key`` defaults to the
 secret's name (``a/b`` nests), ``key: ""`` or ``format: binary`` is the
@@ -106,6 +110,7 @@ class Settings:
     binary: Optional[str] = None
     age_key_file: Optional[str] = None
     age_ssh_key_files: Tuple[str, ...] = ()
+    generate_ssh_key: bool = False
     secrets_dir: str = field(default_factory=lambda: os.path.expanduser(DEFAULT_SECRETS_DIR))
 
 
@@ -190,13 +195,20 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
     age = raw.get("age")
     age = {} if age is None else age
     try:
-        if not isinstance(age, Mapping) or set(age) - {"keyFile", "sshKeyPaths"}:
-            raise ValueError("age must be a mapping with keyFile and/or sshKeyPaths")
+        if not isinstance(age, Mapping) or set(age) - {"keyFile", "sshKeyPaths", "generateSshKey"}:
+            raise ValueError(
+                "age must be a mapping with keyFile, sshKeyPaths and/or generateSshKey"
+            )
         ssh_paths = age.get("sshKeyPaths")
         ssh_paths = [] if ssh_paths is None else ssh_paths
         if not isinstance(ssh_paths, list) or not all(isinstance(p, str) and p for p in ssh_paths):
             raise ValueError("sops.age.sshKeyPaths must be a list of non-empty path strings")
         ssh_keys = tuple(_path_field({"p": p}, "p", "sops.age.sshKeyPaths") for p in ssh_paths)
+        generate_ssh_key = age.get("generateSshKey", False)
+        if not isinstance(generate_ssh_key, bool):
+            raise ValueError("sops.age.generateSshKey must be true or false")
+        if generate_ssh_key and not ssh_keys:
+            raise ValueError("sops.age.generateSshKey needs a path in sops.age.sshKeyPaths")
         default_format = raw.get("defaultSopsFormat")
         default_format = "yaml" if default_format is None else default_format
         if default_format not in FORMATS:
@@ -205,6 +217,7 @@ def parse_sops(raw: Optional[Mapping]) -> Parsed:
             binary=_path_field(raw, "binary", "sops"),
             age_key_file=_path_field(age, "keyFile", "sops.age"),
             age_ssh_key_files=ssh_keys,
+            generate_ssh_key=generate_ssh_key,
             secrets_dir=_path_field(raw, "secretsDir", "sops") or _expand(DEFAULT_SECRETS_DIR),
         )
         if not os.path.isabs(settings.secrets_dir):
@@ -306,6 +319,41 @@ def secret_paths(raw: Optional[Mapping]) -> Dict[str, str]:
 # --------------------------------------------------------------------------
 # Decryption
 # --------------------------------------------------------------------------
+
+
+def ssh_key_to_generate(settings: Settings) -> Optional[str]:
+    """The ``sshKeyPaths`` entry ``generateSshKey`` would create, else None."""
+    if not settings.generate_ssh_key or not settings.age_ssh_key_files:
+        return None
+    path = settings.age_ssh_key_files[0]
+    return None if os.path.lexists(path) else path
+
+
+def ensure_ssh_key(settings: Settings, runner: Runner = default_runner) -> bool:
+    """Create the first ``sshKeyPaths`` key if ``generateSshKey`` and it is
+    missing, then log its age recipient. False only when generation failed."""
+    path = ssh_key_to_generate(settings)
+    if path is None:
+        return True
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        rc, _out, err = runner(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path], dict(os.environ)
+        )
+    except OSError as e:
+        log(f"sops: cannot generate ssh key {path}: {e.strerror or e}", Color.RED)
+        return False
+    if rc != 0:
+        last = (err or "").strip().splitlines()[-1:] or ["no output"]
+        log(f"sops: ssh-keygen failed for {path} (exit {rc}): {last[0][:200]}", Color.RED)
+        return False
+    log(f"Generated SSH key: {path}", Color.GREEN)
+    try:
+        with open(path + ".pub", encoding="ascii") as f:
+            log(f"age public key: {ssh_age.public_key_to_age(f.read())}", Color.GREEN)
+    except (OSError, UnicodeDecodeError, ssh_age.ConvertError) as e:
+        log(f"sops: cannot read the age recipient of {path}.pub: {e}", Color.YELLOW)
+    return True
 
 
 class DecryptError(Exception):

@@ -49,6 +49,22 @@ class TestSshAge(unittest.TestCase):
         with self.assertRaisesRegex(ssh_age.ConvertError, "not an OpenSSH"):
             ssh_age.private_key_to_age(b"\xff\xfe")
 
+    def test_public_key_matches_ssh_to_age(self):
+        line = "ssh-ed25519 " + base64.b64encode(ssh_keys.public_blob()).decode() + " throwaway\n"
+        self.assertEqual(ssh_age.public_key_to_age(line), ssh_keys.AGE_RECIPIENT)
+
+    def test_rejected_public_keys(self):
+        good = base64.b64encode(ssh_keys.public_blob()).decode()
+        for line in (
+            "",
+            "ssh-rsa " + good,
+            "ssh-ed25519 !!",
+            "ssh-ed25519 " + base64.b64encode(ssh_keys.public_blob()[:-1]).decode(),
+            "ssh-ed25519 " + base64.b64encode(ssh_keys.public_blob() + b"x").decode(),
+        ):
+            with self.assertRaises(ssh_age.ConvertError, msg=line):
+                ssh_age.public_key_to_age(line)
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen not available")
     def test_ssh_keygen_output_parses(self):
         with tempfile.TemporaryDirectory() as tmp:

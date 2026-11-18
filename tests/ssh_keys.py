@@ -10,10 +10,16 @@ import struct
 SEED = bytes.fromhex("4cd3d7b5b4c05569c7852daf4570ed338aad08e777f2c7272ec1514e75b02609")
 PUBLIC = bytes.fromhex("caf5c36c3bd4622e973538bb1a723efba4962a056b11673b7dfa04313284cf59")
 AGE_KEY = "AGE-SECRET-KEY-10SQL6LLG3ZV0QNNP7V6USD92EZ8X6L589U0HCKLCUWSHT66YENDQET7R96"
+# ``ssh-to-age`` on the matching ``.pub`` line.
+AGE_RECIPIENT = "age1lxrjlf2uzrnlv6hllduekqjdy2y5fkc6hchavs7esmwr3gk22gesuqsf2t"
 
 
 def _s(b: bytes) -> bytes:
     return struct.pack(">I", len(b)) + b
+
+
+def public_blob(public=PUBLIC) -> bytes:
+    return _s(b"ssh-ed25519") + _s(public)
 
 
 def openssh_key(

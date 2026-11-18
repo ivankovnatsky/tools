@@ -4,6 +4,9 @@ Same result as ``ssh-to-age -private-key`` (Mic92/ssh-to-age): the age
 secret key is the first 32 bytes of SHA-512 over the ed25519 seed, bech32
 encoded with the ``AGE-SECRET-KEY-`` prefix. Only unencrypted keys in the
 ``openssh-key-v1`` format are supported.
+
+``public_key_to_age`` matches ``ssh-to-age`` on a ``.pub`` line: the ed25519
+point's Montgomery u-coordinate, bech32 encoded as an ``age1`` recipient.
 """
 
 import base64
@@ -116,3 +119,26 @@ def private_key_to_age(data: bytes) -> str:
     """``AGE-SECRET-KEY-1...`` for an unencrypted OpenSSH ed25519 private key."""
     scalar = hashlib.sha512(_ed25519_seed(data)).digest()[:32]
     return bech32_encode("AGE-SECRET-KEY-", scalar).upper()
+
+
+_P = 2**255 - 19
+
+
+def public_key_to_age(line: str) -> str:
+    """``age1...`` recipient for an ``ssh-ed25519 <base64> [comment]`` line."""
+    parts = line.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise ConvertError("not an ssh-ed25519 public key")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except binascii.Error:
+        raise ConvertError("invalid base64 in key") from None
+    key_type, off = _read_string(blob, 0)
+    public, off = _read_string(blob, off)
+    if key_type != b"ssh-ed25519" or len(public) != 32 or off != len(blob):
+        raise ConvertError("corrupt ed25519 public key")
+    y = int.from_bytes(public, "little") & ((1 << 255) - 1)
+    if y >= _P or y == 1:
+        raise ConvertError("corrupt ed25519 public key")
+    u = (1 + y) * pow(1 - y, _P - 2, _P) % _P
+    return bech32_encode("age", u.to_bytes(32, "little"))

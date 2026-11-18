@@ -706,8 +706,12 @@ def _run_sections(
         config.get("gitRepos"), config.get("sops"), config.get("templates")
     )
     report = secrets_flow.RunReport()
+    sops_settings = sops_section.parse_sops(config.get("sops")).settings
+    # The key sops decrypts with, before anything decrypts.
+    if "sops" in active:
+        success &= sops_section.ensure_ssh_key(sops_settings)
     # One decryptor for both, so templates render the values sops just wrote.
-    decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
+    decryptor = sops_section.Decryptor(sops_settings)
     run_sops = "sops" in active and sops_section.has_work(config.get("sops"), state)
     run_templates = "templates" in active and templates_section.has_work(
         config.get("templates"), state

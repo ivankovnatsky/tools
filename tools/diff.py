@@ -707,8 +707,12 @@ def show_diff(
     run_templates = "templates" in active and templates_section.has_work(
         config.get("templates"), state
     )
+    sops_settings = sops_section.parse_sops(config.get("sops")).settings
     if run_sops or run_templates:
-        decryptor = sops_section.Decryptor(sops_section.parse_sops(config.get("sops")).settings)
+        decryptor = sops_section.Decryptor(sops_settings)
+    # Deploy creates it before decrypting; shown in the first sops rows.
+    new_key = sops_section.ssh_key_to_generate(sops_settings) if "sops" in active else None
+    key_rows = [f"  + generate ssh key {new_key}"] if new_key else []
     # In memory only: diff never saves state. A narrowed deploy makes no moves.
     moves = (
         []
@@ -744,14 +748,15 @@ def show_diff(
     failed: tuple = ()
 
     def secrets(phase, suffix=""):
-        nonlocal failed
+        nonlocal failed, key_rows
         split = {"phase": phase, "inside": inside} if phase else {}
         if run_sops:
             sops_plan = secrets_flow.plan_sops(
                 config.get("sops"), state, decryptor, conflicts, **split
             )
             failed += secrets_flow.failed_secrets(sops_plan)
-            changes = sops_section.describe(sops_plan)
+            changes = key_rows + sops_section.describe(sops_plan)
+            key_rows = []
             if changes:
                 sections.append(("sops" + suffix, changes))
         if run_templates:
