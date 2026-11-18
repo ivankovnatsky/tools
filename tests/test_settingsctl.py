@@ -41,7 +41,7 @@ class FakeCli:
             rows = [{"name": n, "enabled": on} for n, on in self.panes[verb].items()]
             return 0, json.dumps({"items": rows}), ""
         assert "set" not in args[1:2], args
-        if verb == "appearance":
+        if verb in ("appearance", "scaling", "location"):
             return (1 if "--init" in self.stuck else 0), "", ""
         ok = True
         names = args[-1].split(",")
@@ -104,7 +104,7 @@ class SettingsctlCase(unittest.TestCase):
         rows = self.diff(raw, state=state)
         ran = [
             "  {} settings {}".format(
-                "-" if c[1] in ("revoke", "remove") else "+" if c[0] != "appearance" else "~",
+                "-" if c[1] in ("revoke", "remove") else "~" if c[1:2] == ["--init"] else "+",
                 settingsctl._shown(c),
             )
             for c in commands
@@ -524,6 +524,34 @@ class AppearanceInitTest(SettingsctlCase):
         ok, commands = self._install({"appearanceInit": 1})
         self.assertFalse(ok)
         self.assertEqual(commands, [])
+
+
+class EveryRunInitTest(SettingsctlCase):
+    def test_runs_every_deploy_without_a_record(self):
+        raw = {"scalingInit": True, "locationInit": True}
+        expected = [["scaling", "--init"], ["location", "--init"]]
+        state = {}
+        for _ in range(2):
+            self.assert_preview_matches(raw, state, expected)
+            ok, commands = self._install(raw, state=state)
+            self.assertTrue(ok)
+            self.assertEqual(commands, expected)
+        self.assertEqual(state, {})
+
+    def test_false_does_nothing(self):
+        self.assertEqual(self.diff({"scalingInit": False, "locationInit": False}), [])
+        self.assertEqual(self._install({"scalingInit": False}, state={}), (True, []))
+
+    def test_failure_fails_the_section(self):
+        self.fake.stuck.add("--init")
+        ok, commands = self._install({"scalingInit": True}, state={})
+        self.assertFalse(ok)
+        self.assertEqual(commands, [["scaling", "--init"]])
+
+    def test_typed(self):
+        self.assertEqual(
+            self.diff({"locationInit": "yes"}), ["  ! locationInit: must be true or false"]
+        )
 
 
 HOST = {

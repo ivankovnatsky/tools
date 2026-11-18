@@ -9,6 +9,8 @@ Config shape::
       accessibility: [Hammerspoon]               # settings accessibility enable / revoke
       loginItems: [Hammerspoon, LosslessSwitcher]  # settings login add / remove
       appearanceInit: true                       # settings appearance --init, once
+      scalingInit: true                          # settings scaling --init, every run
+      locationInit: true                         # settings location --init, every run
       defaultBrowser: firefox                    # settings defaultbrowser set
       # root only (sudo tools deploy):
       hostName: my-mac                           # settings hostname set --host-name
@@ -30,7 +32,10 @@ them all; `settingsctl.unconfirmed` holds the ones a failed step left unverified
 count as not granted until a live read or an apply confirms them. Names whose revoke
 failed stay recorded. An unreadable login item list fails the section.
 
-`appearanceInit` runs `settings appearance --init` once and records it. Every other
+`appearanceInit` runs `settings appearance --init` once and records it. `scalingInit`
+and `locationInit` run `settings scaling --init` and `settings location --init` on every
+deploy, like an activation script; both commands check first and skip when there is
+nothing to do (location only reports when Location Services is off). Every other
 key is read first (`settings ... get --json`) and set only when it differs. Root keys
 run in the sudo phase; as the user they are read and reported in a note. A scalar key
 that leaves config is left as is.
@@ -54,7 +59,7 @@ from tools.log import Color, log
 from tools.util import run_command
 
 LIST_KEYS = ("fullDiskAccess", "accessibility", "loginItems")
-BOOL_KEYS = ("appearanceInit",)
+BOOL_KEYS = ("appearanceInit", "scalingInit", "locationInit")
 NAME_KEYS = {
     "hostName": "--host-name",
     "localHostName": "--local-host-name",
@@ -69,6 +74,7 @@ ROOT_HINT = "run sudo tools deploy --scope settingsctl"
 NO_STATE = "--no-state"
 SUDO_VARS = ("SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND")
 APPEARANCE_INIT = ["appearance", "--init"]
+EVERY_RUN = {"scalingInit": ["scaling", "--init"], "locationInit": ["location", "--init"]}
 REVOKE_DELETES = ("accessibility",)
 PANE = {"fullDiskAccess": "fulldiskaccess", "accessibility": "accessibility"}
 ENABLE = {
@@ -475,6 +481,9 @@ def plan_other(
     errors: List[str] = []
     if spec.get("appearanceInit") and not inited:
         todo.append((f"  ~ settings {_shown(APPEARANCE_INIT)}", APPEARANCE_INIT))
+    for key, cmd in EVERY_RUN.items():
+        if spec.get(key):
+            todo.append((f"  ~ settings {_shown(cmd)}", cmd))
     if "defaultBrowser" in spec and runner:
         want = spec["defaultBrowser"]
         try:

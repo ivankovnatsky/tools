@@ -998,6 +998,8 @@ settingsctl:
   accessibility: [Hammerspoon, kitty]         # settings accessibility enable / revoke
   loginItems: [Hammerspoon, LosslessSwitcher] # settings login add / remove
   appearanceInit: true    # settings appearance --init, once
+  scalingInit: true       # settings scaling --init, every run
+  locationInit: true      # settings location --init, every run
   defaultBrowser: firefox # settings defaultbrowser set; macOS asks to confirm
   # root only: sudo tools deploy
   hostName: my-mac        # settings hostname set --host-name
@@ -1024,6 +1026,10 @@ settingsctl:
 - `appearanceInit` switches to dark mode once; tools records
   `appearanceInit: true` in `state.json` and later toggles are yours. Dropping
   the key forgets the record, so adding it back initialises again.
+- `scalingInit` and `locationInit` run on every deploy, like a nix-darwin
+  activation script, so `diff` always lists them. `settings scaling --init`
+  sets the built-in display to the model's mode unless it is already there;
+  `settings location --init` only reports when Location Services is off.
 - Lists are additive plus revoke. A privacy list with names not yet recorded
   reads the pane (`settings <pane> list --json`) and enables the configured
   names that are not on; fully recorded lists skip the pane. Login items are
