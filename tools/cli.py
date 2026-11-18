@@ -533,6 +533,7 @@ def _deploy_locked(
                     persist,
                     restarts,
                     owed,
+                    full_state=view.merged(state) if view else None,
                 )
             else:
                 success = _run_sections(
@@ -601,14 +602,18 @@ def _run_root_sections(
     persist=lambda: None,
     deferred: list | None = None,
     owed: dict | None = None,
+    full_state: dict | None = None,
 ) -> bool:
     """Under sudo: system files, launchd daemons, system-scope defaults and settingsctl host
     settings; nothing in user space. ``owed`` is the user's state: daemons it owes a
-    restartUnits restart are restarted here, once, and settled there."""
+    restartUnits restart are restarted here, once, and settled there. ``full_state``
+    keeps the records --only set aside, so nixDarwin still sees every tracked job."""
     success = True
     # First: nix-darwin's /etc links and daemons go before files and daemons replace them.
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
-        success &= install_nix_darwin(config.get("nixDarwin"), state, root=True)
+        success &= install_nix_darwin(
+            config.get("nixDarwin"), full_state if full_state is not None else state, root=True
+        )
     # Before daemons, whose restartOn may name these files.
     if "files" in active and files_has_system_work(config.get("files"), state):
         success &= install_files(config.get("files") or [], config_dir, state, system=True)
@@ -877,7 +882,9 @@ def _run_sections(
 
     # Before launchd: nix-darwin's agents free the labels and plist paths tools writes.
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
-        success &= install_nix_darwin(config.get("nixDarwin"), state, root=False)
+        # Every tracked job, also those --only set aside, is left alone.
+        owned = view.merged(state) if view else state
+        success &= install_nix_darwin(config.get("nixDarwin"), owned, root=False)
 
     # After files, so restartOn hashes see files written in this run.
     units = secrets_flow.pending_restarts(state)

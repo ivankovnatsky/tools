@@ -7,12 +7,13 @@ Config shape::
 
 Under sudo: daemons in /Library/LaunchDaemons that run from /nix/store are
 booted out and moved to the Trash (org.nixos.activate-system would re-activate
-nix-darwin at boot). Every /etc symlink into /etc/static goes to the Trash,
-and its ``<path>.before-nix-darwin`` (saved by nix-darwin's first activation)
-is moved back in its place; then /etc/static itself. As your user: agents in
-~/Library/LaunchAgents that run from /nix/store, so launchd jobs with the same
-labels can be created. Jobs tools tracks in state are never touched;
-Determinate Nix's own daemons don't run from /nix/store and are left alone.
+nix-darwin at boot). Each /etc symlink into /etc/static is replaced in one step
+by its ``<path>.before-nix-darwin`` (file or symlink, saved by nix-darwin's
+first activation), or moved to the Trash when there is none; then /etc/static
+itself. As your user: agents in ~/Library/LaunchAgents that run from
+/nix/store, so launchd jobs with the same labels can be created. Jobs tools
+tracks in state are never touched; Determinate Nix's own daemons don't run
+from /nix/store and are left alone.
 
 Runs before `files` (root) and `launchd` (user). Nothing is recorded in state:
 once nothing is left, the section is a no-op. Darwin only.
@@ -133,7 +134,7 @@ def plan(
         return actions
     for link in etc_links(etc, static):
         backup = link + BEFORE
-        if os.path.isfile(backup) and not os.path.islink(backup):
+        if os.path.islink(backup) or os.path.isfile(backup):
             actions.append(("restore", link, backup))
         else:
             actions.append(("remove", link, None))
@@ -148,7 +149,7 @@ def row(action: Action) -> str:
     if kind == "job":
         return f"  - {detail}: boot out, move {path} to Trash (runs from /nix/store)"
     if kind == "restore":
-        return f"  ~ {path}: link into /etc/static to Trash, restore {detail}"
+        return f"  ~ {path}: replace link into /etc/static with {detail}"
     return f"  - {path}: nix-darwin link, move to Trash"
 
 
@@ -166,7 +167,7 @@ def _do(action: Action, root: bool) -> Optional[str]:
                 return f"bootout {detail} failed ({rc}): {(err or out).strip()}"
             fsutil.trash(path)
         elif kind == "restore":
-            fsutil.trash(path)
+            # Replaces the link in one step: on failure nothing has changed.
             os.rename(detail, path)
         else:
             fsutil.trash(path)

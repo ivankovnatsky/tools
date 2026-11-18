@@ -598,7 +598,13 @@ def show_diff(
         if view and not _hide(view, state):
             return False
         return _print_sections(
-            _root_sections(view.config if view else config, config_dir, scope, state)
+            _root_sections(
+                view.config if view else config,
+                config_dir,
+                scope,
+                state,
+                full_state=view.merged(state) if view else None,
+            )
         )
 
     state = {}
@@ -847,7 +853,7 @@ def show_diff(
             sections.append(("plist", changes))
 
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
-        changes = diff_nix_darwin(config.get("nixDarwin"), state, root=False)
+        changes = diff_nix_darwin(config.get("nixDarwin"), full_state, root=False)
         if changes:
             sections.append(("nixDarwin", changes))
 
@@ -903,13 +909,16 @@ def _hide(view, state: dict) -> bool:
     return True
 
 
-def _root_sections(config: dict, config_dir: str, scope, state: dict) -> list:
+def _root_sections(
+    config: dict, config_dir: str, scope, state: dict, full_state: dict | None = None
+) -> list:
     """Under sudo: system files, launchd daemons, system-scope defaults and settingsctl host
     settings; nothing in user space."""
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
-        changes = diff_nix_darwin(config.get("nixDarwin"), state, root=True)
+        owned = full_state if full_state is not None else state
+        changes = diff_nix_darwin(config.get("nixDarwin"), owned, root=True)
         if changes:
             sections.append(("nixDarwin", changes))
     if "files" in active and files_has_system_work(config.get("files"), state):
