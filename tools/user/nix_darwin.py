@@ -34,6 +34,10 @@ STATIC = "/etc/static"
 BEFORE = ".before-nix-darwin"
 STORE = "/nix/store/"
 LAUNCHCTL = "/bin/launchctl"
+SHELLS = ("/bin/sh", "/bin/bash", "/bin/zsh")
+WAIT_STORE = "/bin/wait4path /nix/store"
+# nix-darwin's own Nix daemon (nix.enable): booting it out would stop Nix itself.
+KEEP = frozenset({"org.nixos.nix-daemon"})
 DAEMON_DIR = "/Library/LaunchDaemons"
 AGENT_DIR = "~/Library/LaunchAgents"
 # launchctl bootout: ESRCH (3) and 113 mean the job was not loaded.
@@ -87,9 +91,21 @@ def etc_links(etc: str = ETC, static: str = STATIC) -> List[str]:
 
 
 def _runs_from_store(plist: Dict) -> bool:
+    """The job's executable is in /nix/store, or it is nix-darwin's shell wrapper
+    (`/bin/sh -c "/bin/wait4path /nix/store && exec ..."`). A store path that is
+    only a data argument does not count."""
     args = plist.get("ProgramArguments")
-    values = [plist.get("Program")] + (list(args) if isinstance(args, list) else [])
-    return any(isinstance(v, str) and STORE in v for v in values)
+    args = args if isinstance(args, list) else []
+    program = plist.get("Program") or (args[0] if args else None)
+    if isinstance(program, str) and program.startswith(STORE):
+        return True
+    return (
+        program in SHELLS
+        and len(args) >= 3
+        and args[1] == "-c"
+        and isinstance(args[2], str)
+        and args[2].lstrip().startswith(WAIT_STORE)
+    )
 
 
 def nix_jobs(directory: str, owned: Iterable[str] = ()) -> List[Tuple[str, str]]:
@@ -110,7 +126,12 @@ def nix_jobs(directory: str, owned: Iterable[str] = ()) -> List[Tuple[str, str]]
         except (OSError, plistlib.InvalidFileException, ValueError):
             continue
         label = plist.get("Label") if isinstance(plist, dict) else None
-        if isinstance(label, str) and label not in owned and _runs_from_store(plist):
+        if (
+            isinstance(label, str)
+            and label not in owned
+            and label not in KEEP
+            and _runs_from_store(plist)
+        ):
             jobs.append((path, label))
     return jobs
 
@@ -199,6 +220,11 @@ def install_nix_darwin(raw, state: Optional[Dict] = None, root: Optional[bool] =
     root = os.geteuid() == 0 if root is None else root
     ok = True
     for action in plan(root, state):
+        kind, path, _ = action
+        if not ok and kind == "remove" and os.path.basename(path) == "static":
+            # A link left in place still points into /etc/static: keep it working.
+            log(f"nixDarwin: keeping {path}: earlier steps failed", Color.YELLOW)
+            continue
         err = _do(action, root)
         if err:
             log(f"nixDarwin: {err}", Color.RED)

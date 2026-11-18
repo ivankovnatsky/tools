@@ -55,10 +55,18 @@ class PlanTest(unittest.TestCase):
         )
         os.symlink("/opt/homebrew/etc/other", os.path.join(self.etc, "other"))
         self.nix = write_job(
-            self.jobs, "org.nixos.activate-system", ["/bin/sh", "-c", "exec /nix/store/x-start"]
+            self.jobs,
+            "org.nixos.activate-system",
+            ["/bin/sh", "-c", "/bin/wait4path /nix/store && exec /nix/store/x-start"],
         )
         write_job(self.jobs, "systems.determinate.nix-daemon", ["/usr/local/bin/determinate-nixd"])
         write_job(self.jobs, "com.example.ours", ["/nix/store/y/bin/ours"])
+        write_job(self.jobs, "com.example.du", ["/usr/bin/du", "-s", "/nix/store/x"])
+        write_job(
+            self.jobs,
+            "org.nixos.nix-daemon",
+            ["/bin/sh", "-c", "/bin/wait4path /nix/store && exec /nix/store/n/bin/nix-daemon"],
+        )
 
     def plan(self, root=True, state=None):
         return nix_darwin.plan(root, state, etc=self.etc, daemons=self.jobs, agents=self.jobs)
@@ -115,6 +123,24 @@ class PlanTest(unittest.TestCase):
         with mock.patch.object(nix_darwin.os, "rename", side_effect=OSError(13, "denied")):
             self.assertIsNotNone(nix_darwin._do(action, root=True))
         self.assertEqual(os.readlink(link), "/etc/static/zshrc")
+
+    def test_static_kept_after_failure(self):
+        state = {"launchd": {"services": {"com.example.ours": {}}}}
+        real_rename = os.rename
+
+        def rename(src, dst):
+            if dst.endswith("zshrc"):
+                raise OSError(13, "denied")
+            return real_rename(src, dst)
+
+        with (
+            mock.patch.object(nix_darwin, "plan", return_value=self.plan(True, state)),
+            mock.patch.object(nix_darwin, "run_command", return_value=(3, "", "")),
+            mock.patch.object(nix_darwin.sys, "platform", "darwin"),
+            mock.patch.object(nix_darwin.os, "rename", side_effect=rename),
+        ):
+            self.assertFalse(nix_darwin.install_nix_darwin({"takeOver": True}, state, root=True))
+        self.assertTrue(os.path.islink(os.path.join(self.etc, "static")))
 
     def test_bootout_failure_keeps_plist(self):
         action = ("job", self.nix, "org.nixos.activate-system")
