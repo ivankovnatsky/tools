@@ -984,7 +984,7 @@ class FixesTest(TemplatesTestBase):
         with open(os.path.join(b, "app.json"), "w") as f:
             f.write("handwritten-content-here\n")
         rows = self.diff(self.tpl({"a": 2}))
-        self.assertEqual(rows, [replace_row(self.target, "not tracked by tools")])
+        self.assertEqual(rows, [replace_row(self.target, "replaced since tools wrote it")])
         ok, out = self.deploy(self.tpl({"a": 2}))
         self.assertTrue(ok)
         self.assertNotIn("handwritten-content-here", out)
@@ -1053,6 +1053,14 @@ class FixesTest(TemplatesTestBase):
         rows = self.diff(self.tpl({"a": 2}))
         self.assertTrue(rows[0].startswith(f"  ~ update {self.target}"), rows)
         self.assertNotIn("not tracked", rows[0])
+
+    def test_in_place_edit_on_renumbered_device_is_modified(self):
+        self.deploy(self.tpl({"a": 1}))
+        record = self.state["templates"]["installed"][self.target]
+        record["dev"] += 1
+        record["mtime_ns"] += 1
+        rows = self.diff(self.tpl({"a": 2}))
+        self.assertEqual(rows, [replace_row(self.target, "modified since tools wrote it")])
 
     def test_held_removal_is_shown_in_diff(self):
         self.deploy(self.tpl({"a": 1}))

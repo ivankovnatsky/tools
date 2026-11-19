@@ -21,6 +21,7 @@ from tools.fsutil import (
     same_identity,
     trash,
     unmounted_volume,
+    untracked_reason,
 )
 from tools.log import Color, debug, log
 from tools.user import secrets_flow
@@ -245,7 +246,7 @@ def plan_file(
             return FilePlan("unchanged", existing=existing)
         return FilePlan("chmod", existing=existing)
     if not _tracked(target, record):
-        return _replace(target, "not tracked by tools", existing, backup)
+        return _replace(target, untracked_reason(target, record), existing, backup)
     if hashlib.sha256(existing).hexdigest() != record.get("hash"):
         return _replace(target, "modified since tools wrote it", existing, backup)
     return FilePlan("update", existing=existing)

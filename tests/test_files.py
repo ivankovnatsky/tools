@@ -297,11 +297,43 @@ class FilesIdentityTest(unittest.TestCase):
             os.symlink(b, link)
             _write(os.path.join(b, "app.ini"), "fresh = 1\nhandwrittenvalue = 2\n")
             rows = _diff_files(entries, d, state)
-            self.assertEqual(rows, [_replace_row(target, "not tracked by tools")])
+            self.assertEqual(rows, [_replace_row(target, "replaced since tools wrote it")])
             out = io.StringIO()
             with contextlib.redirect_stdout(out), mock.patch("tools.user.files.log") as log:
                 files.install_files(entries, d, state)
             self.assertNotIn("handwrittenvalue", out.getvalue() + repr(log.call_args_list))
+
+    def test_atomic_rename_is_replaced_not_untracked(self):
+        from tools.diff import _diff_files
+
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            _write(os.path.join(d, "src"), "fresh = 1\n")
+            target = os.path.join(d, "settings.toml")
+            entries = [{"source": "src", "target": target}]
+            state = {}
+            with mock.patch("tools.user.files.log"):
+                files.install_files(entries, d, state)
+            # An app rewrites its settings by rename: new inode, same path.
+            tmp = target + ".tmp"
+            _write(tmp, "fresh = 1\napp = 2\n")
+            os.replace(tmp, target)
+            rows = _diff_files(entries, d, state)
+            self.assertEqual(rows, [_replace_row(target, "replaced since tools wrote it")])
+
+    def test_legacy_hash_record_edited_is_modified(self):
+        from tools.diff import _diff_files
+
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            _write(os.path.join(d, "src"), "fresh = 1\n")
+            target = os.path.join(d, "settings.toml")
+            _write(target, "edited = 1\n")
+            entries = [{"source": "src", "target": target}]
+            # Written before inodes were tracked: only a hash, now stale.
+            state = {"files": {target: {"hash": hashlib.sha256(b"old").hexdigest()}}}
+            rows = _diff_files(entries, d, state)
+            self.assertEqual(rows, [_replace_row(target, "modified since tools wrote it")])
 
     def test_identity_kept_for_unchanged_file(self):
         with tempfile.TemporaryDirectory() as d:

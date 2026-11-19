@@ -156,6 +156,15 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(self.read(), b"edited")
         self.assertIn(self.target, self.state["fetch"]["installed"])
 
+    def test_renamed_over_file_is_replaced_not_untracked(self):
+        raw = {self.target: URL}
+        self.deploy(raw)
+        with open(self.target + ".tmp", "wb") as f:
+            f.write(b"edited")
+        os.replace(self.target + ".tmp", self.target)  # new inode, same path
+        why = self.aside("replaced since tools wrote it")
+        self.assertEqual(self.diff(raw), [f"  ~ replace {self.target} <- {URL} ({why})"])
+
     def test_untracked_existing_file_moved_aside(self):
         self.write(b"mine")
         os.chmod(self.target, 0o600)

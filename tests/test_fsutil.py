@@ -11,7 +11,7 @@ import trash_fake
 from tools import fsutil
 
 
-class RefreshDevTest(unittest.TestCase):
+class _FileTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, "secret")
@@ -22,6 +22,8 @@ class RefreshDevTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+
+class RefreshDevTest(_FileTestBase):
     def test_record_without_dev_gains_it(self):
         record = {"ino": self.st.st_ino, "mtime_ns": self.st.st_mtime_ns}
         fsutil.refresh_dev(self.path, record)
@@ -43,6 +45,36 @@ class RefreshDevTest(unittest.TestCase):
         record["dev"] += 1
         record["mtime_ns"] += 1
         self.assertFalse(fsutil.same_identity(self.path, record))
+
+
+class UntrackedReasonTest(_FileTestBase):
+    def test_no_identity_record_is_untracked(self):
+        self.assertEqual(fsutil.untracked_reason(self.path, None), "not tracked by tools")
+        self.assertEqual(fsutil.untracked_reason(self.path, {}), "not tracked by tools")
+
+    def test_hash_only_record_is_modified(self):
+        # Written before inodes were tracked; the hash no longer matches.
+        self.assertEqual(
+            fsutil.untracked_reason(self.path, {"hash": "x"}), "modified since tools wrote it"
+        )
+
+    def test_other_inode_is_replaced(self):
+        record = {"ino": self.st.st_ino + 1, "dev": self.st.st_dev}
+        self.assertEqual(
+            fsutil.untracked_reason(self.path, record), "replaced since tools wrote it"
+        )
+
+    def test_same_inode_on_renumbered_device_is_modified(self):
+        # Edited in place after a remount: no hash to prove the content.
+        record = {
+            "ino": self.st.st_ino,
+            "dev": self.st.st_dev + 1,
+            "mtime_ns": self.st.st_mtime_ns + 1,
+        }
+        self.assertFalse(fsutil.same_identity(self.path, record))
+        self.assertEqual(
+            fsutil.untracked_reason(self.path, record), "modified since tools wrote it"
+        )
 
 
 if __name__ == "__main__":

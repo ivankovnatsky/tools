@@ -601,7 +601,14 @@ def plan(
         elif not current.exists:
             changes.append(Change(s, "create", desired))
         elif current.content != desired and not tracked:
-            changes.append(Change(s, "replace", desired, aside="not tracked by tools"))
+            changes.append(
+                Change(
+                    s,
+                    "replace",
+                    desired,
+                    aside=fsutil.untracked_reason(s.path, installed.get(s.path)),
+                )
+            )
         elif current.content != desired and not fsutil.matches_fingerprint(
             s.path, installed.get(s.path) or {}
         ):

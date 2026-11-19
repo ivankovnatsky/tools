@@ -278,7 +278,7 @@ def _plan_file(e: Entry, record: Dict, update: bool) -> Change:
     if not _tracked(e.target, record):
         if e.sha256 and current == e.sha256:
             return Change(e, "adopt")
-        return Change(e, "replace", "not tracked by tools")
+        return Change(e, "replace", fsutil.untracked_reason(e.target, record))
     why = _why_refetch(e, record, update)
     if e.sha256 and current == e.sha256 and record.get("hash") != e.sha256:
         return Change(e, "adopt")  # already holds the new pin

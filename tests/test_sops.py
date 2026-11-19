@@ -1077,7 +1077,7 @@ class FixesTest(SopsTestBase):
         with open(os.path.join(b, "tok"), "w") as f:
             f.write("hand-written")
         rows = self.diff(raw)
-        why = aside(path, "not tracked by tools")
+        why = aside(path, "replaced since tools wrote it")
         self.assertEqual(rows, [f"  ~ replace {path} (secret; {why})"])
         ok, _ = self.deploy(raw)
         self.assertTrue(ok)

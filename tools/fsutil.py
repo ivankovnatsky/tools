@@ -172,6 +172,23 @@ def same_identity(path: str, record) -> bool:
     return bool(record.get("hash")) and _content_hash(path) == record["hash"]
 
 
+def untracked_reason(path: str, record) -> str:
+    """Why a file failing ``same_identity`` is replaced: without a record,
+    tools never wrote it; with a hash-only record (from before inodes were
+    tracked), its content no longer matches; with an identity record, the
+    file was since swapped for another (say, an app's atomic rename), or,
+    same inode on a renumbered device, edited in place where no hash can
+    prove otherwise."""
+    if not isinstance(record, dict):
+        return "not tracked by tools"
+    if "ino" not in record:
+        return "modified since tools wrote it" if record.get("hash") else "not tracked by tools"
+    fp = fingerprint(path)
+    if fp is not None and fp["ino"] == record["ino"]:
+        return "modified since tools wrote it"
+    return "replaced since tools wrote it"
+
+
 def refresh_dev(path: str, record: Dict) -> None:
     """Record the current device number of a file ``same_identity`` accepted,
     including records written before ``dev`` was tracked."""

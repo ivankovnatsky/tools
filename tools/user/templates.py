@@ -315,7 +315,7 @@ def plan(
         elif not current.exists:
             ch.action = "create"
         elif current.content != desired and not tracked:
-            ch.action, ch.aside = "replace", "not tracked by tools"
+            ch.action, ch.aside = "replace", fsutil.untracked_reason(t.target, record)
         elif current.content != desired and not fsutil.matches_fingerprint(t.target, record):
             ch.action, ch.aside = "replace", "modified since tools wrote it"
         elif current.content != desired:
