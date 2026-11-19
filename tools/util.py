@@ -168,9 +168,8 @@ def checked_section(section: str, section_config) -> bool:
 
 
 def package_entries(section: str, packages) -> tuple[Dict[str, Dict], List[str]]:
-    """`<section>.packages` with bare keys (None) as {}, plus config errors."""
-    if packages is None:
-        return {}, []
+    """`<section>.packages` with bare keys (None) as {}, plus config errors. A null
+    `packages` is an error: read as {}, it would remove every tracked package."""
     if not isinstance(packages, dict):
         return {}, [f"{section}.packages must be a mapping, got {type(packages).__name__}"]
     entries: Dict[str, Dict] = {}

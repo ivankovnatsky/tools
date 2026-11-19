@@ -98,7 +98,7 @@ def run_mgmt(
                 log(f"mgmt: unknown service {name!r}", Color.RED)
             ok = False
     for name, module in SERVICES.items():
-        if config.get(name) is None:  # absent or null: unmanaged
+        if config.get(name) is None:  # absent: unmanaged (null is held earlier)
             continue
         section_state = state.setdefault(name, {})
         ctx = make(name, apply=apply, state=section_state, fingerprint_key=fingerprint_key)

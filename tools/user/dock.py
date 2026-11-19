@@ -193,7 +193,8 @@ def parse_dock(raw) -> Tuple[DockSpec, List[str]]:
         spec.restart = restart
 
     for name, key in SECTIONS.items():
-        # A bare `apps:` (every entry commented out) is unmanaged; only `[]` empties it.
+        # Absent: unmanaged. A bare `apps:` is held earlier as a config error
+        # (config.null_section_errors); only `[]` empties it.
         entries = raw.get(name)
         if entries is None:
             continue

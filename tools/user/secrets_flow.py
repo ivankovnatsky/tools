@@ -191,6 +191,10 @@ def _link_owned_paths(links_raw, skills_raw, state: Dict, config_dir: str):
     return link_paths, trees
 
 
+# The sections _movable moves records between.
+MOVE_SECTIONS = frozenset({"files", "fetch", "sops", "templates"})
+
+
 def _movable():
     """Sections a path can move between: name -> (state store, module).
 

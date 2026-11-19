@@ -192,6 +192,12 @@ resolved relative to the including file and merged underneath it.
 Each file may only use known top-level keys (every section, plus `stateFile`,
 `paths`, `vars`, `include`); anything else fails the load, naming the file.
 
+A section, or a key in it listing what it manages (`uv.packages`,
+`launchd.agents`, `brew.casks`, `dock.apps`, ...), left with nothing under it
+is null, a config error that holds that section in `deploy` and `diff`: a key
+whose entries were all commented out never removes anything. An absent key
+manages nothing, and `{}` or `[]` removes everything tracked.
+
 Notable keys:
 
 - `stateFile` — where ownership state lives (default
@@ -802,7 +808,7 @@ Behaviour:
 - Daemon log paths must be absolute, normalized, without `..`, under `/var/log` or the default `/tmp/log/launchd`. As root, a daemon's log dir (and each log file's parent) must not be a symlink, and every existing component must be root-owned and not group/world-writable, except a root-owned sticky ancestor such as `/tmp`, checked at plan and again at apply; missing components are created one `mkdir` at a time and each must come out a root-only directory. A failing daemon is not written or loaded; if it is `disabled: true`, it is still disabled and booted out (plist and logs left untouched).
 - State records only steps that succeeded; a failed activation shows as `retry` in `tools diff`.
 - `tools diff` lists every change deploy would make to tracked jobs: creates, updates, adoptions, loads, restarts, removals, and removals held by a config error (`! held: remove ...`).
-- `launchd:`, `launchd.agents` or `launchd.daemons` that is not a mapping (e.g. `[]`, `false`) is a config error that holds every change; only an absent or null key means "no jobs".
+- `launchd:`, `launchd.agents` or `launchd.daemons` that is not a mapping (e.g. `[]`, `false`) is a config error that holds every change; only an absent key means "no jobs" (a null one is a config error, see [Config](#config)).
 - `tools status` shows one row per domain and label (configured agents and daemons, plus what this run's state tracks).
 - Each domain has its own state (root's for daemons, the user's for agents): moving a job from `agents` to `daemons` is created as root and then removed from the user domain by the same `sudo tools deploy`.
 - A plist tools didn't write is never replaced (an identical one is adopted) and never removed.
@@ -945,9 +951,9 @@ dock:
   restart: false                     # default, as dockutil --no-restart
 ```
 
-- Only declared sections are managed; `apps: []` empties one, bare `apps:`
-  does not. Comparison is by resolved path, spacer kind and the folder options
-  you set. Tiles, folder defaults (auto, folder, date modified) and
+- Only declared sections are managed; `apps: []` empties one, a bare `apps:`
+  is a config error that holds the Dock. Comparison is by resolved path,
+  spacer kind and the folder options you set. Tiles, folder defaults (auto, folder, date modified) and
   `/Applications` path resolution follow dockutil.
 - A missing app keeps its live tile; a section with no existing paths is left
   untouched.

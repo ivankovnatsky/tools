@@ -141,12 +141,10 @@ def plan_installs(
         elif update and pkg_unpinned(pkg_info):
             actions.append((pkg, "upgrade"))
     units, unit_errors = secrets_flow.parse_package_units("uv", packages)
-    return {
-        "actions": actions,
-        "units": units,
-        "unit_errors": unit_errors,
-        **_blocked(packages, paths, state, files_declared),
-    }
+    blocked = _blocked(packages, paths, state, files_declared)
+    # Deploy skips a package with a restartUnits error, so its files copy stays.
+    blocked["takeover"] = {k: v for k, v in blocked["takeover"].items() if k in units}
+    return {"actions": actions, "units": units, "unit_errors": unit_errors, **blocked}
 
 
 def plan(

@@ -259,6 +259,138 @@ class DeployGatingTest(unittest.TestCase):
             self.assertFalse(self._deploy(config, {}))
         mcp.assert_not_called()
 
+    # A bare key under a section is null: read as empty, it removed everything tracked.
+    NULL_CASES = (
+        ({"uv": {"packages": None}}, "install_uv_packages", "uv.packages must be a mapping"),
+        ({"go": {"packages": None}}, "install_go_packages", "go.packages must be a mapping"),
+        ({"files": None}, "install_files", "files must be a list"),
+        ({"links": None}, "install_links", "links must be a list"),
+        ({"skills": None}, "install_skills", "skills must be a mapping"),
+        ({"skills": {"enable": None}}, "install_skills", "skills.enable must be a list"),
+        ({"gitRepos": None}, "install_git_repos", "gitRepos must be a mapping"),
+        ({"brew": {"casks": None}}, "install_brew_packages", "brew.casks must be a list"),
+        ({"launchd": {"agents": None}}, "install_launchd", "launchd.agents must be a mapping"),
+        ({"dock": {"apps": None}}, "install_dock", "dock.apps must be a list"),
+        ({"defaults": {"user": None}}, "install_defaults", "defaults.user must be a mapping"),
+        ({"mgmt": {"arr": None}}, "release_mgmt", "mgmt.arr must be a mapping"),
+    )
+    TRACKED = {
+        "uv": {"packages": {"zz": {"installed": True}}},
+        "go": {"packages": {"zz": {"installed": True}}},
+        "files": {"/tmp/zz": {"hash": "h"}},
+        "links": {"installed": {"/tmp/zz": {}}},
+        "skills": {"installed": {"zz": {}}},
+        "gitRepos": {"installed": ["/tmp/zz"]},
+        "brew": {"casks": ["zz"]},
+        "launchd": {"services": {"zz": {}}},
+        "dock": {"sections": {"persistent-apps": {}}},
+        "defaults": {"managed": {"user": {"zz": {"k": {}}}}},
+        "mgmt": {"arr": {}},
+    }
+
+    def test_null_subsection_holds_the_section(self):
+        for config, installer, error in self.NULL_CASES:
+            with self.subTest(config):
+                with (
+                    mock.patch.object(cli, installer, return_value=True) as install,
+                    mock.patch.object(cli, "log") as log,
+                ):
+                    self.assertFalse(self._deploy(config, dict(self.TRACKED), tuple(config)))
+                install.assert_not_called()
+                logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+                self.assertIn(f"{error}, got NoneType", logged)
+
+    def test_null_section_leaves_other_sections_running(self):
+        with (
+            mock.patch.object(cli, "install_files") as files,
+            mock.patch.object(cli, "install_links", return_value=True) as links,
+            mock.patch.object(cli, "log"),
+        ):
+            config = {"files": None, "links": []}
+            self.assertFalse(self._deploy(config, dict(self.TRACKED), ("files", "links")))
+        files.assert_not_called()
+        links.assert_called_once_with([], mock.ANY)
+
+    def test_explicit_empty_and_absent_still_remove(self):
+        for config, scope, installer, arg in (
+            ({"uv": {"packages": {}}}, "uv", "install_uv_packages", {}),
+            ({"uv": {}}, "uv", "install_uv_packages", {}),
+            ({"files": []}, "files", "install_files", []),
+            ({}, "files", "install_files", []),
+            ({"links": []}, "links", "install_links", []),
+        ):
+            with self.subTest(config):
+                with mock.patch.object(cli, installer, return_value=True) as install:
+                    self.assertTrue(self._deploy(config, dict(self.TRACKED), (scope,)))
+                self.assertEqual(install.call_args.args[0], arg)
+
+    def test_null_files_skips_moves_and_uv_takeover(self):
+        config = {"files": None, "sops": {}, "uv": {"packages": {"x": {}}}}
+        # files out of scope too: its null list must not read as "declares nothing".
+        for scope, ok in (
+            (("files", "sops", "uv"), False),
+            (("sops", "uv"), True),
+            (("uv",), True),
+        ):
+            with (
+                self.subTest(scope),
+                mock.patch.object(cli.secrets_flow, "move_between_sections") as moves,
+                mock.patch.object(cli, "install_uv_packages", return_value=True) as uv,
+                mock.patch.object(cli, "log"),
+            ):
+                self.assertEqual(self._deploy(config, {}, scope), ok)
+            moves.assert_not_called()
+            self.assertIsNone(uv.call_args.args[4])
+
+    def test_diff_null_files_out_of_scope_skips_moves_and_uv_takeover(self):
+        from tools import diff
+
+        config = {"files": None, "sops": {}, "uv": {"packages": {"x": {}}}}
+        with tempfile.TemporaryDirectory() as d:
+            save_json(f"{d}/s.json", {})
+            with (
+                mock.patch.object(diff.secrets_flow, "move_between_sections") as moves,
+                mock.patch.object(diff, "_diff_uv", return_value=[]) as uv,
+                mock.patch.object(diff, "log"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                diff.show_diff({**config, "stateFile": f"{d}/s.json"}, d, ("sops", "uv"))
+        moves.assert_not_called()
+        self.assertIsNone(uv.call_args.args[4])
+
+    def test_null_system_files_hold_root_files(self):
+        with (
+            mock.patch.object(cli, "install_files") as files,
+            mock.patch.object(cli, "log") as log,
+        ):
+            ok = cli._run_root_sections({"files": None}, "/tmp", {"files": {}}, {"files"})
+        self.assertFalse(ok)
+        files.assert_not_called()
+        self.assertIn("files must be a list", log.call_args.args[0])
+
+    def test_diff_shows_null_error_instead_of_removals(self):
+        from tools import diff
+
+        for config, scope, removal in (
+            ({"uv": {"packages": None}}, ("uv",), "remove zz"),
+            ({"files": None}, ("files",), "remove /tmp/zz"),
+            ({"gitRepos": None}, ("gitRepos",), "/tmp/zz"),
+        ):
+            with self.subTest(config), tempfile.TemporaryDirectory() as d:
+                save_json(f"{d}/s.json", self.TRACKED)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), mock.patch.object(diff, "log") as log:
+                    self.assertFalse(
+                        diff.show_diff({**config, "stateFile": f"{d}/s.json"}, d, scope)
+                    )
+                rows = out.getvalue() + "".join(str(c.args[0]) for c in log.call_args_list)
+                self.assertIn("got NoneType", rows)
+                self.assertNotIn(removal, rows)
+
+        rows = diff._root_sections({"files": None}, "/tmp", ("files",), {"files": {}})
+        self.assertEqual(rows[0][0], "files")
+        self.assertIn("files must be a list, got NoneType", rows[0][1][0])
+
 
 class RestartUnitsWiringTest(unittest.TestCase):
     def _deploy(self, config, state, daemons=None):

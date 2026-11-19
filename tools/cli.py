@@ -12,6 +12,7 @@ from tools.config import (
     deep_merge,
     load_config,
     load_config_dir,
+    null_section_errors,
     pin_hostname,
     resolve_config,
 )
@@ -592,6 +593,15 @@ def _finish_restarts(restarts: list, deferred: list | None) -> None:
         deferred.extend(restarts)
 
 
+def _hold_null_sections(config: dict, active: set) -> set:
+    """Log each active section's null config errors; those sections must not run."""
+    held = {s: errors for s, errors in null_section_errors(config).items() if s in active}
+    for errors in held.values():
+        for err in errors:
+            log(err, Color.RED)
+    return set(held)
+
+
 def _run_root_sections(
     config: dict,
     config_dir: str,
@@ -606,7 +616,9 @@ def _run_root_sections(
     settings; nothing in user space. ``owed`` is the user's state: daemons it owes a
     restartUnits restart are restarted here, once, and settled there. ``full_state``
     keeps the records --only set aside, so nixDarwin still sees every tracked job."""
-    success = True
+    held = _hold_null_sections(config, active & set(privilege.ROOT_SECTIONS))
+    active = active - held
+    success = not held
     # First: nix-darwin's /etc links and daemons go before files and daemons replace them.
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
         success &= install_nix_darwin(
@@ -659,13 +671,18 @@ def _run_sections(
 ) -> bool:
     """With --only, ``config`` is the narrowed config and ``view`` holds the state records
     set aside; ownership is still judged on ``full_config`` and the whole state."""
-    success = True
+    held = _hold_null_sections(config, active)
+    active = active - held
+    success = not held
     full = full_config if full_config is not None else config
+    # Null sections in or out of scope: their records must not be read as empty.
+    null = set(null_section_errors(full))
 
-    # Moves rewrite records of any section, so a narrowed run leaves them to a full one.
+    # Moves rewrite records of any section, so a narrowed run leaves them to a full one,
+    # and a null section's records stay where they are.
     moves = (
         []
-        if view
+        if view or null & secrets_flow.MOVE_SECTIONS
         else secrets_flow.move_between_sections(
             state,
             files_entries=config.get("files"),
@@ -811,7 +828,9 @@ def _run_sections(
         if uv_packages or state.get("uv", {}).get("packages"):
             # --only sets files records aside: leave a stale files copy to a full run.
             files_declared = (
-                None if view else files_declared_targets(full.get("files"), config_dir, conflicts)
+                None
+                if view or "files" in null
+                else files_declared_targets(full.get("files"), config_dir, conflicts)
             )
             success &= install_uv_packages(uv_packages, paths, state, update, files_declared)
 

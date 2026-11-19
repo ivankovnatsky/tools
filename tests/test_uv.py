@@ -274,6 +274,18 @@ class UvFilesTakeoverTest(unittest.TestCase):
         self.assertIn(f"take over {self.target}", out.getvalue())
         self.assertNotIn(f"- remove {self.target}", out.getvalue())
 
+    def test_unit_error_skips_takeover_in_preview_and_deploy(self):
+        self.packages["claude-statusline"]["restartUnits"] = "launchd:x"
+        changes = _diff_uv(
+            self.packages, self.paths, self.state, files_declared=files.Declared([], [])
+        )
+        self.assertNotIn(f"  ~ take over {self.target} from files (old copy to Trash)", changes)
+        ok, trash, cmds = self.deploy()
+        self.assertFalse(ok)
+        trash.assert_not_called()
+        self.assertEqual(cmds, [])
+        self.assertIn(self.target, self.state["files"])
+
 
 class UvCliFilesDeclaredTest(unittest.TestCase):
     def run_sections(self, view):

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from tools import privilege, selection
-from tools.config import SECTIONS
+from tools.config import SECTIONS, null_section_errors
 from tools.fsutil import respell
 from tools.log import Color, log
 from tools.mgmt import diff_mgmt
@@ -102,6 +102,14 @@ def _bad_section(section: str, config: Dict, sections: List) -> bool:
     if rows:
         sections.append((section, rows))
     return bool(rows)
+
+
+def _held_sections(config: Dict, active: set, sections: List) -> set:
+    """Rows for each active section's null config errors; deploy runs nothing in it."""
+    held = {s: errors for s, errors in null_section_errors(config).items() if s in active}
+    for section, errors in held.items():
+        sections.append((section, [f"  ! {err}" for err in errors]))
+    return set(held)
 
 
 def _released(key: str, old, new, tracked, desired) -> List[str]:
@@ -660,6 +668,9 @@ def show_diff(
     paths = config.get("paths", {})
 
     sections = []
+    active -= _held_sections(config, active, sections)
+    # Null sections in or out of scope: their records must not be read as empty.
+    null = set(null_section_errors(full))
     taken_over: set = set()
 
     def registry():
@@ -716,7 +727,9 @@ def show_diff(
                 paths,
                 state,
                 update,
-                None if view else files_declared_targets(full.get("files"), config_dir, registry()),
+                None
+                if view or "files" in null
+                else files_declared_targets(full.get("files"), config_dir, registry()),
                 taken_over,
             )
             if changes:
@@ -782,7 +795,7 @@ def show_diff(
     # In memory only: diff never saves state. A narrowed deploy makes no moves.
     moves = (
         []
-        if view
+        if view or null & secrets_flow.MOVE_SECTIONS
         else secrets_flow.move_between_sections(
             state,
             files_entries=config.get("files"),
@@ -967,6 +980,7 @@ def _root_sections(
     settings; nothing in user space."""
     active = set(scope) if scope else set(privilege.ROOT_SECTIONS)
     sections = []
+    active -= _held_sections(config, active & set(privilege.ROOT_SECTIONS), sections)
     if "nixDarwin" in active and nix_darwin_has_work(config.get("nixDarwin")):
         owned = full_state if full_state is not None else state
         changes = diff_nix_darwin(config.get("nixDarwin"), owned, root=True)

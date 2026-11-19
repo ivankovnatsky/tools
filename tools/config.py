@@ -44,6 +44,77 @@ _RENAMED_KEYS = {"services": "mgmt"}
 
 _PACKAGE_SECTIONS = ("bun", "npm", "uv", "go", "cargo", "pi")
 
+# Keys whose value is what a section manages: it drops what it tracks but no
+# longer finds there. A YAML key with nothing under it (`files:`, `uv:
+# {packages: }`) is null, which sections read as empty, removing everything
+# tracked. Paths are relative to the section; () is the section, "*" any key.
+_MAP, _LIST = "mapping", "list"
+_MANAGED_KEYS: Dict[str, Dict[tuple, str]] = {
+    **{s: {(): _MAP, ("packages",): _MAP} for s in _PACKAGE_SECTIONS},
+    "mcp": {(): _MAP, ("servers",): _MAP},
+    "curlShell": {(): _MAP},
+    "gitRepos": {(): _MAP},
+    "sops": {(): _MAP, ("secrets",): _MAP},
+    "templates": {(): _MAP},
+    "files": {(): _LIST},
+    "fetch": {(): _MAP},
+    "env": {(): _MAP, ("vars",): _MAP, ("path",): _LIST},
+    "skills": {(): _MAP, ("sources",): _MAP, ("targets",): _LIST, ("enable",): _LIST},
+    "links": {(): _LIST},
+    "brew": {
+        (): _MAP,
+        ("brews",): _LIST,
+        ("casks",): _LIST,
+        ("taps",): _LIST,
+        ("masApps",): _MAP,
+        ("trust",): _MAP,
+        ("trust", "taps"): _LIST,
+    },
+    "ollamaModels": {(): _MAP, ("models",): _LIST},
+    "flatpak": {(): _MAP, ("packages",): f"{_LIST} or {_MAP}", ("remotes",): _MAP},
+    "settingsctl": {
+        (): _MAP,
+        ("fullDiskAccess",): _LIST,
+        ("accessibility",): _LIST,
+        ("loginItems",): _LIST,
+    },
+    "users": {(): _MAP},
+    "plist": {(): _MAP},
+    "launchd": {(): _MAP, ("agents",): _MAP, ("daemons",): _MAP},
+    "defaults": {(): _MAP, ("user",): _MAP, ("currentHost",): _MAP, ("system",): _MAP},
+    "dock": {(): _MAP, ("apps",): _LIST, ("others",): _LIST},
+    # A null service forgets its state.
+    "mgmt": {(): _MAP, ("*",): _MAP},
+}
+
+
+def _nulls(value: Any, path: tuple, where: str) -> List[str]:
+    """Dotted names of the nulls ``path`` reaches under ``value``."""
+    if not path:
+        return [where] if value is None else []
+    if not isinstance(value, dict):
+        return []
+    head, rest = path[0], path[1:]
+    keys = list(value) if head == "*" else [head] if head in value else []
+    return [name for k in keys for name in _nulls(value[k], rest, f"{where}.{k}")]
+
+
+def null_section_errors(config: Dict[str, Any]) -> Dict[str, List[str]]:
+    """{section: errors} for each null where a section expects what it manages.
+
+    Each such section is held, removals included: an absent key still means
+    none and `{}`/`[]` still removes everything, but a bare key left after
+    commenting out its entries must not."""
+    held: Dict[str, List[str]] = {}
+    for section, keys in _MANAGED_KEYS.items():
+        for path, kind in keys.items():
+            for where in _nulls(config.get(section, {}), path, section):
+                empty = "{}" if kind == _MAP else "[]"
+                held.setdefault(section, []).append(
+                    f"{where} must be a {kind}, got NoneType (use {empty} for none)"
+                )
+    return held
+
 
 class ConfigError(Exception):
     """Raised when the config cannot be resolved into a usable desired state."""

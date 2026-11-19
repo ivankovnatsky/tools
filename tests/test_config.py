@@ -211,5 +211,52 @@ class TopLevelKeysTest(unittest.TestCase):
                 load_config(host)
 
 
+class NullSectionErrorsTest(unittest.TestCase):
+    def test_absent_and_explicit_empty_are_fine(self):
+        self.assertEqual(config_mod.null_section_errors({}), {})
+        config = {
+            "uv": {"packages": {}},
+            "files": [],
+            "brew": {"casks": [], "trust": {"taps": []}},
+            "mgmt": {"arr": {}},
+            "dock": {"apps": []},
+        }
+        self.assertEqual(config_mod.null_section_errors(config), {})
+
+    def test_yaml_bare_keys_are_errors(self):
+        import yaml
+
+        config = yaml.safe_load(
+            "uv:\n  packages:\nfiles:\nbrew:\n  trust:\n    taps:\nmgmt:\n  arr:\n"
+            "sops:\n  secrets:\n    a:\n"
+        )
+        held = config_mod.null_section_errors(config)
+        self.assertEqual(
+            held,
+            {
+                "uv": ["uv.packages must be a mapping, got NoneType (use {} for none)"],
+                "files": ["files must be a list, got NoneType (use [] for none)"],
+                "brew": ["brew.trust.taps must be a list, got NoneType (use [] for none)"],
+                "mgmt": ["mgmt.arr must be a mapping, got NoneType (use {} for none)"],
+            },
+        )
+
+    def test_null_values_that_mean_defaults_are_not_errors(self):
+        # A bare package or secret name installs with defaults; a null defaults
+        # value is unmanaged.
+        config = {
+            "uv": {"packages": {"ruff": None}},
+            "sops": {"secrets": {"a": None}},
+            "defaults": {"user": {"d": {"k": None}}},
+        }
+        self.assertEqual(config_mod.null_section_errors(config), {})
+
+    def test_every_section_but_nix_darwin_is_checked(self):
+        checked = set(config_mod._MANAGED_KEYS)
+        self.assertEqual(set(SECTIONS) - checked, {"nixDarwin"})
+        for section in checked:
+            self.assertIn(section, config_mod.null_section_errors({section: None}))
+
+
 if __name__ == "__main__":
     unittest.main()
