@@ -428,6 +428,8 @@ def _diff_files(
                 changes.append(f"  + create directory {target}")
             elif not _is_real_dir(target):
                 changes.append(f"  ! {target} exists and is not a directory")
+                if e.on_update:
+                    held_updates.add(e.on_update)
                 continue
             elif desired_mode is not None and stat.S_IMODE(os.lstat(target).st_mode) != (
                 desired_mode
@@ -439,6 +441,8 @@ def _diff_files(
                     src_bytes = f.read()
             except OSError:
                 changes.append(f"  ? cannot read source {source}")
+                if e.on_update:
+                    held_updates.add(e.on_update)
                 continue
             source_mode = stat.S_IMODE(os.stat(source).st_mode)
             effective_mode = desired_mode if desired_mode is not None else source_mode
@@ -454,6 +458,8 @@ def _diff_files(
                 changes.append(f"  + create {target}")
             elif fp.action == "error":
                 changes.append(f"  ! {fp.reason}")
+                if e.on_update:
+                    held_updates.add(e.on_update)
                 continue
             elif fp.action == "replace":
                 note = (

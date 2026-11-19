@@ -73,6 +73,16 @@ class UpdatePreviewTest(unittest.TestCase):
             ["  ~ run onUpdate: true"],
         )
 
+    def test_files_on_update_held_when_entry_fails(self):
+        target = os.path.join(self.tmp, "d")
+        with open(target, "w") as f:
+            f.write("x\n")
+        entries = [{"target": target, "directory": True, "onUpdate": "true"}]
+        self.assertEqual(
+            diff_mod._diff_files(entries, self.tmp, {}, update=True),
+            [f"  ! {target} exists and is not a directory"],
+        )
+
     def test_fetch_refetch(self):
         target = os.path.join(self.tmp, "f")
         raw = {target: {"url": URL}}
