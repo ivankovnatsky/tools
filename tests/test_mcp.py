@@ -396,5 +396,48 @@ class McpRuntimePlaceholderTest(unittest.TestCase):
         self.assertIn("${API_KEY}", repr(state))
 
 
+class McpConfigErrorsTest(unittest.TestCase):
+    def test_valid_config_has_no_errors(self):
+        server = {"scope": "user", "transport": "http", "url": "u", "headers": ["A: b"]}
+        self.assertEqual(mcp.config_errors({"servers": {"x": server, "y": {"command": "c"}}}), [])
+        self.assertEqual(mcp.config_errors({}), [])
+
+    def test_null_section_or_servers_is_an_error(self):
+        self.assertIn("mcp must be a mapping, got NoneType", mcp.config_errors(None)[0])
+        errors = mcp.config_errors({"servers": None})
+        self.assertIn("mcp.servers must be a mapping, got NoneType", errors[0])
+
+    def test_unknown_keys_are_errors(self):
+        errors = mcp.config_errors(
+            {"serverz": {}, "servers": {"x": {"url": "u", "header": ["A: b"], "secretPaths": {}}}}
+        )
+        self.assertEqual(len(errors), 2)
+        self.assertIn("mcp: unknown keys ['serverz']", errors[0])
+        self.assertIn("mcp.servers.x: unknown keys ['header', 'secretPaths']", errors[1])
+        self.assertIn("secretPaths was removed", errors[1])
+
+    def test_non_mapping_server_is_an_error(self):
+        self.assertIn("must be a mapping", mcp.config_errors({"servers": {"x": None}})[0])
+
+    def test_diff_shows_errors_instead_of_plan(self):
+        config = {"mcp": {"servers": {"x": {"url": "u", "header": ["A: b"]}}}}
+        with mock.patch.object(diff_mod, "_diff_mcp") as plan:
+            sections = []
+            for name, rows in self._sections(config):
+                sections.append((name, rows))
+        plan.assert_not_called()
+        self.assertEqual(sections[0][0], "mcp")
+        self.assertIn("  ! mcp.servers.x: unknown keys ['header']", sections[0][1][0])
+
+    def _sections(self, config):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            config = {**config, "stateFile": f"{d}/state.json"}
+            with mock.patch.object(diff_mod, "_print_sections", return_value=True) as printed:
+                diff_mod.show_diff(config, d, ("mcp",))
+        return printed.call_args.args[0]
+
+
 if __name__ == "__main__":
     unittest.main()

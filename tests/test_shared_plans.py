@@ -10,6 +10,7 @@ from unittest import mock
 
 from tools import diff as diff_mod
 from tools.user import bun, cargo, git_repos, go, mcp, npm, pi, uv
+from tools.util import PACKAGE_ENTRY_KEYS
 
 UNIT = "launchd:org.example.svc"
 BAD_UNITS = {"restartUnits": "launchd:x"}
@@ -64,14 +65,19 @@ class SharedPlanTest(unittest.TestCase):
             out.update(results[0])
         return out
 
-    def packages(self):
-        return {
+    def packages(self, section=None):
+        packages = {
             "keep": {"binary": "k"},
             "bumped": {"version": "2", "restartUnits": [UNIT]},
             "loose": {},
             "new": {},
             "bad": BAD_UNITS,
         }
+        if section is None:
+            return packages
+        # Only the keys the section reads: the rest are config errors.
+        allowed = PACKAGE_ENTRY_KEYS[section]
+        return {n: {k: v for k, v in i.items() if k in allowed} for n, i in packages.items()}
 
     def tracked(self):
         return {
@@ -137,7 +143,7 @@ class SharedPlanTest(unittest.TestCase):
             with self.subTest(section):
                 paths = {key: self.bin, "nodejs": "/node", "bun": "/bun"}
                 state = {section: {"prefix": self.bin, "packages": self.tracked()}}
-                packages = self.packages()
+                packages = self.packages(section)
                 rec = Recorder()
                 with mock.patch.object(module, "run_command", rec):
                     p = self.assert_same_plan(
@@ -179,7 +185,7 @@ class SharedPlanTest(unittest.TestCase):
     def test_cargo(self):
         paths = {"cargoRoot": self.tmp}
         state = {"cargo": {"context": f"{self.tmp}|", "root": self.tmp, "packages": self.tracked()}}
-        packages = self.packages()
+        packages = self.packages("cargo")
         rows = diff_mod._diff_cargo(packages, paths, copy.deepcopy(state), True)
         rec = self.patch(cargo, "run_command", Recorder())
         self.patch(cargo.shutil, "which", return_value="/cargo")
@@ -197,7 +203,7 @@ class SharedPlanTest(unittest.TestCase):
 
     def test_pi(self):
         state = {"pi": {"packages": self.tracked()}}
-        packages = {k: v for k, v in self.packages().items() if k != "bad"}
+        packages = {k: v for k, v in self.packages("pi").items() if k != "bad"}
         rows = diff_mod._diff_pi(packages, {}, copy.deepcopy(state))
         rec = self.patch(pi, "run_command", Recorder())
         self.patch(pi, "resolve_pi_cli", return_value="/pi")

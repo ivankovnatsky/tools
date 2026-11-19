@@ -186,6 +186,30 @@ class TopLevelKeysTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
         self.assertIn("'services'", log.call_args[0][0])
 
+    def test_yaml_syntax_error_is_a_config_error(self):
+        from tools import cli
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.yaml")
+            _write(path, "files: [\n")
+
+            with self.assertRaisesRegex(ConfigError, path):
+                load_config(path)
+            with mock.patch.object(cli, "log") as log, self.assertRaises(SystemExit):
+                cli._load_merged_config([path])
+
+        self.assertIn(f"Config error in {path}", log.call_args[0][0])
+
+    def test_included_non_mapping_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            inc = os.path.join(d, "inc.yaml")
+            _write(inc, "- a\n- b\n")
+            host = os.path.join(d, "h.yaml")
+            _write(host, "include: [inc.yaml]\n")
+
+            with self.assertRaisesRegex(ConfigError, f"{inc}: top level must be a mapping"):
+                load_config(host)
+
 
 if __name__ == "__main__":
     unittest.main()

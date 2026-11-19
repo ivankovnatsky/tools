@@ -467,9 +467,10 @@ skills:
   never overwritten, a copy modified since tools wrote it is neither updated
   nor removed, and removals only run when every source fetched and every
   entry resolved.
-- The `linkTargets` option was removed. Symlinks it recorded in state are
-  forgotten on the next fully resolved deploy (`~ forget` in diff) and left in
-  place on disk; manage them with `links:` or delete them by hand.
+- The `linkTargets` option was removed and is now a config error. Symlinks it
+  recorded in state are forgotten on the next fully resolved deploy (`~ forget`
+  in diff) and left in place on disk; manage them with `links:` or delete them
+  by hand.
 
 ## Links
 

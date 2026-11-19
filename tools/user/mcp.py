@@ -6,6 +6,40 @@ from typing import Dict, Optional, Set
 from tools.log import Color, debug, log
 from tools.util import run_command
 
+SECTION_KEYS = ("servers",)
+# What install_mcp_servers reads to register a server.
+SERVER_KEYS = ("command", "args", "url", "transport", "scope", "headers")
+_REMOVED_KEYS = {"secretPaths": "secretPaths was removed"}
+
+
+def config_errors(mcp_config) -> list:
+    """Config errors for the `mcp` section; any error holds the whole section, so a
+    typo (`header:`) never registers a server without what it names. An absent
+    section is {}; a bare `mcp:` or `servers:` is None and an error."""
+    if not isinstance(mcp_config, dict):
+        return [f"mcp must be a mapping, got {type(mcp_config).__name__}"]
+    errors = []
+    unknown = sorted((k for k in mcp_config if k not in SECTION_KEYS), key=str)
+    if unknown:
+        errors.append(f"mcp: unknown keys {unknown} (expected {list(SECTION_KEYS)})")
+    if "servers" not in mcp_config:
+        return errors
+    servers = mcp_config["servers"]
+    if not isinstance(servers, dict):
+        return errors + [f"mcp.servers must be a mapping, got {type(servers).__name__}"]
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            errors.append(f"mcp.servers.{name} must be a mapping, got {type(server).__name__}")
+            continue
+        unknown = sorted((k for k in server if k not in SERVER_KEYS), key=str)
+        if unknown:
+            removed = "".join(f"; {_REMOVED_KEYS[k]}" for k in unknown if k in _REMOVED_KEYS)
+            errors.append(
+                f"mcp.servers.{name}: unknown keys {unknown} (expected {list(SERVER_KEYS)})"
+                f"{removed}"
+            )
+    return errors
+
 
 def get_installed_mcp_servers(claude_cli: str, env: Dict = None) -> Optional[Set[str]]:
     """Servers currently registered, or None when the CLI cannot list them.

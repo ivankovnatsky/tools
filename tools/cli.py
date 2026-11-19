@@ -66,7 +66,7 @@ from tools.user.launchd import (
 from tools.user.links import has_work as links_has_work
 from tools.user.links import install_links
 from tools.user.links import resolve as links_resolve
-from tools.user.mcp import install_mcp_servers
+from tools.user.mcp import config_errors, install_mcp_servers
 from tools.user.nix_darwin import has_work as nix_darwin_has_work
 from tools.user.nix_darwin import install_nix_darwin
 from tools.user.npm import install_npm_packages
@@ -83,6 +83,7 @@ from tools.user.skills import source_root as skills_source_root
 from tools.user.users import has_work as users_has_work
 from tools.user.users import install_users
 from tools.user.uv import install_uv_packages
+from tools.util import PACKAGE_SECTION_KEYS, checked_section
 from tools.watch import is_excluded, is_watched, log_files, run_in_tmux, snapshot, watch_loop, wlog
 
 
@@ -119,10 +120,6 @@ def _load_merged_config(config_paths: list[str], sources: list | None = None) ->
             ValueError,
         ) as exc:
             log(f"Config error in {config_path}: {exc}", Color.RED)
-            sys.exit(1)
-        if not isinstance(loaded, dict):
-            # deep_merge on a list/str would die with a raw AttributeError.
-            log(f"Config error in {config_path}: top level must be a mapping", Color.RED)
             sys.exit(1)
         config = deep_merge(config, loaded)
     try:
@@ -788,43 +785,54 @@ def _run_sections(
     # bun/npm index paths['bun'] and paths['nodejs'] directly, so calling them
     # with nothing configured raises KeyError on a machine show_diff calls
     # clean. Gate them like uv/go: run only when there is work or state.
-    if "bun" in active:
+    # A typo of `packages` reads as an empty list: hold the whole section.
+    bad = {
+        s for s in PACKAGE_SECTION_KEYS if s in active and not checked_section(s, config.get(s, {}))
+    }
+    success &= not bad
+
+    if "bun" in active and "bun" not in bad:
         bun_config = config.get("bun", {})
         bun_packages = bun_config.get("packages", {})
         bun_only_config = {"configFile": bun_config.get("configFile")}
         if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
             success &= install_bun_packages(bun_packages, paths, state, bun_only_config, update)
 
-    if "npm" in active:
+    if "npm" in active and "npm" not in bad:
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
         npm_only_config = {"configFile": npm_config.get("configFile")}
         if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
             success &= install_npm_packages(npm_packages, paths, state, npm_only_config, update)
 
-    if "uv" in active:
+    if "uv" in active and "uv" not in bad:
         uv_packages = config.get("uv", {}).get("packages", {})
         if uv_packages or state.get("uv", {}).get("packages"):
             success &= install_uv_packages(uv_packages, paths, state, update)
 
-    if "go" in active:
+    if "go" in active and "go" not in bad:
         go_packages = config.get("go", {}).get("packages", {})
         go_state = state.get("go", {})
         if go_packages or go_state.get("packages"):
             success &= install_go_packages(go_packages, paths, state, update)
 
-    if "cargo" in active:
+    if "cargo" in active and "cargo" not in bad:
         cargo_packages = config.get("cargo", {}).get("packages", {})
         cargo_state = state.get("cargo", {})
         if cargo_packages or cargo_state.get("packages"):
             success &= install_cargo_packages(cargo_packages, paths, state, update)
 
-    if "pi" in active:
+    if "pi" in active and "pi" not in bad:
         pi_packages = config.get("pi", {}).get("packages", {})
         if pi_packages or state.get("pi", {}).get("packages"):
             success &= install_pi_packages(pi_packages, paths, state)
 
-    if "mcp" in active:
+    mcp_errors = config_errors(config.get("mcp", {})) if "mcp" in active else []
+    for err in mcp_errors:
+        log(err, Color.RED)
+    success &= not mcp_errors
+
+    if "mcp" in active and not mcp_errors:
         mcp_servers = config.get("mcp", {}).get("servers", {})
         # Skip the `claude mcp list` shell-out when there is nothing to
         # reconcile, matching _diff_mcp.

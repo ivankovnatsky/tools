@@ -127,6 +127,46 @@ def skipped_row(target: str) -> str:
     return f"{SKIPPED_ROW}{target} (skip: true; not written)"
 
 
+# Keys each package section reads. version/source/commit drive installs and
+# version_changed; pi installs from version/source only, so a commit pin there
+# would never take effect.
+_PKG_KEYS = ("version", "source", "commit")
+PACKAGE_ENTRY_KEYS = {
+    "npm": _PKG_KEYS + ("binary", "subpackages", "postInstall", "restartUnits"),
+    "bun": _PKG_KEYS + ("restartUnits",),
+    "uv": _PKG_KEYS + ("binary", "restartUnits"),
+    "go": _PKG_KEYS + ("binary", "restartUnits"),
+    "cargo": _PKG_KEYS + ("restartUnits",),
+    "pi": ("version", "source"),
+}
+# npm/bun `configFile` stays known so its own "was removed" error shows.
+PACKAGE_SECTION_KEYS = {
+    section: ("packages", "configFile") if section in ("npm", "bun") else ("packages",)
+    for section in PACKAGE_ENTRY_KEYS
+}
+
+
+def package_section_errors(section: str, section_config) -> List[str]:
+    """Config errors for `<section>` itself: a typo of `packages` would read as an
+    empty package list and remove every tracked package. An absent section is {};
+    a bare `<section>:` is None and an error, or every later `.get` crashes."""
+    if not isinstance(section_config, dict):
+        return [f"{section} must be a mapping, got {type(section_config).__name__}"]
+    allowed = PACKAGE_SECTION_KEYS[section]
+    unknown = sorted((k for k in section_config if k not in allowed), key=str)
+    if unknown:
+        return [f"{section}: unknown keys {unknown} (expected {list(allowed)})"]
+    return []
+
+
+def checked_section(section: str, section_config) -> bool:
+    """package_section_errors logged; False means the section must not run."""
+    errors = package_section_errors(section, section_config)
+    for err in errors:
+        log(err, Color.RED)
+    return not errors
+
+
 def package_entries(section: str, packages) -> tuple[Dict[str, Dict], List[str]]:
     """`<section>.packages` with bare keys (None) as {}, plus config errors."""
     if packages is None:
@@ -140,6 +180,13 @@ def package_entries(section: str, packages) -> tuple[Dict[str, Dict], List[str]]
             info = {}
         if not isinstance(info, dict):
             errors.append(f"{section}.packages.{name} must be a mapping, got {type(info).__name__}")
+            continue
+        allowed = PACKAGE_ENTRY_KEYS.get(section)
+        unknown = sorted((k for k in info if k not in allowed), key=str) if allowed else []
+        if unknown:
+            errors.append(
+                f"{section}.packages.{name}: unknown keys {unknown} (expected {list(allowed)})"
+            )
             continue
         entries[name] = info
     return entries, errors

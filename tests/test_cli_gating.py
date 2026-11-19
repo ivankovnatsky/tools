@@ -188,6 +188,77 @@ class DeployGatingTest(unittest.TestCase):
         with mock.patch.object(cli, "install_git_repos", return_value=False):
             self.assertFalse(self._deploy({}, state))
 
+    def test_package_section_typo_holds_removals(self):
+        # `pakages` read as no packages would uninstall every tracked one.
+        import tempfile
+
+        from tools import diff
+
+        tracked = {"zz": {"installed": True}}
+        with mock.patch.object(cli, "install_uv_packages", return_value=True) as uv:
+            self.assertFalse(
+                self._deploy({"uv": {"pakages": {"zz": {}}}}, {"uv": {"packages": tracked}})
+            )
+        uv.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as d:
+            save_json(f"{d}/state.json", {"uv": {"packages": tracked}})
+            config = {"stateFile": f"{d}/state.json", "uv": {"pakages": {"zz": {}}}}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), mock.patch.object(diff, "log") as log:
+                self.assertFalse(diff.show_diff(config, d, ("uv",)))
+        rows = out.getvalue() + "".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("uv: unknown keys ['pakages']", rows)
+        self.assertNotIn("remove zz", rows)
+
+    def test_package_entry_typo_is_a_config_error(self):
+        state = {"uv": {"packages": {"zz": {"installed": True}}}}
+        config = {"uv": {"packages": {"foo": {"sorce": "git+file:///x"}}}}
+        from tools.user import uv as uv_section
+
+        with (
+            mock.patch.object(uv_section, "run_command") as run,
+            mock.patch("tools.util.log") as log,
+        ):
+            self.assertFalse(self._deploy(config, state))
+        run.assert_not_called()
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("uv.packages.foo: unknown keys ['sorce']", logged)
+
+    def test_null_sections_are_config_errors_not_crashes(self):
+        # A bare `uv:` or `servers:` loads as None; .get on it used to crash.
+        from tools import diff
+
+        for config, error in (
+            ({"uv": None}, "uv must be a mapping, got NoneType"),
+            ({"bun": None}, "bun must be a mapping, got NoneType"),
+            ({"mcp": None}, "mcp must be a mapping, got NoneType"),
+            ({"mcp": {"servers": None}}, "mcp.servers must be a mapping, got NoneType"),
+        ):
+            with self.subTest(config):
+                with mock.patch.object(cli, "log") as log, mock.patch("tools.util.log") as ulog:
+                    self.assertFalse(self._deploy(config, {}))
+                logged = " ".join(str(c.args[0]) for m in (log, ulog) for c in m.call_args_list)
+                self.assertIn(error, logged)
+
+                with tempfile.TemporaryDirectory() as d:
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out), mock.patch.object(diff, "log") as dlog:
+                        diff.show_diff({**config, "stateFile": f"{d}/s.json"}, d, tuple(config))
+                rows = out.getvalue() + "".join(str(c.args[0]) for c in dlog.call_args_list)
+                self.assertIn(error, rows)
+
+    def test_mcp_unknown_keys_hold_the_section(self):
+        config = {
+            "mcp": {
+                "serverz": {},
+                "servers": {"x": {"url": "u", "transport": "http", "header": ["A: b"]}},
+            }
+        }
+        with mock.patch.object(cli, "install_mcp_servers", return_value=True) as mcp:
+            self.assertFalse(self._deploy(config, {}))
+        mcp.assert_not_called()
+
 
 class RestartUnitsWiringTest(unittest.TestCase):
     def _deploy(self, config, state, daemons=None):

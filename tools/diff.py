@@ -60,6 +60,7 @@ from tools.util import (
     get_pkg_subpackages,
     looks_like_secret,
     package_entries,
+    package_section_errors,
     pkg_install_spec,
     skipped_row,
 )
@@ -92,6 +93,14 @@ def _notify_rows(pkg_info) -> List[str]:
 def _bad_packages(section: str, packages) -> List[str]:
     """Config error rows for `<section>.packages`; deploy then runs nothing in the section."""
     return [f"  ! {err}" for err in package_entries(section, packages)[1]]
+
+
+def _bad_section(section: str, config: Dict, sections: List) -> bool:
+    """Rows for errors in `<section>` itself; deploy then runs nothing in the section."""
+    rows = [f"  ! {err}" for err in package_section_errors(section, config.get(section, {}))]
+    if rows:
+        sections.append((section, rows))
+    return bool(rows)
 
 
 def _released(key: str, old, new, tracked, desired) -> List[str]:
@@ -631,7 +640,7 @@ def show_diff(
     # Section gates must mirror _deploy exactly: any extra condition here
     # (e.g. requiring a paths key) makes diff report "clean" for work deploy
     # would still attempt.
-    if "bun" in active:
+    if "bun" in active and not _bad_section("bun", config, sections):
         bun_config = config.get("bun", {})
         bun_packages = bun_config.get("packages", {})
         if bun_packages or bun_config.get("configFile") or state.get("bun", {}).get("packages"):
@@ -645,7 +654,7 @@ def show_diff(
             if changes:
                 sections.append(("bun", changes))
 
-    if "npm" in active:
+    if "npm" in active and not _bad_section("npm", config, sections):
         npm_config = config.get("npm", {})
         npm_packages = npm_config.get("packages", {})
         if npm_packages or npm_config.get("configFile") or state.get("npm", {}).get("packages"):
@@ -659,7 +668,7 @@ def show_diff(
             if changes:
                 sections.append(("npm", changes))
 
-    if "uv" in active:
+    if "uv" in active and not _bad_section("uv", config, sections):
         if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
             uv_packages = config.get("uv", {}).get("packages", {})
             changes = _bad_packages("uv", uv_packages) or _diff_uv(
@@ -668,7 +677,7 @@ def show_diff(
             if changes:
                 sections.append(("uv", changes))
 
-    if "go" in active:
+    if "go" in active and not _bad_section("go", config, sections):
         go_state = state.get("go", {})
         if config.get("go", {}).get("packages") or go_state.get("packages"):
             go_packages = config.get("go", {}).get("packages", {})
@@ -678,7 +687,7 @@ def show_diff(
             if changes:
                 sections.append(("go", changes))
 
-    if "cargo" in active:
+    if "cargo" in active and not _bad_section("cargo", config, sections):
         cargo_state = state.get("cargo", {})
         if config.get("cargo", {}).get("packages") or cargo_state.get("packages"):
             cargo_packages = config.get("cargo", {}).get("packages", {})
@@ -688,7 +697,7 @@ def show_diff(
             if changes:
                 sections.append(("cargo", changes))
 
-    if "pi" in active:
+    if "pi" in active and not _bad_section("pi", config, sections):
         if config.get("pi", {}).get("packages") or state.get("pi", {}).get("packages"):
             pi_packages = config.get("pi", {}).get("packages", {})
             changes = _bad_packages("pi", pi_packages) or _diff_pi(
@@ -698,7 +707,11 @@ def show_diff(
                 sections.append(("pi", changes))
 
     if "mcp" in active:
-        changes = _diff_mcp(config.get("mcp", {}).get("servers", {}), paths, state)
+        from tools.user.mcp import config_errors as mcp_config_errors
+
+        changes = [f"  ! {err}" for err in mcp_config_errors(config.get("mcp", {}))] or _diff_mcp(
+            config.get("mcp", {}).get("servers", {}), paths, state
+        )
         if changes:
             sections.append(("mcp", changes))
 

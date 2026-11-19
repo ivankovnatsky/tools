@@ -152,6 +152,20 @@ def source_root(name: str, source: Dict, cache_dir: str, config_dir: str) -> str
     return os.path.normpath(os.path.join(base, _subdir(source)))
 
 
+KEYS = ("sources", "targets", "enable", "cacheDir")
+SOURCE_KEYS = ("url", "ref", "subdir", "path")
+_REMOVED_KEYS = {"linkTargets": "linkTargets was removed"}
+
+
+def validate_keys(skills_config: Dict) -> List[str]:
+    """Unknown top-level `skills` keys; like every resolve error, they hold removals."""
+    unknown = sorted((k for k in skills_config if k not in KEYS), key=str)
+    if not unknown:
+        return []
+    removed = "".join(f"; {_REMOVED_KEYS[k]}" for k in unknown if k in _REMOVED_KEYS)
+    return [f"unknown keys {unknown} (expected {list(KEYS)}){removed}"]
+
+
 def validate_sources(sources: Dict) -> List[str]:
     errors = []
     if not isinstance(sources, dict):
@@ -163,6 +177,9 @@ def validate_sources(sources: Dict) -> List[str]:
         if not isinstance(source, dict):
             errors.append(f"source {name!r} must be a mapping")
             continue
+        unknown = sorted((k for k in source if k not in SOURCE_KEYS), key=str)
+        if unknown:
+            errors.append(f"source {name!r}: unknown keys {unknown} (expected {list(SOURCE_KEYS)})")
         has_url = bool(source.get("url"))
         has_path = source.get("path") is not None
         if has_url == has_path:
@@ -214,6 +231,7 @@ def resolve(
     pending: List[str] = []
     desired: Dict[str, Tuple[str, str]] = {}
 
+    errors += validate_keys(skills_config)
     sources = skills_config.get("sources") or {}
     errors += validate_sources(sources)
     if errors:
@@ -576,9 +594,11 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
     cached: Dict[str, Dict] = dict(section.get("sources", {}) or {})
     success = True
 
-    source_errors = validate_sources(skills_config.get("sources") or {})
+    config_errors = validate_keys(skills_config) + validate_sources(
+        skills_config.get("sources") or {}
+    )
     cache_dir = cache_dir_for(skills_config)
-    git_sources = {} if source_errors else _git_sources(skills_config)
+    git_sources = {} if config_errors else _git_sources(skills_config)
 
     failed = set()
     for name, source in sorted(git_sources.items()):
@@ -686,8 +706,8 @@ def diff_skills(
     cache_dir = cache_dir_for(skills_config)
     git_sources = (
         {}
-        if validate_sources(skills_config.get("sources") or {})
-        else (_git_sources(skills_config))
+        if validate_keys(skills_config) + validate_sources(skills_config.get("sources") or {})
+        else _git_sources(skills_config)
     )
 
     # Upstream commits on an unchanged url/ref are only fetched by `deploy --update`.

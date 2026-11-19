@@ -202,6 +202,11 @@ class ConfigErrorTest(SkillsTestBase):
         cfg["sources"]["mine"]["subdir"] = "../.."
         self.assertErrors(cfg, "subdir")
 
+    def test_unknown_source_key_rejected(self):
+        cfg = self.config(["mine/pdf"])
+        cfg["sources"]["mine"]["subDir"] = "x"
+        self.assertErrors(cfg, "source 'mine': unknown keys ['subDir']")
+
 
 class DiffIsReadOnlyTest(SkillsTestBase):
     def test_unfetched_git_source_is_previewed_without_network_or_writes(self):
@@ -248,6 +253,15 @@ class ReviewRegressionTest(SkillsTestBase):
             with mock.patch.object(skills, "run_command") as run:
                 self.assertFalse(self.deploy(cfg))
             run.assert_not_called()
+
+    def test_unknown_top_level_key_skips_git_fetch(self):
+        cfg = self.config(["remote/pdf"], linkTargets=[self.t1])
+        cfg["sources"] = {"remote": {"url": "https://example.invalid/x"}}
+        with mock.patch.object(skills, "run_command") as run:
+            self.assertFalse(self.deploy(cfg))
+            self.assertNotIn("  + fetch remote (https://example.invalid/x)", self.diff(cfg))
+        run.assert_not_called()
+        self.assertNotIn("remote", self.state["skills"].get("sources", {}))
 
     def test_unused_git_source_is_not_fetched(self):
         cfg = self.config(["mine/pdf"], targets=[self.t1])
@@ -330,6 +344,18 @@ class LinkRecordForgetTest(SkillsTestBase):
         cfg = self.config([entry], targets=[self.agents])
 
         self.assertIn(f"  ! unknown keys ['linkTargets'] in enable entry {entry!r}", self.diff(cfg))
+
+    def test_top_level_link_targets_is_an_error_and_holds_forget(self):
+        cfg = self.config(["mine/pdf"], targets=[self.agents])
+        cfg["linkTargets"] = [self.t1]
+
+        self.assertIn(
+            "  ! unknown keys ['linkTargets'] (expected ['sources', 'targets', 'enable', "
+            "'cacheDir']); linkTargets was removed",
+            self.diff(cfg),
+        )
+        self.assertFalse(self.deploy(cfg))
+        self.assertIn(self.link, self.state["skills"]["links"])
 
 
 @unittest.skipUnless(GIT, "git not available")

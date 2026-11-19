@@ -99,7 +99,10 @@ def _load_raw(path: str) -> Dict[str, Any]:
         import yaml  # lazy import
 
         with open(path, "r") as f:
-            data = yaml.safe_load(f)
+            try:
+                data = yaml.safe_load(f)
+            except yaml.YAMLError as exc:
+                raise ConfigError(f"{path}: {exc}") from None
         return data or {}
 
     if suffix == ".toml":
@@ -142,7 +145,8 @@ def load_config(
 
     data = _load_raw(path)
     if not isinstance(data, dict):
-        return data
+        # deep_merge on a list/str would die with a raw AttributeError.
+        raise ConfigError(f"{path}: top level must be a mapping, got {type(data).__name__}")
     check_top_level_keys(data, path)
 
     includes = data.pop("include", None)
