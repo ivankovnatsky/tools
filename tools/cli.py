@@ -49,6 +49,7 @@ from tools.user.env import has_work as env_has_work
 from tools.user.env import install_env
 from tools.user.fetch import has_work as fetch_has_work
 from tools.user.fetch import install_fetch
+from tools.user.files import declared_targets as files_declared_targets
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.files import install_files
 from tools.user.files import source_paths as files_source_paths
@@ -808,7 +809,11 @@ def _run_sections(
     if "uv" in active and "uv" not in bad:
         uv_packages = config.get("uv", {}).get("packages", {})
         if uv_packages or state.get("uv", {}).get("packages"):
-            success &= install_uv_packages(uv_packages, paths, state, update)
+            # --only sets files records aside: leave a stale files copy to a full run.
+            files_declared = (
+                None if view else files_declared_targets(full.get("files"), config_dir, conflicts)
+            )
+            success &= install_uv_packages(uv_packages, paths, state, update, files_declared)
 
     if "go" in active and "go" not in bad:
         go_packages = config.get("go", {}).get("packages", {})

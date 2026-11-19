@@ -848,6 +848,65 @@ def _restore(target: str, managed, conflicts=None) -> Optional[bool]:
     return True
 
 
+class Declared(NamedTuple):
+    """What the files section's removal loop checks before it removes a tracked file."""
+
+    targets: List[str]
+    others: List[str]
+    conflicts: object = None
+
+
+def declared_targets(entries, config_dir: str, conflicts=None) -> Optional[Declared]:
+    """Targets the `files:` config declares (and ``conflicts``, the ownership
+    registry); None when the config does not resolve."""
+    resolved, errors = _resolve_entries(entries or [], config_dir)
+    if errors:
+        return None
+    others = other_run_targets(entries or [], config_dir, False)
+    return Declared([e.target for e in resolved], others, conflicts)
+
+
+def stale_copy(target: str, state: Dict, declared: Declared) -> Optional[str]:
+    """State key of an undeclared copy at ``target`` this section wrote and would
+    remove anyway, so another section may take the path over; else None."""
+    if (
+        same_file_as(target, declared.targets)
+        or same_file_as(target, declared.others)
+        or removal_blocked(declared.conflicts, target)
+    ):
+        return None
+    want = canonical_path(target)
+    records = state.get("files") or {}
+    key = next((k for k in records if isinstance(k, str) and canonical_path(k) == want), None)
+    if key is None:
+        return None
+    record = records[key]
+    if (
+        not isinstance(record, dict)
+        or record.get("dir")
+        or not _removable(target, record)
+        or restorable_backup(target, records, declared.conflicts)
+    ):
+        return None
+    return key
+
+
+def release_to(target: str, state: Dict, declared: Declared) -> Optional[bool]:
+    """Trash a `stale_copy` at ``target`` and drop its record.
+
+    True when done, None when the copy is not ours to give up, False on failure."""
+    key = stale_copy(target, state, declared)
+    if key is None:
+        return None
+    try:
+        trash(target)
+    except OSError as e:
+        log(f"Failed to move {target} to Trash: {e}", Color.RED)
+        return False
+    state["files"].pop(key, None)
+    return True
+
+
 def _conflict(target: str, conflicts: Optional[Dict[str, str]]) -> Optional[str]:
     if not conflicts:
         return None

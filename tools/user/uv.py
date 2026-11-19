@@ -1,7 +1,8 @@
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 from tools.log import Color, debug, log
+from tools.user import files as files_section
 from tools.user import secrets_flow
 from tools.util import (
     checked_packages,
@@ -59,7 +60,74 @@ def plan_removals(packages: Dict, paths: Dict, state: Dict) -> Dict:
     }
 
 
-def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
+def _links_into(path: str, tool_dir: str) -> bool:
+    if not os.path.islink(path):
+        return False
+    root = os.path.join(os.path.realpath(os.path.expanduser(tool_dir)), "")
+    return os.path.realpath(path).startswith(root)
+
+
+def _real_dir(path: str) -> str:
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def _old_dirs(paths: Dict, dirs) -> set:
+    """``dirs`` minus empty ones and the current uvToolDir (a uvBin-only move)."""
+    current = paths.get("uvToolDir")
+    current = _real_dir(current) if current else None
+    return {d for d in dirs if d and _real_dir(d) != current}
+
+
+def _old_tool_dirs(paths: Dict, state: Dict, released) -> list:
+    """Released tool dirs some entry point in uvBin still links into."""
+    old_dirs = _old_dirs(paths, set(state.get("uv", {}).get("oldToolDirs") or []) | set(released))
+    bin_dir = os.path.expanduser(paths["uvBin"])
+    try:
+        names = os.listdir(bin_dir)
+    except OSError:
+        return sorted(old_dirs)
+    paths_in_bin = [os.path.join(bin_dir, n) for n in names]
+    return sorted(d for d in old_dirs if any(_links_into(x, d) for x in paths_in_bin))
+
+
+def _blocked(packages: Dict, paths: Dict, state: Dict, files_declared) -> Dict[str, Dict]:
+    """Binaries in the way of a fresh install that are ours to replace.
+
+    ``force``: package to the old tool dir its entry point links into, left by a
+    released context (uv refuses to overwrite them); kept in state as
+    ``oldToolDirs`` until those packages install. ``takeover``: an undeclared
+    `files` copy, moved to the Trash first; None for ``files_declared`` (--only)
+    skips it."""
+    _, released, state_packages = _context(paths, state)
+    old_dirs = list(state.get("uv", {}).get("oldToolDirs") or [])
+    if released and isinstance(released[0], str):
+        old_dirs.append(released[0].partition("|")[2])
+    old_dirs = sorted(_old_dirs(paths, old_dirs))
+    force, takeover = {}, {}
+    for pkg, pkg_info in packages.items():
+        binary = pkg_info.get("binary")
+        if pkg in state_packages or not binary or not paths.get("uvBin"):
+            continue
+        path = os.path.join(os.path.expanduser(paths["uvBin"]), binary)
+        old = next((d for d in old_dirs if _links_into(path, d)), None)
+        if old:
+            force[pkg] = old
+        elif (
+            files_declared is not None
+            and os.path.lexists(path)
+            and files_section.stale_copy(path, state, files_declared)
+        ):
+            takeover[pkg] = path
+    return {"force": force, "takeover": takeover}
+
+
+def plan_installs(
+    packages: Dict,
+    paths: Dict,
+    state: Dict,
+    update: bool = False,
+    files_declared: Optional[files_section.Declared] = None,
+) -> Dict:
     """Run after removals: a removal can take a binary another package declares."""
     _, _, state_packages = _context(paths, state)
     actions = []
@@ -73,18 +141,37 @@ def plan_installs(packages: Dict, paths: Dict, state: Dict, update: bool = False
         elif update and pkg_unpinned(pkg_info):
             actions.append((pkg, "upgrade"))
     units, unit_errors = secrets_flow.parse_package_units("uv", packages)
-    return {"actions": actions, "units": units, "unit_errors": unit_errors}
-
-
-def plan(packages: Dict, paths: Dict, state: Dict, update: bool = False) -> Dict:
-    """What deploy does with uv packages; the preview renders the same plan."""
     return {
-        **plan_removals(packages, paths, state),
-        **plan_installs(packages, paths, state, update),
+        "actions": actions,
+        "units": units,
+        "unit_errors": unit_errors,
+        **_blocked(packages, paths, state, files_declared),
     }
 
 
-def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool = False):
+def plan(
+    packages: Dict,
+    paths: Dict,
+    state: Dict,
+    update: bool = False,
+    files_declared: Optional[files_section.Declared] = None,
+) -> Dict:
+    """What deploy does with uv packages; the preview renders the same plan."""
+    return {
+        **plan_removals(packages, paths, state),
+        **plan_installs(packages, paths, state, update, files_declared),
+    }
+
+
+def install_uv_packages(
+    packages: Dict,
+    paths: Dict,
+    state: Dict,
+    update: bool = False,
+    files_declared: Optional[files_section.Declared] = None,
+):
+    """``files_declared``: `files.declared_targets` of the full config, or None
+    (--only) to leave stale `files` copies alone."""
     packages, ok = checked_packages("uv", packages)
     if not ok:
         return False
@@ -143,7 +230,7 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
     # Install missing packages, reinstall on version change or when a declared
     # binary is gone. Persist each success so a later failure does not discard
     # progress.
-    p = plan_installs(packages, paths, state, update)
+    p = plan_installs(packages, paths, state, update, files_declared)
     to_install = [pkg for pkg, kind in p["actions"] if kind != "upgrade"]
     units = p["units"]
     for err in p["unit_errors"].values():
@@ -161,9 +248,19 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
                 spec = _uv_commit_spec(source, commit)
             else:
                 spec = pkg_install_spec(pkg, get_pkg_version(pkg_info), source)
+            if pkg in p["takeover"]:
+                path = p["takeover"][pkg]
+                released = files_section.release_to(path, state, files_declared)
+                if released is False:
+                    log(f"Failed to install UV package {spec}: {path} is in the way", Color.RED)
+                    success = False
+                    continue
+                if released:
+                    log(f"Moved {path} to Trash: uv now installs it", Color.YELLOW)
             cmd = [f"{paths['uv']}/uv", "tool", "install", spec]
-            # Force reinstall if already present (version changed or binary gone)
-            if pkg in state_packages:
+            # Force reinstall if already present (version changed or binary gone),
+            # or over an entry point the old tool dir left behind.
+            if pkg in state_packages or pkg in p["force"]:
                 cmd.append("--force")
             returncode, _, stderr = run_command(cmd, env)
             if returncode != 0:
@@ -197,5 +294,11 @@ def install_uv_packages(packages: Dict, paths: Dict, state: Dict, update: bool =
     if tracked != state_pkgs:
         state.setdefault("uv", {})["packages"] = tracked
     state.setdefault("uv", {})["context"] = context
+    # A failed install still needs --force next run, after the context is saved.
+    old_dirs = _old_tool_dirs(paths, state, p["force"].values())
+    if old_dirs:
+        state["uv"]["oldToolDirs"] = old_dirs
+    else:
+        state["uv"].pop("oldToolDirs", None)
 
     return success

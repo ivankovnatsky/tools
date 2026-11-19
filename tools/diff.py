@@ -3,7 +3,7 @@
 import os
 import stat
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from tools import privilege, selection
 from tools.config import SECTIONS
@@ -33,6 +33,7 @@ from tools.user.env import diff_env
 from tools.user.env import has_work as env_has_work
 from tools.user.fetch import diff_fetch
 from tools.user.fetch import has_work as fetch_has_work
+from tools.user.files import declared_targets as files_declared_targets
 from tools.user.files import has_system_work as files_has_system_work
 from tools.user.flatpak import diff_flatpak
 from tools.user.launchd import diff_launchd
@@ -207,13 +208,26 @@ def _diff_npm(packages: Dict, paths: Dict, state: Dict, npm_config: Dict, update
     return changes
 
 
-def _diff_uv(packages: Dict, paths: Dict, state: Dict, update: bool = False):
-    p = uv_section.plan(packages, paths, state, update)
+def _diff_uv(
+    packages: Dict,
+    paths: Dict,
+    state: Dict,
+    update: bool = False,
+    files_declared=None,
+    taken_over: Optional[set] = None,
+):
+    """``taken_over`` collects the `files` copies uv takes over, for `_diff_files`."""
+    p = uv_section.plan(packages, paths, state, update, files_declared)
+    if taken_over is not None:
+        taken_over.update(p["takeover"].values())
     changes: List[str] = []
     if p["released"]:
         old, tracked = p["released"]
         if tracked:
             changes += _released("uv tool dir", old, p["context"], tracked, set(packages))
+    changes += [
+        f"  ~ take over {path} from files (old copy to Trash)" for path in p["takeover"].values()
+    ]
     changes += _package_rows("uv", p, packages)
     changes += [f"  - remove {pkg}" for pkg in p["remove"]]
     return changes
@@ -355,16 +369,19 @@ def _diff_files(
     conflicts=None,
     system: bool = False,
     update: bool = False,
+    taken_over=(),
 ):
     """Dry-run for the unified `files:` section.
 
     Resolves entries via `_resolve_entries`, compares each desired entry
     against the live filesystem, and accounts for cleanup against state.
     ``system`` (root) covers only entries whose target directory the user cannot write;
-    as the user they get a note instead.
+    as the user they get a note instead. ``taken_over``: tracked copies another
+    section (uv) removes first, so not listed again.
     """
     from tools.fsutil import (
         aside_note,
+        canonical_path,
         removal_blocked,
         same_file_as,
         unmounted_volume,
@@ -490,8 +507,9 @@ def _diff_files(
     # Deploy holds removals on config errors; a refused target stays tracked.
     removed = set()
     tracked = declared + list(state_files)
+    taken = {canonical_path(t) for t in taken_over}
     for target in _removal_order(state_files, state_files) if not errors else ():
-        if target not in managed_targets:
+        if target not in managed_targets and canonical_path(target) not in taken:
             record = state_files.get(target)
             if same_file_as(target, others):
                 continue
@@ -642,6 +660,22 @@ def show_diff(
     paths = config.get("paths", {})
 
     sections = []
+    taken_over: set = set()
+
+    def registry():
+        return secrets_flow.ownership_conflicts(
+            files_entries=full.get("files"),
+            sops_raw=full.get("sops"),
+            templates_raw=full.get("templates"),
+            links_raw=full.get("links"),
+            skills_raw=full.get("skills"),
+            state=full_state,
+            config_dir=config_dir,
+            git_repos_raw=full.get("gitRepos"),
+            clone_pending="gitRepos" in active,
+            env_raw=full.get("env"),
+            fetch_raw=full.get("fetch"),
+        )
 
     # Section gates must mirror _deploy exactly: any extra condition here
     # (e.g. requiring a paths key) makes diff report "clean" for work deploy
@@ -678,7 +712,12 @@ def show_diff(
         if config.get("uv", {}).get("packages") or state.get("uv", {}).get("packages"):
             uv_packages = config.get("uv", {}).get("packages", {})
             changes = _bad_packages("uv", uv_packages) or _diff_uv(
-                package_entries("uv", uv_packages)[0], paths, state, update
+                package_entries("uv", uv_packages)[0],
+                paths,
+                state,
+                update,
+                None if view else files_declared_targets(full.get("files"), config_dir, registry()),
+                taken_over,
             )
             if changes:
                 sections.append(("uv", changes))
@@ -755,19 +794,7 @@ def show_diff(
     )
     if moves:
         sections.append(("move", [f"~ move {m}" for m in moves]))
-    conflicts = secrets_flow.ownership_conflicts(
-        files_entries=full.get("files"),
-        sops_raw=full.get("sops"),
-        templates_raw=full.get("templates"),
-        links_raw=full.get("links"),
-        skills_raw=full.get("skills"),
-        state=full_state,
-        config_dir=config_dir,
-        git_repos_raw=full.get("gitRepos"),
-        clone_pending="gitRepos" in active,
-        env_raw=full.get("env"),
-        fetch_raw=full.get("fetch"),
-    )
+    conflicts = registry()
     # Same order as deploy: paths inside a gitRepos destination after the clone.
     inside = secrets_flow.paths_in_repos(
         config.get("gitRepos"), config.get("sops"), config.get("templates")
@@ -816,7 +843,12 @@ def show_diff(
 
     if "files" in active:
         changes = _diff_files(
-            config.get("files", []) or [], config_dir, state, conflicts, update=update
+            config.get("files", []) or [],
+            config_dir,
+            state,
+            conflicts,
+            update=update,
+            taken_over=taken_over,
         )
         if changes:
             sections.append(("files", changes))
