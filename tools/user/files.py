@@ -14,6 +14,7 @@ from tools.fsutil import (
     earlier_backup,
     fingerprint,
     makedirs_secret,
+    matches_fingerprint,
     removal_blocked,
     respell,
     restore_aside,
@@ -65,19 +66,27 @@ def _record(target: str, file_hash: str) -> Dict:
 # Section move (secrets_flow.move_between_sections): every file-writing
 # section defines these three.
 def record_unmodified(target: str, record) -> bool:
-    return (
-        isinstance(record, dict)
-        and bool(record.get("hash"))
-        and (_file_hash(target) == record["hash"])
-    )
+    if not isinstance(record, dict):
+        return False
+    if record_secret(record):
+        return matches_fingerprint(target, record)
+    return bool(record.get("hash")) and _file_hash(target) == record["hash"]
 
 
 def record_for(target: str, name: str, secret: bool) -> Dict:
+    if secret:
+        # No hash of a secret in state. Identity alone keeps the target
+        # tracked; the missing hash makes the next deploy replace it, so
+        # the old secret is moved aside and never shown in a diff. mtime
+        # stands in for the hash when deciding whether it was edited.
+        fp = fingerprint(target) or {}
+        return {k: fp[k] for k in ("dev", "ino", "mtime_ns") if k in fp}
     return _record(target, _file_hash(target))
 
 
 def record_secret(record) -> bool:
-    return False
+    # record_for leaves the hash out of secret records.
+    return isinstance(record, dict) and not record.get("hash") and "mtime_ns" in record
 
 
 def _removable(target: str, record) -> bool:
@@ -86,6 +95,8 @@ def _removable(target: str, record) -> bool:
     if "ino" in record and not same_identity(target, record):
         return False
     stored_hash = record.get("hash")
+    if not stored_hash and "mtime_ns" in record:
+        return matches_fingerprint(target, record)
     return not stored_hash or _file_hash(target) == stored_hash
 
 

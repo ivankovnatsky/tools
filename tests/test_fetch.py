@@ -347,6 +347,21 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(self.read(), b"v1")
         self.assertEqual(self.state["fetch"]["installed"][self.target]["url"], URL)
 
+    def test_move_secret_template_to_fetch_stores_no_hash_and_replaces(self):
+        from tools import fsutil
+
+        self.write(b"password = hunter2")
+        rec = {"name": "app", "secret": True, **fsutil.fingerprint(self.target)}
+        self.state["templates"] = {"installed": {self.target: rec}}
+        secrets_flow.move_between_sections(self.state, fetch_raw={self.target: URL})
+        self.assertNotIn("hash", self.state["fetch"]["installed"][self.target])
+        raw = {self.target: URL}
+        (change,) = fetch.plan(raw, self.state["fetch"]["installed"]).changes
+        self.assertEqual(change.action, "replace")
+        self.assertTrue(self.deploy(raw))
+        self.assertEqual(self.read(), b"v1")
+        self.assertEqual(len(self.backups()), 1)
+
     def test_malformed_url_is_config_error(self):
         entries, errors = fetch.parse({self.target: "https://[broken"})
         self.assertEqual(entries, [])

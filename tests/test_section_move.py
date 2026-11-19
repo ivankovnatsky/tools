@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from tools import cli
+from tools import cli, diff
 from tools.user import secrets_flow
 from tools.user.files import _file_hash, _record
 
@@ -100,6 +100,79 @@ class SectionMoveTest(unittest.TestCase):
         moved = self.move(state, templates=self.tmpl_cfg())
         self.assertEqual(moved, [f"{self.target} (sops -> templates)"])
         self.assertTrue(state["templates"]["installed"][self.target]["secret"])
+
+    def test_secret_template_to_files_stores_no_hash_and_hides_old_content(self):
+        from tools import fsutil
+        from tools.user import files
+
+        self.write_target('{"password": "hunter2-very-secret"}\n')
+        rec = {"name": "app", "secret": True, **fsutil.fingerprint(self.target)}
+        state = {"templates": {"installed": {self.target: rec}}}
+        moved = self.move(state, files=self.files_cfg())
+        self.assertEqual(moved, [f"{self.target} (templates -> files)"])
+        record = state["files"][self.target]
+        self.assertNotIn("hash", record)
+        self.assertTrue(fsutil.same_identity(self.target, record))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            preview = diff._diff_files(self.files_cfg(), self.tmp, state)
+            ok = files.install_files(self.files_cfg(), self.tmp, state)
+        self.assertTrue(ok, out.getvalue())
+        self.assertNotIn("hunter2", "\n".join(preview) + out.getvalue())
+        self.assertIn("Moved aside", out.getvalue())
+        with open(self.target) as f:
+            self.assertEqual(f.read(), '{"a": 1}\n')
+
+    def test_secret_moved_to_files_then_edited_is_kept_on_removal(self):
+        from tools import fsutil
+        from tools.user import files
+
+        self.write_target('{"password": "old"}\n')
+        rec = {"name": "app", "secret": True, **fsutil.fingerprint(self.target)}
+        state = {"templates": {"installed": {self.target: rec}}}
+        self.move(state, files=self.files_cfg())
+        # Edit in place (same inode), with a clearly different mtime.
+        with open(self.target, "a") as f:
+            f.write("edited\n")
+        st = os.stat(self.target)
+        os.utime(self.target, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            files.install_files([], self.tmp, state)
+        self.assertTrue(os.path.exists(self.target), out.getvalue())
+        self.assertIn("modified since we wrote it", out.getvalue())
+        self.assertIn(self.target, state["files"])
+
+    def test_sops_to_files_stores_no_hash(self):
+        from tools import fsutil
+
+        self.write_target('{"token": "abc"}\n')
+        state = {
+            "sops": {"installed": {self.target: {"name": "s", **fsutil.fingerprint(self.target)}}}
+        }
+        self.move(state, files=self.files_cfg())
+        self.assertNotIn("hash", state["files"][self.target])
+
+    def test_secret_moved_again_before_deploy_stays_secret(self):
+        from tools import fsutil
+
+        self.write_target('{"password": "hunter2"}\n')
+        rec = {"name": "app", "secret": True, **fsutil.fingerprint(self.target)}
+        state = {"templates": {"installed": {self.target: rec}}}
+        self.move(state, files=self.files_cfg())
+        url = "https://example.com/app.json"
+        moved = secrets_flow.move_between_sections(state, fetch_raw={self.target: url})
+        self.assertEqual(moved, [f"{self.target} (files -> fetch)"])
+        self.assertNotIn(self.target, state["files"])
+        record = state["fetch"]["installed"][self.target]
+        self.assertNotIn("hash", record)
+        self.assertTrue(fsutil.matches_fingerprint(self.target, record))
+        moved = self.move(state, templates=self.tmpl_cfg())
+        self.assertEqual(moved, [f"{self.target} (fetch -> templates)"])
+        self.assertTrue(state["templates"]["installed"][self.target]["secret"])
+        self.assertTrue(os.path.exists(self.target))
 
     def test_new_section_needs_only_a_table_entry(self):
         from unittest import mock

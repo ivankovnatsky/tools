@@ -208,7 +208,11 @@ def record_unmodified(target: str, record) -> bool:
 
 
 record_for = files.record_for
-record_secret = files.record_secret
+
+
+def record_secret(record) -> bool:
+    # Install records have no hash either, but are not secrets.
+    return not _is_install_record(record) and files.record_secret(record)
 
 
 # --------------------------------------------------------------------------
