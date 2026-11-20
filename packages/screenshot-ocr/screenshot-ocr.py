@@ -151,7 +151,7 @@ def main(src, out):
                 [str(binary), path], capture_output=True, text=True, timeout=60 * 2
             )
             r = json.loads(res.stdout)
-        except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             print(f"screenshot-ocr: {image}: {e}", file=sys.stderr)
             continue
         if "error" in r:
@@ -160,7 +160,11 @@ def main(src, out):
             # run. Other errors (Vision failures) retry next run.
             if r["error"] != UNREADABLE:
                 continue
-        write(image, when, dst, r.get("lines", []))
+        try:
+            write(image, when, dst, r.get("lines", []))
+        except OSError as e:  # e.g. the screenshot was deleted mid-run
+            print(f"screenshot-ocr: {image}: {e}", file=sys.stderr)
+            continue
         written += 1
     print(f"screenshot-ocr: wrote {written} files")
 
