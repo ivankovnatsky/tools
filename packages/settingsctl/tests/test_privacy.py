@@ -3,6 +3,7 @@
 Run from the repo root: python -m unittest discover -s packages/settingsctl/tests
 """
 
+import io
 import os
 import sys
 import tempfile
@@ -190,6 +191,82 @@ class PaneTest(unittest.TestCase):
         self.assertEqual(self.state("accessibility-enabled"), "old")
         self.pane.rows = None
         self.assertFalse(accessibility_state.accessibility_revoke(["old"]))
+
+    def test_accessibility_confirmed_removal_needs_no_second_pane_read(self):
+        (Path(self.dir.name) / "accessibility-enabled").write_text("Terminal,old")
+        reads = [self.list_apps("u")]
+        with (
+            mock.patch.object(accessibility_state, "list_apps", lambda _u: reads.pop(0)),
+            mock.patch.object(accessibility_state, "accessibility_remove") as remove,
+        ):
+            remove.side_effect = lambda app: self.pane.rows.pop(app, None) is not None
+            self.assertTrue(accessibility_state.accessibility_revoke(["old"]))
+        self.assertEqual(reads, [])
+        self.assertEqual(self.state("accessibility-enabled"), "Terminal")
+
+    def test_accessibility_set_failed_removal_keeps_the_grant(self):
+        (Path(self.dir.name) / "accessibility-enabled").write_text("Terminal,old")
+        with mock.patch.object(accessibility_state, "accessibility_remove", return_value=False):
+            self.assertFalse(accessibility_state.accessibility_set({"Terminal": None}))
+        self.assertEqual(self.state("accessibility-enabled"), "Terminal,old")
+
+
+class RemoveAppTest(unittest.TestCase):
+    """remove_app drives osascript (mocked): the script and how its output is read."""
+
+    def run_remove(self, stdout, returncode=0):
+        calls = []
+
+        def run(cmd, **_kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
+
+        with mock.patch.object(privacy_pane.subprocess, "run", run):
+            result = privacy_pane.remove_app("url", "old")
+        script = next(c[2] for c in calls if "select r" in c[2])
+        return result, script
+
+    def test_clicks_the_button_labelled_remove_never_by_position(self):
+        result, script = self.run_remove("removed\n")
+        self.assertTrue(result)
+        self.assertNotIn("click btn", script)
+        self.assertNotIn("click button 1", script)
+        self.assertIn("description of btn", script)
+        self.assertIn('labels contains "Remove"', script)
+        self.assertIn('if removeBtn is missing value then return "no remove button: "', script)
+        self.assertIn('return "still listed"', script)
+        self.assertIn('count of windows of process "SecurityAgent"', script)
+
+    def test_missing_remove_button_reports_the_labels_seen(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            result, _ = self.run_remove("no remove button: [add/+] [] \n")
+        self.assertFalse(result)
+        self.assertIn("buttons: [add/+] []", err.getvalue())
+
+    def test_auth_wait_ends_once_the_click_took_effect(self):
+        # A SecurityAgent window left open must not stall a click that worked:
+        # the done check runs before the prompt check on every poll.
+        _, script = self.run_remove("removed\n")
+        exit_done = script.index("if clickDone then exit repeat")
+        self.assertLess(script.index("then set clickDone to false"), exit_done)
+        self.assertLess(exit_done, script.index('process "SecurityAgent"'))
+        calls = []
+
+        def run(cmd, **_kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout="a:enabled\n", stderr="")
+
+        with mock.patch.object(privacy_pane.subprocess, "run", run):
+            privacy_pane.set_listed("url", ["a", "b"])
+        script = next(c[2] for c in calls if "click el" in c[2])
+        self.assertIn("set clickDone to (value of el is 1)", script)
+        exit_done = script.index("if clickDone then exit repeat")
+        self.assertLess(exit_done, script.index('process "SecurityAgent"'))
+
+    def test_only_a_confirmed_removal_counts(self):
+        for out in ("no remove button: \n", "still listed\n", "not found\n", ""):
+            self.assertFalse(self.run_remove(out)[0], out)
+        self.assertFalse(self.run_remove("removed\n", returncode=1)[0])
 
 
 class NoStateTest(unittest.TestCase):

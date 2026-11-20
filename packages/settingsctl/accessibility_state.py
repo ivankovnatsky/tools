@@ -50,6 +50,25 @@ def _record(names: list[str]) -> None:
         print(f"Warning: could not write state: {e}", file=sys.stderr)
 
 
+def _remove_confirmed(apps: list[str]) -> dict[str, bool]:
+    """Remove apps from the pane: {app: gone}.
+
+    accessibility_remove is True only when the row is gone after the click (it
+    re-checks the rows in the same System Settings session), so a click that
+    did not remove the row never drops a grant from state.
+    """
+    gone = {}
+    for app in sorted(apps):
+        gone[app] = accessibility_remove(app)
+        if not gone[app]:
+            print(f"Could not remove accessibility entry: {app}", file=sys.stderr)
+            continue
+        print(f"Removed accessibility entry: {app}")
+        if quit_app(app):
+            print(f"Quit running app: {app}")
+    return gone
+
+
 def accessibility_enable(
     apps: dict[str, str | None], add_missing: bool = False
 ) -> bool:
@@ -92,18 +111,9 @@ def accessibility_set(apps: dict[str, str | None], add_missing: bool = False) ->
         else:
             current = {item["name"] for item in listed}
             gone = {app: app not in current for app in to_remove}
-        for app in sorted(a for a in to_remove if gone.get(a) is False):
-            if accessibility_remove(app):
-                gone[app] = True
-                print(f"Removed accessibility entry: {app}")
-                if quit_app(app):
-                    print(f"Quit running app: {app}")
-            else:
-                print(
-                    f"Could not remove accessibility entry: {app}",
-                    file=sys.stderr,
-                )
-                ok = False
+        removed = _remove_confirmed([a for a in to_remove if gone.get(a) is False])
+        gone.update(removed)
+        ok = ok and all(removed.values())
 
     on_ok, on = enable_apps(ACCESSIBILITY_URL, "accessibility", apps, add_missing)
     ok = on_ok and ok
@@ -122,16 +132,9 @@ def accessibility_revoke(names: list[str]) -> bool:
         return False
     current = {item["name"] for item in listed}
     done = {name for name in names if name not in current}
-    ok = True
-    for app in sorted(set(names) - done):
-        if accessibility_remove(app):
-            done.add(app)
-            print(f"Removed accessibility entry: {app}")
-            if quit_app(app):
-                print(f"Quit running app: {app}")
-        else:
-            print(f"Could not remove accessibility entry: {app}", file=sys.stderr)
-            ok = False
+    removed = _remove_confirmed(sorted(set(names) - done))
+    done |= {app for app, gone in removed.items() if gone}
+    ok = all(removed.values())
     if not state_disabled():
         previous = accessibility_previous_state()
         kept = [a for a in previous if a not in done]

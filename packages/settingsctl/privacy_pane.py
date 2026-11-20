@@ -160,23 +160,102 @@ def toggle_app(pane_url: str, name: str) -> bool | None:
     return out == "1" if out in ("0", "1") else None
 
 
+def _auth_wait(done: str) -> str:
+    """AppleScript waiting out the auth prompt after a click (at most 120s).
+
+    The prompt may be a sheet on the System Settings window or a separate
+    SecurityAgent window, so wait while either is up. `done` is AppleScript
+    that sets `clickDone`; the wait ends as soon as the click took effect, so a
+    SecurityAgent window left open never stalls a click that worked.
+    """
+    return f"""\
+        delay 2
+        repeat 120 times
+{done}
+            if clickDone then exit repeat
+            delay 1
+            set prompting to (count of sheets of window 1) > 0
+            if not prompting then
+                try
+                    tell application "System Events"
+                        set prompting to (count of windows of process "SecurityAgent") > 0
+                    end tell
+                end try
+            end if
+            if not prompting then exit repeat
+        end repeat
+        delay 0.5"""
+
+
+# Labels (AXDescription, title or help) that mark the remove button; button 1
+# of the pane group is the add (+) button, so never pick a button by position.
+REMOVE_LABELS = ("Remove", "−", "-")
+
+
 def remove_app(pane_url: str, name: str) -> bool:
-    """Select an app's row and click the remove (-) button."""
+    """Select an app's row, click the remove (-) button, confirm the row is gone.
+
+    The button is found by its label, not position. True only when the row is
+    no longer listed after the click (and any authentication sheet).
+    """
+    labels = " or ".join(f'labels contains "{label}"' for label in REMOVE_LABELS)
+    wait = _auth_wait(f"""            set clickDone to true
+            try
+                repeat with r2 in (every row of theOutline)
+                    repeat with el2 in (every checkbox of UI element 1 of r2)
+                        if name of el2 is "{name}" then set clickDone to false
+                    end repeat
+                end repeat
+            on error
+                set clickDone to false
+            end try""")
     body = (
         _for_each_checkbox(f'''                    if name of el is "{name}" then
                         select r
                         delay 0.3
+                        set removeBtn to missing value
+                        set seen to ""
                         repeat with btn in (every button of {PANE_GROUP})
+                            set labels to {{}}
                             try
-                                click btn
-                                delay 0.5
-                                return "removed"
+                                set end of labels to (description of btn) as string
                             end try
+                            try
+                                set end of labels to (name of btn) as string
+                            end try
+                            try
+                                set end of labels to (help of btn) as string
+                            end try
+                            if {labels} then
+                                set removeBtn to contents of btn
+                                exit repeat
+                            end if
+                            set AppleScript's text item delimiters to "/"
+                            set seen to seen & "[" & (labels as string) & "] "
+                            set AppleScript's text item delimiters to ""
                         end repeat
+                        if removeBtn is missing value then return "no remove button: " & seen
+                        click removeBtn
+{wait}
+                        repeat with r2 in (every row of theOutline)
+                            repeat with el2 in (every checkbox of UI element 1 of r2)
+                                if name of el2 is "{name}" then return "still listed"
+                            end repeat
+                        end repeat
+                        return "removed"
                     end if''')
         + '\n        return "not found"'
     )
-    return "removed" in (run_in_pane(pane_url, body) or "")
+    out = (run_in_pane(pane_url, body, timeout=300) or "").strip()
+    if out.startswith("no remove button"):
+        seen = out.partition(":")[2].strip() or "none"
+        print(
+            f"  remove button not found in the pane; nothing clicked (buttons: {seen})",
+            file=sys.stderr,
+        )
+    elif out == "still listed":
+        print(f"  {name}: still listed after clicking remove", file=sys.stderr)
+    return out == "removed"
 
 
 def set_listed(pane_url: str, apps: list[str], on: bool = True) -> dict[str, str] | None:
@@ -191,19 +270,17 @@ def set_listed(pane_url: str, apps: list[str], on: bool = True) -> dict[str, str
     want = 1 if on else 0
     verb = "enabled" if on else "disabled"
     checks = " or ".join(f'name of el is "{app}"' for app in apps)
+    wait = _auth_wait(f"""            set clickDone to false
+            try
+                set clickDone to (value of el is {want})
+            end try""")
     body = (
         '        set output to ""'
         + _for_each_checkbox(f"""                    if {checks} then
                         set appName to name of el
                         if value of el is not {want} then
                             click el
-                            -- Wait for the password sheet to appear and be dismissed
-                            delay 2
-                            repeat 120 times
-                                delay 1
-                                if (count of sheets of window 1) is 0 then exit repeat
-                            end repeat
-                            delay 0.5
+{wait}
                             if value of el is {want} then
                                 set output to output & appName & ":{verb}" & linefeed
                             else
