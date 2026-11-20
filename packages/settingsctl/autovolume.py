@@ -33,6 +33,9 @@ from common import is_linux, is_macos
 DEFAULT_IDLE_SECONDS = 60 * 30  # 30 minutes
 DEFAULT_THRESHOLD_PERCENT = 2
 DEFAULT_CHECK_INTERVAL = 60 * 5  # 5 minutes
+# Absolute cap for a raise: it sets the volume to the threshold, but never
+# to more than this many percent, whatever the threshold is.
+RAISE_MAX_PERCENT = 10
 
 # Hard timeout for every probe subprocess so a stuck ioreg/pmset/pactl can
 # never wedge the daemon loop (and block signal handling).
@@ -180,6 +183,9 @@ def is_audio_active() -> bool | None:
 class AutoVolume:
     """Lower volume to `threshold_percent` after `idle_seconds` of silence.
 
+    With `raise_below`, a volume under the threshold is raised to it
+    instead, capped at RAISE_MAX_PERCENT.
+
     Lowers at most once per idle period within a single daemon run; the
     latch resets when audio resumes so the user can raise the volume
     manually and the next idle period will lower it again. The latch is
@@ -194,9 +200,11 @@ class AutoVolume:
         idle_seconds: int,
         threshold_percent: int,
         verbose: bool = True,
+        raise_below: bool = False,
     ) -> None:
         self.idle_seconds = idle_seconds
         self.threshold_percent = threshold_percent
+        self.raise_below = raise_below
         self.verbose = verbose
         self.last_audio_time = time.monotonic()
         self.lowered_in_this_idle = False
@@ -224,6 +232,15 @@ class AutoVolume:
         current = volume_mod.volume_get()
         if current is None:
             self.log("cannot read current volume; skipping")
+            return
+        raise_to = min(self.threshold_percent, RAISE_MAX_PERCENT)
+        if self.raise_below and current < raise_to:
+            self.log(
+                f"idle for {idle:.0f}s (>= {self.idle_seconds}s); "
+                f"raising volume {current}% -> {raise_to}%"
+            )
+            if volume_mod.volume_set(raise_to):
+                self.lowered_in_this_idle = True
             return
         if current <= self.threshold_percent:
             self.log(

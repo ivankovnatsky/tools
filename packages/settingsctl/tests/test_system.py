@@ -286,6 +286,7 @@ class ExistingInvocationsTest(unittest.TestCase):
         ["login", "set", "Hammerspoon,Mac Mouse Fix,LosslessSwitcher"],
         ["daemon", "run", "--autovolume", "--autovolume-idle", "1800"]
         + ["--autovolume-threshold", "6", "--check-interval", "300", "--verbose"],
+        ["daemon", "run", "--autovolume", "--autovolume-raise"],
     )
 
     def test_parse(self):

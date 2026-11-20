@@ -17,6 +17,7 @@ from autovolume import (
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_IDLE_SECONDS,
     DEFAULT_THRESHOLD_PERCENT,
+    RAISE_MAX_PERCENT,
     AutoVolume,
 )
 
@@ -47,6 +48,14 @@ def register(cli):
         help="Volume percentage to lower to.",
     )
     @click.option(
+        "--autovolume-raise/--no-autovolume-raise",
+        default=False,
+        help=(
+            "After sustained silence, also raise a volume below the threshold "
+            f"to it (never above {RAISE_MAX_PERCENT}%)."
+        ),
+    )
+    @click.option(
         "--check-interval",
         type=click.IntRange(min=1),
         default=DEFAULT_CHECK_INTERVAL,
@@ -62,6 +71,7 @@ def register(cli):
         autovolume: bool,
         autovolume_idle: int,
         autovolume_threshold: int,
+        autovolume_raise: bool,
         check_interval: int,
         verbose: bool,
     ):
@@ -82,7 +92,14 @@ def register(cli):
 
         features = []
         if autovolume:
-            features.append(AutoVolume(autovolume_idle, autovolume_threshold, verbose))
+            features.append(
+                AutoVolume(
+                    autovolume_idle,
+                    autovolume_threshold,
+                    verbose,
+                    raise_below=autovolume_raise,
+                )
+            )
 
         if not features:
             # Idle instead of exiting: a non-zero exit would make launchd
