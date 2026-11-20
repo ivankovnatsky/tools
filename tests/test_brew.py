@@ -734,6 +734,39 @@ class BrewOptionsTest(unittest.TestCase):
         self.assertEqual(fake.calls[-1], ["/brew", "autoremove"])
         self.assertNotIn("autoremoveOwed", state["brew"])
 
+    def test_failed_cleanup_keeps_the_autoremove_owed(self):
+        fake = FakeBrew(formulae={"bar": {}, "u/t/foo": {}}, taps=["u/t"])
+        fake.fail.add("uninstall")
+        state = _state(brews=["u/t/foo"])
+        state["brew"]["autoremoveOwed"] = True
+        config = {"brews": ["u/t/foo"], "onActivation": {"cleanup": "uninstall"}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            self.assertFalse(brew.install_brew_packages(config, state, phase=brew.REMOVE))
+        self.assertIn(["/brew", "uninstall", "bar"], fake.calls)
+        self.assertTrue(state["brew"].get("autoremoveOwed"))
+
+    def test_tap_package_renamed_to_its_short_name_is_a_rename(self):
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1:4] == ["info", "--json=v2", "--formula"]:
+                entry = {"name": "foo", "full_name": "u/t/foo", "aliases": [], "oldnames": []}
+                return 0, json.dumps({"formulae": [entry]}), ""
+            if cmd[1] in ("install", "uninstall"):
+                raise AssertionError(cmd)
+            return 0, "", ""
+
+        state = _state(brews=["u/t/foo"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertTrue(brew.install_brew_packages({"brews": ["foo"]}, state))
+        self.assertEqual(state["brew"]["brews"], ["foo"])
+
     def test_failed_autoremove_after_a_move_is_owed(self):
         fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
         fake.fail.add("autoremove")

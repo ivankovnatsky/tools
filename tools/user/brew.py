@@ -1053,6 +1053,7 @@ def install_brew_packages(
     zap = spec.cleanup == "zap"
     cask_cmd = [brew, "uninstall", "--cask"] + (["--zap"] if zap else [])
     removals = []
+    cleanup_failed = False
     if cleanup_planned:
         # One package per command, casks then formulae, dependents first, so a
         # refusal blocks only itself. Homebrew's own autoremove after each
@@ -1072,6 +1073,7 @@ def install_brew_packages(
             log(f"{'Zapping' if kind == '--cask' and zap else 'Removing'} {name}", Color.RED)
             if not _remove(brew, rm_env, cmd, [name], owned, kind):
                 success = False
+                cleanup_failed = True
     else:
         for cmd, names, owned, kind in (
             (
@@ -1162,7 +1164,9 @@ def install_brew_packages(
 
     _record(state, inst_brews, inst_casks, inst_taps, inst_mas, inst_trust)
     # Still owed until an autoremove succeeds.
-    if (phase == INSTALL and (replaced or owed_before)) or (moves_done and autoremove_failed):
+    # Cleanup stands in for autoremove only when all its removals worked.
+    unpaid = autoremove_failed or (cleanup_planned and cleanup_failed)
+    if (phase == INSTALL and (replaced or owed_before)) or (moves_done and unpaid):
         state["brew"][_AUTOREMOVE_OWED] = True
     return success
 
