@@ -343,7 +343,10 @@ def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
     changes = []
     p = git_repos_section.plan(git_repos, state, update)
     installed = p["installed"]
+    stale = git_repos_section.stale_origins(git_repos, installed)
     for dest in git_repos:
+        if dest in stale:
+            changes.append(f"  ~ set origin {dest} -> {git_repos[dest]}")
         action = git_repos_section.checkout_action(dest, installed, update)
         if action == "clone":
             changes.append(f"  + clone {dest}")

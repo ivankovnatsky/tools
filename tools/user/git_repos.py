@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from tools import fsutil
 from tools.log import Color, debug, log
@@ -53,6 +53,59 @@ def _is_empty_dir(path: str) -> bool:
         return os.path.isdir(path) and not os.path.islink(path) and not os.listdir(path)
     except OSError:
         return False
+
+
+def _git() -> Optional[Tuple[str, Dict[str, str]]]:
+    """(git binary, env to run it with), or None when git is missing."""
+    try:
+        git_bin, git_dir = system_bin("git"), system_dir("git")
+    except (KeyError, FileNotFoundError):
+        return None
+    env = os.environ.copy()
+    env["PATH"] = f"{git_dir}:{env.get('PATH', '')}"
+    return git_bin, env
+
+
+def origin_url(path: str) -> Optional[str]:
+    """The checkout's one origin URL; None with no origin, several URLs, a URL
+    from anywhere but the checkout's own config file, or a git failure.
+
+    `remote set-url` rewrites only `.git/config` itself, so a URL that comes
+    from another scope or an included file is left alone.
+    """
+    git = _git()
+    if git is None:
+        return None
+    git_bin, env = git
+    config = [git_bin, "-C", path, "config"]
+    found = []
+    for scope in ([], ["--local", "--no-includes"]):
+        rc, stdout, _ = run_command([*config, *scope, "--get-all", "remote.origin.url"], env)
+        found.append(stdout.splitlines() if rc == 0 else None)
+    effective, own = found
+    return effective[0] if effective and len(effective) == 1 and own == effective else None
+
+
+def stale_origins(
+    repos: Dict[str, str], installed, read: Optional[Callable[[str], Optional[str]]] = None
+) -> Dict[str, str]:
+    """{dest: current URL} for tracked checkouts whose one origin URL is not
+    the declared URL.
+
+    Only checkouts tools already tracks: a checkout being adopted keeps the
+    origin it was cloned with. Any other origin (none, several URLs,
+    unreadable) is left alone too.
+    """
+    read = read or origin_url
+    stale = {}
+    for dest, url in repos.items():
+        expanded = os.path.expanduser(dest)
+        if dest not in installed or not is_checkout(expanded):
+            continue
+        current = read(expanded)
+        if current is not None and current != url:
+            stale[dest] = current
+    return stale
 
 
 def plan(repos: Dict[str, str], state: Dict, update: bool = False) -> Dict:
@@ -124,7 +177,10 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
     installed = p["installed"]
     to_install, to_remove, to_update = p["to_install"], p["to_remove"], p["to_update"]
 
-    if not to_install and not to_remove and not to_update:
+    # A changed URL for an existing checkout: point origin at it.
+    stale = stale_origins(repos, installed)
+
+    if not to_install and not to_remove and not to_update and not stale:
         debug("All git repos already installed", Color.BLUE)
         if installed != stored:
             state.setdefault("gitRepos", {})["installed"] = sorted(installed)
@@ -169,6 +225,17 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
             state_changed = True
         installed.discard(dest_path)
 
+    unset = set()
+    for dest_path in sorted(stale):
+        url = repos[dest_path]
+        log(f"Setting origin of {dest_path}: {stale[dest_path]} -> {url}", Color.BLUE)
+        cmd = [git_bin, "-C", os.path.expanduser(dest_path), "remote", "set-url", "origin", url]
+        returncode, _, stderr = run_command(cmd, env)
+        if returncode != 0:
+            log(f"Failed to set origin of {dest_path}: {stderr}", Color.RED)
+            success = False
+            unset.add(dest_path)
+
     for dest_path in sorted(to_install | to_update):
         repo_url = repos[dest_path]
         expanded_path = os.path.expanduser(dest_path)
@@ -178,7 +245,10 @@ def install_git_repos(repos: Dict[str, str], state: Dict, update: bool = False):
             log(f"Not a git repo, skipping {dest_path}", Color.YELLOW)
             success = False
             continue
-        if action != "clone" and update:
+        if action != "clone" and update and dest_path in unset:
+            # Pulling would fetch from the old origin.
+            log(f"Not updating {dest_path}: origin still has the old URL", Color.YELLOW)
+        elif action != "clone" and update:
             log(f"Updating git repo: {dest_path}", Color.BLUE)
             cmd = [git_bin, "-C", expanded_path, "pull", "--ff-only"]
             returncode, stdout, stderr = run_command(cmd, env)

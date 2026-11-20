@@ -269,6 +269,7 @@ class SharedPlanTest(unittest.TestCase):
         repos = {new: "u-new", pulled: "u-pulled"}
         state = {"gitRepos": {"installed": [pulled, gone]}}
         self.patch(git_repos, "_has_local_work", return_value=False)
+        self.patch(git_repos, "origin_url", return_value=None)
         rows = diff_mod._diff_git_repos(repos, copy.deepcopy(state), True)
         rec = self.patch(git_repos, "run_command", Recorder())
         self.patch(git_repos, "system_bin", return_value="git")

@@ -54,8 +54,11 @@ class UpdatePreviewTest(unittest.TestCase):
         dest = os.path.join(self.tmp, "repo")
         os.makedirs(os.path.join(dest, ".git"))
         state = {"gitRepos": {"installed": [dest]}}
-        self.assertEqual(diff_mod._diff_git_repos({dest: "u"}, state), [])
-        self.assertEqual(diff_mod._diff_git_repos({dest: "u"}, state, True), [f"  ~ pull {dest}"])
+        with mock.patch.object(git_repos, "origin_url", return_value="u"):
+            self.assertEqual(diff_mod._diff_git_repos({dest: "u"}, state), [])
+            self.assertEqual(
+                diff_mod._diff_git_repos({dest: "u"}, state, True), [f"  ~ pull {dest}"]
+            )
 
     def test_files_on_update_hook(self):
         src = os.path.join(self.tmp, "a.conf")

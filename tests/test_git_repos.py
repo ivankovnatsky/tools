@@ -15,7 +15,13 @@ tearDownModule = trash_fake.stop
 class FakeGit:
     """Stand-in for git, with per-repo dirty/unpushed state."""
 
-    def __init__(self, dirty=(), unpushed=(), failing_status=(), stashed=()):
+    def __init__(
+        self, dirty=(), unpushed=(), failing_status=(), stashed=(), origins=None, failing=()
+    ):
+        # origins: {path: [origin URLs]}; unlisted paths have no origin
+        self.origins = dict(origins or {})
+        # verbs whose command fails, e.g. "remote"
+        self.failing = set(failing)
         self.dirty = set(dirty)
         self.unpushed = set(unpushed)
         self.failing_status = set(failing_status)
@@ -27,6 +33,16 @@ class FakeGit:
         # ["git", "-C", <path>, <verb>, ...]
         path = cmd[2] if len(cmd) > 2 and cmd[1] == "-C" else ""
         verb = cmd[3] if len(cmd) > 3 and cmd[1] == "-C" else cmd[1]
+        if verb in self.failing:
+            return 1, "", f"{verb} failed"
+        if verb == "config" and "--get-all" in cmd:
+            # an entry is a URL in .git/config itself, or a (where, URL) pair
+            # for one from elsewhere (global config, an included file)
+            urls = [u if isinstance(u, tuple) else ("own", u) for u in self.origins.get(path, [])]
+            if "--no-includes" in cmd:
+                urls = [p for p in urls if p[0] == "own"]
+            out = "".join(f"{u}\n" for _, u in urls)
+            return (0, out, "") if urls else (1, "", "")
         if verb == "status":
             if path in self.failing_status:
                 return 1, "", "not a repo"
@@ -295,6 +311,104 @@ class LocalWorkTest(unittest.TestCase):
         self.assertEqual(calls[0], ["git", "-C", "/r", "status", "--porcelain", "--ignored"])
 
 
+class GitReposOriginTest(unittest.TestCase):
+    OLD = "https://example/old.git"
+    NEW = "https://example/new.git"
+
+    def _reconcile(self, fake, update=False):
+        with (
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "run_command", fake.run),
+        ):
+            return git_repos.install_git_repos(
+                {self.repo: self.NEW}, {"gitRepos": {"installed": [self.repo]}}, update
+            )
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = tmp.name
+        os.mkdir(os.path.join(self.repo, ".git"))
+
+    def _writes(self, fake):
+        return [c[3:] for c in fake.commands if c[3:4] in (["remote"], ["pull"])]
+
+    def test_changed_url_sets_origin(self):
+        fake = FakeGit(origins={self.repo: [self.OLD]})
+
+        self.assertTrue(self._reconcile(fake))
+
+        self.assertEqual(self._writes(fake), [["remote", "set-url", "origin", self.NEW]])
+
+    def test_changed_url_sets_origin_before_the_pull(self):
+        fake = FakeGit(origins={self.repo: [self.OLD]})
+
+        self.assertTrue(self._reconcile(fake, update=True))
+
+        self.assertEqual(
+            self._writes(fake),
+            [["remote", "set-url", "origin", self.NEW], ["pull", "--ff-only"]],
+        )
+
+    def test_failed_set_url_skips_the_pull(self):
+        fake = FakeGit(origins={self.repo: [self.OLD]}, failing={"remote"})
+
+        self.assertFalse(self._reconcile(fake, update=True))
+
+        self.assertEqual(self._writes(fake), [["remote", "set-url", "origin", self.NEW]])
+
+    def test_matching_origin_is_left_alone(self):
+        fake = FakeGit(origins={self.repo: [self.NEW]})
+
+        self.assertTrue(self._reconcile(fake))
+
+        self.assertEqual(self._writes(fake), [])
+
+    def test_other_origins_are_left_alone(self):
+        # No origin, several URLs, a URL from global config or an included
+        # file (set-url would add a second one), or git failing (e.g. the macOS stub without the
+        # Command Line Tools).
+        for fake in (
+            FakeGit(),
+            FakeGit(origins={self.repo: [self.OLD, self.NEW]}),
+            FakeGit(origins={self.repo: [("global", self.OLD)]}),
+            FakeGit(origins={self.repo: [("include", self.OLD)]}),
+            FakeGit(origins={self.repo: [self.OLD]}, failing={"config"}),
+        ):
+            with self.subTest(fake=fake.origins):
+                self.assertTrue(self._reconcile(fake))
+                self.assertEqual(self._writes(fake), [])
+
+    def test_adopted_checkout_keeps_its_origin(self):
+        fake = FakeGit(origins={self.repo: [self.OLD]})
+        with (
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "run_command", fake.run),
+        ):
+            state = {}
+            self.assertTrue(git_repos.install_git_repos({self.repo: self.NEW}, state))
+            changes = diff_mod._diff_git_repos({self.repo: self.NEW}, {})
+
+        self.assertEqual(self._writes(fake), [])
+        self.assertEqual(state["gitRepos"]["installed"], [self.repo])
+        self.assertEqual(changes, [f"  + track {self.repo}"])
+
+    def test_changed_url_is_previewed(self):
+        fake = FakeGit(origins={self.repo: [self.OLD]})
+        with (
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "run_command", fake.run),
+        ):
+            changes = diff_mod._diff_git_repos(
+                {self.repo: self.NEW}, {"gitRepos": {"installed": [self.repo]}}
+            )
+
+        self.assertEqual(changes, [f"  ~ set origin {self.repo} -> {self.NEW}"])
+
+
 class GitReposDiffTest(unittest.TestCase):
     def test_dropped_section_is_previewed_at_top_level(self):
         # show_diff must gate gitRepos on config OR state, exactly like
@@ -346,7 +460,10 @@ class GitReposDiffTest(unittest.TestCase):
             home = os.path.realpath(home)
             repo = os.path.join(home, "r")
             os.makedirs(os.path.join(repo, ".git"))
-            with mock.patch.dict(os.environ, {"HOME": home}):
+            with (
+                mock.patch.dict(os.environ, {"HOME": home}),
+                mock.patch.object(git_repos, "origin_url", return_value=None),
+            ):
                 changes = diff_mod._diff_git_repos(
                     {"~/r": "u"}, {"gitRepos": {"installed": [repo]}}
                 )
