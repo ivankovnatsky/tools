@@ -296,7 +296,7 @@ class DeployTest(unittest.TestCase):
                 return 0, json.dumps({"formulae": [entry]}), ""
             return 0, "", ""
 
-        for old, new in (("foo", "user/tap/foo"), ("oldf", "newf")):
+        for old, new in (("foo", "homebrew/core/foo"), ("oldf", "newf")):
             with self.subTest(new=new):
                 calls: list = []
                 save_json(self.state_file, {"version": 2, "brew": {"brews": [old, "gone", "kept"]}})
@@ -310,6 +310,29 @@ class DeployTest(unittest.TestCase):
                     self.assertTrue(self.deploy(config, only))
                 self.assertTrue(all(c[0] == "info" for c in calls), calls)
                 self.assertEqual(self.state()["brew"]["brews"], sorted(["gone", "kept", new]))
+
+    def test_brew_move_to_a_selected_name_uninstalls_the_old_first(self):
+        calls: list = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd[1:])
+            return 0, "", ""
+
+        save_json(self.state_file, {"version": 2, "brew": {"brews": ["terraform", "kept"]}})
+        config = {"brew": {"brews": ["kept", "hashicorp/tap/terraform"]}}
+        only = {"brew": frozenset({"hashicorp/tap/terraform"})}
+        with (
+            mock.patch.object(brew_mod.sys, "platform", "darwin"),
+            mock.patch.object(brew_mod, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew_mod, "run_command", side_effect=fake_run),
+        ):
+            self.assertTrue(self.deploy(config, only))
+        changes = [c for c in calls if c[0] in ("install", "uninstall")]
+        self.assertEqual(
+            changes,
+            [["uninstall", "--formula", "terraform"], ["install", "hashicorp/tap/terraform"]],
+        )
+        self.assertEqual(self.state()["brew"]["brews"], ["hashicorp/tap/terraform", "kept"])
 
     def test_brew_app_store_id_change_refuses_without_uninstall(self):
         save_json(self.state_file, {"version": 2, "brew": {"masApps": {"App": 1}}})

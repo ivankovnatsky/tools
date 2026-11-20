@@ -16,7 +16,7 @@ from tools.user import defaults as defaults_section
 from tools.user import launchd as launchd_section
 from tools.user import sops as sops_section
 from tools.user import templates as templates_section
-from tools.user.brew import _normalize_tap, _resolve_renames, entry_name, parse_brew
+from tools.user.brew import _moves, _normalize_tap, _resolve_renames, entry_name, parse_brew
 from tools.user.files import _resolve_entries, declared_hooks
 from tools.user.secrets_flow import template_hooks
 
@@ -226,7 +226,11 @@ class _Brew:
         resolved = _resolve_renames(parse_brew(view)[0], candidates)
         for key in ("brews", "casks"):
             adopted = set(candidates[key]) - set(resolved.get(key, []))
-            stash[key] = [v for v in stash[key] if v not in adopted]
+            # The old half of a move to a selected name too: it is uninstalled
+            # before the new one installs, not set aside.
+            dropped = sorted(set(candidates[key]) - keep[key])
+            moving = {old for old, _ in _moves(dropped, sorted(keep[key] - set(prev.get(key, []))))}
+            stash[key] = [v for v in stash[key] if v not in adopted | moving]
         mas = prev.get("masApps", {})
         if not isinstance(mas, dict):
             raise _bad_state("brew")

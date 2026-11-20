@@ -147,12 +147,12 @@ class BrewReconcileTest(unittest.TestCase):
         self.assertEqual(state["brew"]["brews"], [])
 
     def test_partial_batch_matches_tap_qualified_names(self):
-        # `brew list -1` prints short names; config names may be `user/tap/tool`.
+        # Formulae are listed with --full-name (tap ones qualified), casks short.
         def fake_run(cmd, env=None, cwd=None):
             if cmd[1] in ("install", "uninstall"):
                 return 1, "", "boom"
             if cmd[1] == "list":
-                return 0, "tool\napp\n", ""
+                return 0, ("u/t/tool\n" if "--full-name" in cmd else "app\n"), ""
             return 0, "", ""
 
         state = {}
@@ -164,6 +164,18 @@ class BrewReconcileTest(unittest.TestCase):
         self.assertFalse(self._reconcile({}, state, fake_run))
         self.assertEqual(state["brew"]["brews"], ["u/t/tool"])
         self.assertEqual(state["brew"]["casks"], ["u/t/app"])
+
+    def test_partial_batch_does_not_take_core_for_a_tap_formula(self):
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1] == "install":
+                return 1, "", "boom"
+            if cmd[1] == "list":
+                return 0, "tool\n", ""
+            return 0, "", ""
+
+        state = {}
+        self.assertFalse(self._reconcile({"brews": ["u/t/tool"]}, state, fake_run))
+        self.assertEqual(state["brew"]["brews"], [])
 
     def test_failed_mas_uninstall_on_id_swap_keeps_old_record(self):
         calls = []
@@ -505,9 +517,15 @@ class BrewOptionsTest(unittest.TestCase):
         self.assertFalse(result)
         self.assertIn(["/brew", "upgrade", "--formula", "a"], fake.calls)
 
-    def test_tap_qualified_rename_only_renames_state(self):
-        for config_name, state_name in (("user/tap/foo", "foo"), ("foo", "user/tap/foo")):
-            for key in ("brews", "casks"):
+    def test_core_qualified_rename_only_renames_state(self):
+        pairs = (
+            ("brews", "homebrew/core/foo", "foo"),
+            ("brews", "homebrew/homebrew-core/foo", "foo"),
+            ("casks", "homebrew/cask/foo", "foo"),
+            ("brews", "User/homebrew-tap/foo", "user/tap/foo"),
+        )
+        for key, qualified, short in pairs:
+            for config_name, state_name in ((qualified, short), (short, qualified)):
                 with self.subTest(key=key, config=config_name):
                     state = _state(**{key: [state_name]})
                     config = {key: [config_name]}
@@ -521,6 +539,231 @@ class BrewOptionsTest(unittest.TestCase):
                     self.assertEqual(fake.calls, [])
                     self.assertEqual(state["brew"][key], [config_name])
 
+    def test_move_between_core_and_a_tap_replaces_the_package(self):
+        # Same short name, another tap: a different package, and brew can't
+        # have both, so the old one is uninstalled before the new install.
+        for old, new in (("terraform", "hashicorp/tap/terraform"), ("u/t/foo", "foo")):
+            for key, kind in (("brews", "--formula"), ("casks", "--cask")):
+                with self.subTest(old=old, key=key):
+                    table = "formulae" if key == "brews" else "casks"
+                    fake = FakeBrew(**{table: {old: {}}})
+                    state = _state(**{key: [old]})
+                    result, fake = self._run({key: [new]}, state, fake)
+                    self.assertTrue(result)
+                    changes = [c[1:] for c in fake.calls if c[1] in ("install", "uninstall")]
+                    self.assertEqual(changes[0], ["uninstall", kind, old])
+                    self.assertEqual(changes[1][0], "install")
+                    self.assertEqual(changes[1][-1], new)
+                    self.assertEqual(len(changes), 2)
+                    self.assertEqual(state["brew"][key], [new])
+
+    def test_move_of_a_hand_removed_package_installs_the_new_one(self):
+        state = _state(brews=["terraform"])
+        result, fake = self._run({"brews": ["hashicorp/tap/terraform"]}, state)
+        self.assertIn(["/brew", "install", "hashicorp/tap/terraform"], fake.calls)
+        self.assertEqual(state["brew"]["brews"], ["hashicorp/tap/terraform"])
+        self.assertTrue(result)
+
+    def test_formula_move_does_not_keep_a_dropped_cask_of_the_same_name(self):
+        fake = FakeBrew(formulae={"foo": {}}, casks={"foo": {}})
+        state = _state(brews=["foo"], casks=["foo"])
+        result, fake = self._run({"brews": ["u/t/foo"]}, state, fake)
+        self.assertTrue(result)
+        self.assertIn(["/brew", "uninstall", "--cask", "foo"], fake.calls)
+        self.assertEqual(state["brew"]["casks"], [])
+
+    def test_failed_move_fails_the_install_phase(self):
+        fake = FakeBrew(formulae={"terraform": {}, "user": {"deps": ["terraform"]}})
+        state = _state(brews=["terraform"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            config = {"brews": ["hashicorp/tap/terraform"]}
+            self.assertFalse(brew.install_brew_packages(config, state, phase=brew.INSTALL))
+        self.assertFalse([c for c in fake.calls if c[1] == "install"])
+
+    def test_cleanup_keeps_deps_of_the_moved_package(self):
+        fake = FakeBrew(
+            formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}},
+            taps=["u/t"],
+            available={"u/t/foo": {"deps": ["libx"]}},
+        )
+        state = _state(brews=["foo"], taps=["u/t"])
+        config = {"brews": ["u/t/foo"], "taps": ["u/t"], "onActivation": {"cleanup": "uninstall"}}
+        result, fake = self._run(config, state, fake)
+        self.assertTrue(result)
+        self.assertNotIn("libx", [c[-1] for c in fake.calls if c[1] == "uninstall"])
+        self.assertIn("libx", fake.formulae)
+
+    def test_short_name_of_the_same_tap_package_is_a_rename(self):
+        calls = []
+
+        def fake_run(cmd, env=None, cwd=None):
+            calls.append(cmd)
+            if cmd[1:3] == ["list", "--formula"]:
+                return 0, "u/t/foo\n", ""
+            return 0, "", ""
+
+        for name in ("u/t/foo", "U/homebrew-t/foo"):
+            with self.subTest(name=name):
+                calls.clear()
+                state = _state(brews=["foo"])
+                with (
+                    mock.patch.object(brew.sys, "platform", "darwin"),
+                    mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+                    mock.patch.object(brew, "run_command", fake_run),
+                ):
+                    self.assertTrue(brew.install_brew_packages({"brews": [name]}, state))
+                self.assertEqual([c for c in calls if c[1] not in ("info", "list")], [])
+                self.assertEqual(state["brew"]["brews"], [name])
+
+    def test_short_name_brew_now_resolves_to_the_tap_is_still_a_move(self):
+        # core foo is installed; brew info foo would name u/t/foo after a migration
+        fake = FakeBrew(formulae={"foo": {}})
+        state = _state(brews=["foo"])
+        result, fake = self._run({"brews": ["u/t/foo"]}, state, fake)
+        self.assertTrue(result)
+        self.assertIn(["/brew", "uninstall", "--formula", "foo"], fake.calls)
+        self.assertIn(["/brew", "install", "u/t/foo"], fake.calls)
+
+    def test_failed_uninstall_keeps_a_short_name_installed_from_a_tap(self):
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1] == "uninstall":
+                return 1, "", "refused"
+            if cmd[1] == "list":
+                return 0, "u/t/foo\n", ""
+            return 0, "", ""
+
+        state = _state(brews=["foo"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertFalse(brew.install_brew_packages({"brews": []}, state))
+        self.assertEqual(state["brew"]["brews"], ["foo"])
+
+    def test_move_autoremoves_the_old_package_deps(self):
+        fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
+        state = _state(brews=["foo"])
+        result, fake = self._run({"brews": ["u/t/foo"]}, state, fake)
+        self.assertTrue(result)
+        self.assertEqual(fake.calls[-1], ["/brew", "autoremove"])
+
+    def test_failed_tap_keeps_the_old_package_across_phases(self):
+        for cleanup in ({}, {"onActivation": {"cleanup": "uninstall"}}):
+            with self.subTest(cleanup=cleanup):
+                fake = FakeBrew(formulae={"terraform": {}})
+                fake.fail.add("tap")
+                state = _state(brews=["terraform"])
+                config = {
+                    "brews": ["hashicorp/tap/terraform"],
+                    "taps": ["hashicorp/tap"],
+                    **cleanup,
+                }
+                with (
+                    mock.patch.object(brew.sys, "platform", "darwin"),
+                    mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+                    mock.patch.object(brew, "run_command", fake),
+                ):
+                    brew.install_brew_packages(config, state, phase=brew.INSTALL)
+                    brew.install_brew_packages(config, state, phase=brew.REMOVE)
+                self.assertIn("terraform", fake.formulae)
+                self.assertEqual(state["brew"]["brews"], ["terraform"])
+
+    def test_cleanup_keeps_deps_of_a_kept_old_package(self):
+        fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
+        fake.fail.add("tap")
+        state = _state(brews=["foo"])
+        config = {"brews": ["u/t/foo"], "taps": ["u/t"], "onActivation": {"cleanup": "uninstall"}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            brew.install_brew_packages(config, state, phase=brew.INSTALL)
+            brew.install_brew_packages(config, state, phase=brew.REMOVE)
+            brew.install_brew_packages(config, state)
+        self.assertFalse([c for c in fake.calls if c[1] == "uninstall"])
+        self.assertIn("libx", fake.formulae)
+
+    def test_failed_tap_keeps_the_old_package(self):
+        fake = FakeBrew(formulae={"terraform": {}})
+        fake.fail.add("tap")
+        state = _state(brews=["terraform"])
+        config = {"brews": ["hashicorp/tap/terraform"], "taps": ["hashicorp/tap"]}
+        result, fake = self._run(config, state, fake)
+        self.assertFalse(result)
+        self.assertIn("terraform", fake.formulae)
+        self.assertFalse([c for c in fake.calls if c[1] in ("install", "uninstall")])
+
+    def test_failed_uninstall_matches_another_tap_spelling(self):
+        def fake_run(cmd, env=None, cwd=None):
+            if cmd[1] == "uninstall":
+                return 1, "", "refused"
+            if cmd[1] == "list":
+                return 0, "user/tap/foo\n", ""
+            return 0, "", ""
+
+        state = _state(brews=["User/homebrew-tap/foo"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake_run),
+        ):
+            self.assertFalse(brew.install_brew_packages({"brews": []}, state))
+        self.assertEqual(state["brew"]["brews"], ["User/homebrew-tap/foo"])
+
+    def test_failed_owed_autoremove_stays_owed(self):
+        fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
+        state = _state(brews=["foo"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            config = {"brews": ["u/t/foo"]}
+            brew.install_brew_packages(config, state, phase=brew.INSTALL)
+            fake.fail.add("autoremove")
+            brew.install_brew_packages(config, state, phase=brew.REMOVE)
+            self.assertTrue(state["brew"].get("autoremoveOwed"))
+            fake.fail.discard("autoremove")
+            brew.install_brew_packages(config, state, phase=brew.REMOVE)
+        self.assertEqual(fake.calls[-1], ["/brew", "autoremove"])
+        self.assertNotIn("autoremoveOwed", state["brew"])
+
+    def test_failed_autoremove_after_a_move_is_owed(self):
+        fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
+        fake.fail.add("autoremove")
+        state = _state(brews=["foo"])
+        result, fake = self._run({"brews": ["u/t/foo"]}, state, fake)
+        self.assertTrue(state["brew"].get("autoremoveOwed"))
+
+    def test_move_autoremoves_in_the_remove_phase(self):
+        fake = FakeBrew(formulae={"foo": {"deps": ["libx"]}, "libx": {"on_request": False}})
+        state = _state(brews=["foo"])
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            config = {"brews": ["u/t/foo"]}
+            self.assertTrue(brew.install_brew_packages(config, state, phase=brew.INSTALL))
+            self.assertNotIn(["/brew", "autoremove"], fake.calls)
+            self.assertTrue(brew.install_brew_packages(config, state, phase=brew.REMOVE))
+        self.assertEqual(fake.calls[-1], ["/brew", "autoremove"])
+        self.assertNotIn("autoremoveOwed", state["brew"])
+
+    def test_failed_uninstall_of_moved_package_skips_the_install(self):
+        fake = FakeBrew(formulae={"terraform": {}, "user": {"deps": ["terraform"]}})
+        state = _state(brews=["terraform"])
+        result, fake = self._run({"brews": ["hashicorp/tap/terraform"]}, state, fake)
+        self.assertFalse(result)
+        self.assertFalse([c for c in fake.calls if c[1] == "install"])
+        self.assertEqual(state["brew"]["brews"], ["terraform"])
+
     def test_ambiguous_short_name_is_not_a_rename(self):
         state = _state(brews=["foo"])
         result, fake = self._run({"brews": ["a/b/foo", "c/d/foo"]}, state)
@@ -530,10 +773,13 @@ class BrewOptionsTest(unittest.TestCase):
 
     def test_move_to_another_tap_is_not_a_rename(self):
         state = _state(brews=["a/b/foo"])
-        result, fake = self._run({"brews": ["c/d/foo"]}, state)
+        result, fake = self._run({"brews": ["c/d/foo"]}, state, FakeBrew(formulae={"a/b/foo": {}}))
         self.assertTrue(result)
-        self.assertIn(["/brew", "install", "c/d/foo"], fake.calls)
-        self.assertIn(["/brew", "uninstall", "a/b/foo"], fake.calls)
+        changes = [c for c in fake.calls if c[1] in ("install", "uninstall")]
+        self.assertEqual(
+            changes,
+            [["/brew", "uninstall", "--formula", "a/b/foo"], ["/brew", "install", "c/d/foo"]],
+        )
 
     def test_renamed_cask_token_only_renames_state(self):
         calls = []

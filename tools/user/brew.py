@@ -118,12 +118,24 @@ def _installed_subset(brew: str, env: dict, candidates: list[str], kind: str) ->
     a failed uninstall would silently drop ownership of packages that are
     still on disk.
     """
-    rc, stdout, _ = run_command([brew, "list", kind, "-1"], env)
+    # --full-name prints tap formulae qualified (`user/tap/tool`), so core
+    # `tool` doesn't count as another tap's `tool`; a short name still matches
+    # any of them. Casks are listed short.
+    full = kind == "--formula"
+    rc, stdout, _ = run_command([brew, "list", kind, *(["--full-name"] * full), "-1"], env)
     if rc != 0:
         return None
-    # `brew list -1` prints short names; config may name `user/tap/tool`.
     present = {line.strip() for line in stdout.splitlines() if line.strip()}
-    return {c for c in candidates if _variants([c]) & present}
+    shorts = _short_names(present)
+    # Config may spell a tap `user/homebrew-tap` or in another case.
+    canonical = {_canonical(n) for n in present}
+
+    def installed(c: str) -> bool:
+        if full and "/" in _canonical(c):
+            return _canonical(c) in canonical
+        return bool(_short_names([c]) & shorts)
+
+    return {c for c in candidates if installed(c)}
 
 
 _KEYS = {"brews", "casks", "taps", "masApps", "environment", "caskArgs", "onActivation", "trust"}
@@ -302,8 +314,10 @@ def _adopt_renames(
     spec: BrewSpec, prev: Dict, known: Optional[Dict[str, Dict[str, Set[str]]]] = None
 ) -> Dict:
     """`prev` with each recorded brew/cask that config now names differently
-    (tap-qualified vs short, or an alias, old name or old token in `known`)
-    recorded under the config's name, so it is neither installed nor removed.
+    (homebrew/core or homebrew/cask qualified vs short, or an alias, old name
+    or old token in `known`) recorded under the config's name, so it is
+    neither installed nor removed. Another tap's `user/tap/foo` is a different
+    package from `foo` unless brew says so (`known`): see `_moves`.
     """
     known = known or {}
     out = dict(prev)
@@ -319,9 +333,7 @@ def _adopt_renames(
                 for n in added
                 if n not in taken
                 and (
-                    old in _variants([n])
-                    or n in _variants([old])
-                    or names.get(n, set()) & _variants([old])
+                    _canonical(old) == _canonical(n) or names.get(n, set()) & _core_variants([old])
                 )
             ]
             if len(hits) == 1:
@@ -374,8 +386,35 @@ def _resolve_renames(spec: BrewSpec, prev: Dict) -> Dict:
         or (plan["casks_install"] and plan["casks_remove"])
     ):
         return renamed
-    known = _known_names(brew, _brew_env(brew, spec), spec, renamed)
-    return _adopt_renames(spec, renamed, known) if known else renamed
+    env = _brew_env(brew, spec)
+    known = _known_names(brew, env, spec, renamed)
+    renamed = _adopt_renames(spec, renamed, known) if known else renamed
+    return _adopt_same_package_moves(brew, env, spec, renamed)
+
+
+def _adopt_same_package_moves(brew: str, env: Dict, spec: BrewSpec, prev: Dict) -> Dict:
+    """`prev` with a recorded short formula name that config now writes
+    tap-qualified recorded under the config's name, when the installed formula
+    is that tap's: `foo` installed from `u/t` is `u/t/foo`, core `foo` is not.
+    Casks are listed short, so a cask move stays a move."""
+    plan = _plan(spec, prev)
+    moves = [
+        (o, n)
+        for o, n in _moves(plan["brews_remove"], plan["brews_install"])
+        if "/" not in _canonical(o)
+    ]
+    if not moves:
+        return prev
+    # The keg's own tap: brew info would name what the short name resolves to now.
+    rc, stdout, _ = run_command([brew, "list", "--formula", "--full-name", "-1"], env)
+    if rc != 0:
+        return prev
+    installed = {_canonical(line.strip()) for line in stdout.splitlines() if line.strip()}
+    out = dict(prev)
+    for old, new in moves:
+        if _canonical(new) in installed:
+            out["brews"] = sorted((set(out.get("brews", [])) - {old}) | {new})
+    return out
 
 
 def _brew_env(brew: str, spec: BrewSpec, update: bool = False) -> Dict[str, str]:
@@ -398,6 +437,54 @@ def _brew_env(brew: str, spec: BrewSpec, update: bool = False) -> Dict[str, str]
 def _variants(names) -> Set[str]:
     """Each name plus its short form, so `user/tap/foo` and `foo` match each other."""
     return {v for n in names for v in (n, n.rsplit("/", 1)[-1])}
+
+
+def _canonical(name: str) -> str:
+    """One spelling per package: `User/homebrew-tap/foo` -> `user/tap/foo`,
+    `homebrew/homebrew-core/foo` -> `foo`; other names lowercased."""
+    tap, short = _tap_of(name), name.rsplit("/", 1)[-1].lower()
+    if tap in ("homebrew/core", "homebrew/cask"):
+        return short
+    return f"{tap}/{short}" if tap else name.lower()
+
+
+def _short_names(names) -> Set[str]:
+    return {n.rsplit("/", 1)[-1] for n in names}
+
+
+def _core_variants(names) -> Set[str]:
+    """Each name, plus its short form when it is short or core-qualified:
+    `homebrew/core/foo` is `foo`, `user/tap/foo` may not be."""
+    return {
+        v for n in names for v in (n, n.rsplit("/", 1)[-1]) if v == n or "/" not in _canonical(n)
+    }
+
+
+def _moves(removed, added) -> List[Tuple[str, str]]:
+    """(old, new): a package that config now takes from another tap under the
+    same short name. brew can't have both installed, so the old one goes first."""
+
+    def by_short(names):
+        out: Dict[str, List[str]] = {}
+        for n in names:
+            out.setdefault(n.rsplit("/", 1)[-1], []).append(n)
+        return out
+
+    olds, news = by_short(removed), by_short(added)
+    return sorted(
+        (olds[k][0], news[k][0])
+        for k in olds.keys() & news.keys()
+        if len(olds[k]) == 1 and len(news[k]) == 1
+    )
+
+
+def _moving(plan: Dict[str, list]) -> Set[str]:
+    """New names of the packages `plan` moves to another tap."""
+    return {
+        new
+        for key in ("brews", "casks")
+        for _, new in _moves(plan[f"{key}_remove"], plan[f"{key}_install"])
+    }
 
 
 def _entry_names(entry: Dict, keys: Tuple[str, ...]) -> Set[str]:
@@ -425,7 +512,9 @@ def _cask_deps(cask: Dict) -> Tuple[List[str], List[str]]:
     return list(depends_on.get("formula") or []), list(depends_on.get("cask") or [])
 
 
-def query_installed(brew: str, env: Dict, spec: BrewSpec) -> Tuple[Optional[Dict], Optional[str]]:
+def query_installed(
+    brew: str, env: Dict, spec: BrewSpec, moving: Optional[Set[str]] = None
+) -> Tuple[Optional[Dict], Optional[str]]:
     """Read-only snapshot of live brew for cleanup. (None, error) when brew can't be queried.
 
     `pending` holds the dependencies of configured packages not installed yet,
@@ -462,8 +551,11 @@ def query_installed(brew: str, env: Dict, spec: BrewSpec) -> Tuple[Optional[Dict
 
     have_brews = set().union(*(_entry_names(f, _FORMULA_NAME_KEYS) for f in formulae))
     have_casks = set().union(*(_entry_names(c, _CASK_NAME_KEYS) for c in casks))
-    missing_brews = sorted(n for n in spec.brews if not _variants([n]) & have_brews)
-    missing_casks = sorted(n for n in spec.casks if not _variants([n]) & have_casks)
+    # A package moving to another tap counts as missing: the installed one with
+    # its short name is the old package (`_moves`).
+    moving = moving or set()
+    missing_brews = sorted(n for n in spec.brews if n in moving or not _variants([n]) & have_brews)
+    missing_casks = sorted(n for n in spec.casks if n in moving or not _variants([n]) & have_casks)
 
     tapped = {t.lower() for t in live_taps}
     wanted_taps = {t.lower() for t in spec.taps}
@@ -699,6 +791,7 @@ def _record(state: Dict, brews, casks, taps, mas, trusted) -> None:
 
 
 INSTALL = "install"
+_AUTOREMOVE_OWED = "autoremoveOwed"
 REMOVE = "remove"
 _REMOVE_KEYS = ("taps_remove", "trust_remove", "brews_remove", "casks_remove")
 
@@ -773,6 +866,11 @@ def install_brew_packages(
             state["brew"]["masApps"] = dict(spec.mas)
         return True
 
+    # A move in an earlier INSTALL phase left the old package's deps for
+    # REMOVE to autoremove.
+    owed_before = bool(state.get("brew", {}).get(_AUTOREMOVE_OWED))
+    owed = owed_before and phase != INSTALL
+
     upgrade = {
         "--formula": sorted(inst_brews & spec.brews),
         "--cask": sorted(inst_casks & spec.casks),
@@ -780,7 +878,7 @@ def install_brew_packages(
     }
     upgrades = update and any(upgrade.values())
     planned = any(plan.values())
-    if not planned and not upgrades and not cleanup:
+    if not planned and not upgrades and not cleanup and not owed:
         debug("All brew packages in sync", Color.BLUE)
         return unchanged()
 
@@ -803,7 +901,7 @@ def install_brew_packages(
     clean = _no_cleanup()
     cleanup_planned = False
     if cleanup:
-        live, err = query_installed(brew, env, spec)
+        live, err = query_installed(brew, env, spec, _moving(whole))
         if err:
             log(f"brew cleanup skipped: {err}", Color.RED)
             success = False
@@ -812,7 +910,7 @@ def install_brew_packages(
         else:
             clean = cleanup_targets(spec, prev, whole, live)
             cleanup_planned = True
-    if not planned and not upgrades and not any(clean.values()):
+    if not planned and not upgrades and not any(clean.values()) and not owed:
         debug("All brew packages in sync", Color.BLUE)
         return unchanged() and success
 
@@ -875,8 +973,47 @@ def install_brew_packages(
                 log(f"Failed to upgrade Mac App Store apps: {stderr}", Color.RED)
                 success = False
 
+    # --- Moves to another tap: uninstall the old package before installing ---
+    # old packages the moves handled: removed, or kept until the move can run
+    moved: Dict[str, Set[str]] = {"brews": set(), "casks": set()}
+    replaced = False
+    blocked: Dict[str, Set[str]] = {"brews": set(), "casks": set()}
+    kept: Dict[str, Set[str]] = {"brews": set(), "casks": set()}
+    for key, owned, kind in (("brews", inst_brews, "--formula"), ("casks", inst_casks, "--cask")):
+        for old_name, new_name in _moves(whole[f"{key}_remove"], whole[f"{key}_install"]):
+            if phase == REMOVE:
+                # The INSTALL phase skipped or failed this move: keep the old one.
+                moved[key].add(old_name)
+                kept[key].add(old_name)
+                continue
+            if _tap_of(new_name) in {t.lower() for t in failed_taps}:
+                log(f"Not replacing {old_name}: tapping for {new_name} failed", Color.YELLOW)
+                blocked[key].add(new_name)
+                moved[key].add(old_name)
+                kept[key].add(old_name)
+                continue
+            log(f"Replacing {old_name} with {new_name}", Color.BLUE)
+            cmd = [brew, "uninstall", kind]
+            _remove(brew, {**env, "HOMEBREW_NO_AUTOREMOVE": "1"}, cmd, [old_name], owned, kind)
+            # A failed uninstall of a package already gone (removed by hand)
+            # leaves it unowned: the move goes on.
+            if old_name in owned:
+                log(f"Not installing {new_name}: {old_name} is still installed", Color.YELLOW)
+                blocked[key].add(new_name)
+                kept[key].add(old_name)
+                success = False
+            else:
+                replaced = True
+            moved[key].add(old_name)
+    if cleanup_planned and any(kept.values()):
+        # A kept old package still needs its deps and its tap.
+        still = {**whole}
+        for key in ("brews", "casks"):
+            still[f"{key}_remove"] = [n for n in whole[f"{key}_remove"] if n not in kept[key]]
+        clean = cleanup_targets(spec, prev, still, live)
+
     # --- Installs ---
-    brews_to_install = plan["brews_install"]
+    brews_to_install = [n for n in plan["brews_install"] if n not in blocked["brews"]]
     if brews_to_install:
         log(f"Installing formulae: {', '.join(brews_to_install)}", Color.GREEN)
         rc, _, stderr = run_command([brew, "install"] + brews_to_install, env)
@@ -893,7 +1030,7 @@ def install_brew_packages(
         else:
             inst_brews |= set(brews_to_install)
             _owe(state, spec.brew_units, "brews", brews_to_install)
-    casks_to_install = plan["casks_install"]
+    casks_to_install = [n for n in plan["casks_install"] if n not in blocked["casks"]]
     if casks_to_install:
         log(f"Installing casks: {', '.join(casks_to_install)}", Color.GREEN)
         cmd = [brew, "install", "--cask"]
@@ -921,16 +1058,34 @@ def install_brew_packages(
         # refusal blocks only itself. Homebrew's own autoremove after each
         # uninstall would delete listed orphans and pending deps out of order.
         rm_env = {**env, "HOMEBREW_NO_AUTOREMOVE": "1"}
-        removals += [(cask_cmd, c, inst_casks, "--cask") for c in clean["cask_order"]]
-        removals += [([brew, "uninstall"], f, inst_brews, "--formula") for f in clean["brew_order"]]
+        removals += [
+            (cask_cmd, c, inst_casks, "--cask")
+            for c in clean["cask_order"]
+            if c not in moved["casks"]
+        ]
+        removals += [
+            ([brew, "uninstall"], f, inst_brews, "--formula")
+            for f in clean["brew_order"]
+            if f not in moved["brews"]
+        ]
         for cmd, name, owned, kind in removals:
             log(f"{'Zapping' if kind == '--cask' and zap else 'Removing'} {name}", Color.RED)
             if not _remove(brew, rm_env, cmd, [name], owned, kind):
                 success = False
     else:
         for cmd, names, owned, kind in (
-            ([brew, "uninstall"], plan["brews_remove"], inst_brews, "--formula"),
-            (cask_cmd, plan["casks_remove"], inst_casks, "--cask"),
+            (
+                [brew, "uninstall"],
+                [n for n in plan["brews_remove"] if n not in moved["brews"]],
+                inst_brews,
+                "--formula",
+            ),
+            (
+                cask_cmd,
+                [n for n in plan["casks_remove"] if n not in moved["casks"]],
+                inst_casks,
+                "--cask",
+            ),
         ):
             if names:
                 removals.append(names)
@@ -973,12 +1128,19 @@ def install_brew_packages(
                 inst_mas[name] = app_id
 
     # --- Autoremove orphaned deps; cleanup already removed the ones it listed ---
-    if removals and not cleanup_planned:
+    # A move's uninstall ran without autoremove, so the new package's deps
+    # were kept until it was installed.
+    # Not in the INSTALL phase of a split run: a runtime another section still
+    # needs must stay until REMOVE, so it is owed in state.
+    moves_done = (phase is None and replaced) or owed
+    autoremove_failed = False
+    if (removals or moves_done) and not cleanup_planned:
         rc, stdout, stderr = run_command([brew, "autoremove"], env)
         if rc == 0 and stdout.strip():
             log("Autoremoved orphaned deps", Color.RED)
         elif rc != 0:
             log(f"Failed to autoremove: {stderr}", Color.RED)
+            autoremove_failed = True
 
     # --- Untap and untrust last, once nothing installed still loads from them ---
     for tap in sorted(set(plan["taps_remove"]) | set(clean["taps"])):
@@ -999,6 +1161,9 @@ def install_brew_packages(
             inst_trust.discard(tap)
 
     _record(state, inst_brews, inst_casks, inst_taps, inst_mas, inst_trust)
+    # Still owed until an autoremove succeeds.
+    if (phase == INSTALL and (replaced or owed_before)) or (moves_done and autoremove_failed):
+        state["brew"][_AUTOREMOVE_OWED] = True
     return success
 
 
@@ -1019,7 +1184,7 @@ def diff_brew(brew_config, state: Dict, update: bool = False) -> List[Tuple[str,
     brew = _brew_bin()
     cleanup_planned = False
     if spec.cleanup and brew:
-        live, err = query_installed(brew, _brew_env(brew, spec), spec)
+        live, err = query_installed(brew, _brew_env(brew, spec), spec, _moving(plan))
         if err:
             notes.append(f"    ? cannot plan cleanup: {err}")
         elif live["deferred"]:
