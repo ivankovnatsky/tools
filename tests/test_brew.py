@@ -1122,6 +1122,104 @@ class BrewOptionsTest(unittest.TestCase):
         self.assertEqual(state["brew"]["trustedTaps"], [])
 
 
+class BrewMoveNeverZapsTest(unittest.TestCase):
+    """A package moving to another tap is replaced with a plain uninstall:
+    `cleanup: zap` must never delete its app data, whatever fails."""
+
+    MOVES = (("a/b/foo", "c/d/foo"), ("foo", "c/d/foo"), ("a/b/foo", "foo"))
+    KINDS = (("brews", "formulae", "--formula"), ("casks", "casks", "--cask"))
+    SPLIT = (brew.INSTALL, brew.REMOVE)
+
+    def _run(self, key, table, old, new, cleanup, phases, fail=(), live_taps=("a/b", "c/d")):
+        # junk: an unmanaged cask, so a zap cleanup visibly ran
+        packages = {"formulae": {}, "casks": {"junk": {}}}
+        packages[table][old] = {}
+        fake = FakeBrew(**packages, taps=list(live_taps))
+        fake.fail |= set(fail)
+        state = _state(**{key: [old]}, taps=["a/b"] if "/" in old else [])
+        taps = [new.rsplit("/", 1)[0]] if "/" in new else []
+        config = {key: [new], "taps": taps, "onActivation": {"cleanup": cleanup}}
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            for phase in phases:
+                brew.install_brew_packages(config, state, phase=phase)
+        return fake, state
+
+    def _cases(self, phase_sets):
+        return [
+            (old, new, key, table, kind, cleanup, phases)
+            for old, new in self.MOVES
+            for key, table, kind in self.KINDS
+            for cleanup in brew.CLEANUP_MODES
+            for phases in phase_sets
+        ]
+
+    def _assert_never_zapped(self, fake, old, kind, cleanup, cleaned=True):
+        uninstalls = [c for c in fake.calls if c[1] == "uninstall"]
+        # Only the move itself removes `foo`, under either spelling.
+        for cmd, env in zip(fake.calls, fake.envs):
+            if cmd not in uninstalls or cmd[-1] == "junk":
+                continue
+            self.assertEqual(cmd, ["/brew", "uninstall", kind, old])
+            self.assertEqual(env.get("HOMEBREW_NO_AUTOREMOVE"), "1")
+        junk = ["/brew", "uninstall", "--cask"] + (["--zap"] if cleanup == "zap" else []) + ["junk"]
+        if cleaned:
+            self.assertIn(junk, uninstalls)
+        else:
+            self.assertFalse([c for c in uninstalls if c[-1] == "junk"])
+
+    def test_move_replaces_the_old_package_without_zapping(self):
+        for old, new, key, table, kind, cleanup, phases in self._cases(((None,), self.SPLIT)):
+            with self.subTest(old=old, new=new, key=key, cleanup=cleanup, ph=phases):
+                fake, state = self._run(key, table, old, new, cleanup, phases)
+                self._assert_never_zapped(fake, old, kind, cleanup)
+                self.assertIn(["/brew", "uninstall", kind, old], fake.calls)
+                self.assertNotIn(old, getattr(fake, table))
+                self.assertIn(new, getattr(fake, table))
+                self.assertEqual(state["brew"][key], [new])
+
+    def test_failed_install_of_the_new_package_never_zaps_the_old_one(self):
+        for old, new, key, table, kind, cleanup, phases in self._cases(((None,), self.SPLIT)):
+            with self.subTest(old=old, new=new, key=key, cleanup=cleanup, ph=phases):
+                fake, state = self._run(key, table, old, new, cleanup, phases, {"install"})
+                self._assert_never_zapped(fake, old, kind, cleanup)
+                self.assertIn(["/brew", "uninstall", kind, old], fake.calls)
+
+    def test_failed_uninstall_keeps_the_old_package_unzapped(self):
+        phase_sets = ((None,), self.SPLIT, (brew.REMOVE,))
+        for old, new, key, table, kind, cleanup, phases in self._cases(phase_sets):
+            with self.subTest(old=old, new=new, key=key, cleanup=cleanup, ph=phases):
+                fail = {("uninstall", kind, old)}
+                fake, state = self._run(key, table, old, new, cleanup, phases, fail)
+                self._assert_never_zapped(fake, old, kind, cleanup)
+                self.assertIn(old, getattr(fake, table))
+                self.assertEqual(state["brew"][key], [old])
+
+    def test_failed_tap_keeps_the_old_package_unzapped(self):
+        for old, new, key, table, kind, cleanup, phases in self._cases(((None,), self.SPLIT)):
+            with self.subTest(old=old, new=new, key=key, cleanup=cleanup, ph=phases):
+                if "/" not in new:
+                    continue
+                fail = {("tap", "c/d")}
+                fake, state = self._run(key, table, old, new, cleanup, phases, fail, ["a/b"])
+                # cleanup waits for the configured tap, so it zaps nothing
+                self._assert_never_zapped(fake, old, kind, cleanup, cleaned=False)
+                self.assertIn(old, getattr(fake, table))
+                self.assertEqual(state["brew"][key], [old])
+
+    def test_remove_phase_alone_keeps_the_pending_move_unzapped(self):
+        for old, new, key, table, kind, cleanup, phases in self._cases(((brew.REMOVE,),)):
+            with self.subTest(old=old, new=new, key=key, cleanup=cleanup, ph=phases):
+                fake, state = self._run(key, table, old, new, cleanup, phases)
+                self._assert_never_zapped(fake, old, kind, cleanup)
+                self.assertNotIn(["/brew", "uninstall", kind, old], fake.calls)
+                self.assertIn(old, getattr(fake, table))
+                self.assertEqual(state["brew"][key], [old])
+
+
 class BrewDiffTest(unittest.TestCase):
     def _diff(self, config, state, fake):
         def read_only(cmd, env=None, cwd=None):
