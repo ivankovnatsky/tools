@@ -1053,9 +1053,29 @@ settingsctl:
   added once by hand: `settings accessibility enable "NEW" --add-missing`
   (needs authentication).
 - Without `settings` on the machine, `diff` reports it whenever a user key is
-  declared, since deploy fails then.
-- A scalar key that leaves config is left as is. Any config error holds the
-  section.
+  declared, since deploy fails then. While records remain (even with the
+  section removed) a missing `settings` fails the section and keeps them all
+  (`!` in diff): keep it installed, and any `path:` it was found by, until
+  the removal has run.
+- Scalar keys (`hostName`, `localHostName`, `computerName`, `timeZone`, each
+  `sleep` timer, `remoteLogin`, `defaultBrowser`) work like `defaults`: the
+  first set records the value before it under `settingsctl.previous` (root's
+  records under `root` for the host keys). When the key leaves config, that
+  value is set again if the setting still holds what tools wrote. The record is
+  forgotten when the setting already holds the prior value, was changed by
+  hand, or the prior value cannot be set with `settings`: an unset host name,
+  sleep timers that differed per power source, Remote Login that was half on,
+  an uninstalled browser, a zone `settings` no longer knows. Remote Login is
+  never turned off on restore, since that could cut off SSH: it stays on and
+  the warning says how to turn it off by hand. A default browser restore is
+  tried once (macOS asks to confirm it). A restore that fails fails that
+  deploy once and is forgotten with a warning; a failed read keeps the record
+  for the next deploy. Host name keys
+  are restored one by one, so some may come back while others are forgotten.
+  Keys tools set before it recorded prior values are no longer managed once
+  they leave config and stay as they are. Host keys are restored only by
+  `sudo tools deploy`; a plain `tools deploy` or `diff` says when some wait.
+- Any config error holds the section.
 
 ## users
 

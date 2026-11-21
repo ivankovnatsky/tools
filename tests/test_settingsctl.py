@@ -463,11 +463,21 @@ class ListRecordTest(SettingsctlCase):
         self.assertEqual(commands, [])
         self.assertEqual(state["settingsctl"], {"loginItems": ["L1"]})
 
-    def test_missing_cli_keeps_records(self):
+    def test_missing_cli_keeps_records_of_removed_section(self):
         state = self.removed_state()
+        rows = self.diff(None, which=lambda _: None, state=state)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("  ! `settings` not found"), rows)
+        self.assertIn(settingsctl.KEEP_CLI, rows[0])
         self.assertFalse(settingsctl.install_settingsctl(None, which=lambda _: None, state=state))
         self.assertEqual(state, self.removed_state())
-        self.assertIn("`settings` not found", self.diff(None, which=lambda _: None, state=state)[0])
+
+    def test_missing_cli_keeps_records_while_section_is_declared(self):
+        state = self.removed_state()
+        raw = {"accessibility": ["Other"]}
+        self.assertFalse(settingsctl.install_settingsctl(raw, which=lambda _: None, state=state))
+        self.assertEqual(state, self.removed_state())
+        self.assertIn("`settings` not found", self.diff(raw, which=lambda _: None, state=state)[0])
 
     def test_root_ignores_records(self):
         state = self.removed_state()
@@ -515,6 +525,12 @@ class AppearanceInitTest(SettingsctlCase):
         state = {"settingsctl": {"appearanceInit": True}}
         self.assertTrue(settingsctl.has_work(None, state))
         self.assertEqual(self._install(None, state=state), (True, []))
+        self.assertEqual(state, {})
+
+    def test_leaving_config_without_cli_forgets_the_record(self):
+        state = {"settingsctl": {"appearanceInit": True}}
+        self.assertEqual(self.diff(None, which=lambda _: None, state=state), [])
+        self.assertTrue(settingsctl.install_settingsctl(None, which=lambda _: None, state=state))
         self.assertEqual(state, {})
 
     def test_bool_keys_are_typed(self):
@@ -597,7 +613,7 @@ class FakeSettings:
         return [c for c in self.calls if c[1:2] == ["set"]]
 
 
-class HostKeysTest(unittest.TestCase):
+class HostCase(unittest.TestCase):
     def setUp(self):
         for patch in (
             mock.patch.object(settingsctl.sys, "platform", "darwin"),
@@ -622,6 +638,8 @@ class HostKeysTest(unittest.TestCase):
     def install(self, raw, root=True, **kw):
         return settingsctl.install_settingsctl(raw, **{**self._kw(root), **kw})
 
+
+class HostKeysTest(HostCase):
     def test_clean_host_sets_nothing(self):
         raw = {**HOST, "defaultBrowser": "firefox"}
         self.assertEqual(self.diff(raw), [])
@@ -725,6 +743,318 @@ class HostKeysTest(unittest.TestCase):
                 self.assertEqual(len(errors), 1, errors)
 
 
+class RestoreTest(HostCase):
+    def prior(self, state):
+        return state["settingsctl"]["previous"]
+
+    def test_first_set_records_prior_and_removal_restores_it(self):
+        self.fake.names["hostName"] = "old"
+        self.fake.zone, self.fake.matches = "Europe/Berlin", False
+        self.fake.sleep["AC Power"]["display"] = 5
+        self.fake.sshd = {"enabled": False, "loaded": False}
+        state = {}
+        self.assertTrue(self.install(HOST, state=state))
+        self.assertEqual(
+            self.prior(state),
+            {
+                "hostName": {"prior": "old", "written": "Ivans-Mac-mini"},
+                "timeZone": {"prior": "Europe/Berlin", "written": "Europe/Uzhgorod"},
+                "sleep.display": {"prior": {"AC Power": 5}, "written": 10},
+                "remoteLogin": {"prior": False, "written": True},
+            },
+        )
+        # A later set keeps the first prior.
+        self.fake.names["hostName"] = "Ivans-Mac-mini"
+        self.assertTrue(self.install({**HOST, "hostName": "new"}, state=state))
+        self.assertEqual(self.prior(state)["hostName"], {"prior": "old", "written": "new"})
+
+        self.fake.names["hostName"] = "new"
+        self.fake.sleep["AC Power"]["display"] = 10
+        self.fake.sshd = {"enabled": True, "loaded": True}
+        self.fake.calls = []
+        live_zone = {"Europe/Uzhgorod": True, "Europe/Berlin": False}
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            args = cmd[2:]
+            if args[:2] == ["timezone", "get"] and len(args) == 4:
+                self.fake.matches = live_zone[args[2]]
+            return orig(cmd, env, cwd)
+
+        rows = self.diff(None, state=state, run=run)
+        self.assertEqual(
+            rows,
+            [
+                "  - settings hostname set --host-name old (restore hostName)",
+                "  - settings timezone set Europe/Berlin (restore timeZone)",
+                "  - settings sleep set --display 5 (restore sleep.display)",
+                "  ~ forget remoteLogin (cannot restore off: turning Remote Login off could"
+                " cut off SSH; turn it off by hand with `sudo settings remotelogin set off`;"
+                " left as is)",
+            ],
+        )
+        self.fake.calls = []
+        self.assertTrue(self.install(None, state=state, run=run))
+        self.assertEqual(
+            self.fake.sets(),
+            [
+                ["hostname", "set", "--host-name", "old"],
+                ["timezone", "set", "Europe/Berlin"],
+                ["sleep", "set", "--display", "5"],
+            ],
+        )
+        self.assertEqual(state, {})
+
+    def test_hand_changed_already_gone_and_unrestorable_are_forgotten(self):
+        state = {
+            "settingsctl": {
+                "previous": {
+                    "hostName": {"prior": "Ivans-Mac-mini", "written": "x"},
+                    "localHostName": {"prior": "a", "written": "b"},
+                    "computerName": {"prior": None, "written": "Mac"},
+                    "sleep.display": {"prior": {"AC Power": 5, "Battery": 2}, "written": 10},
+                }
+            }
+        }
+        rows = self.diff(None, state=state)
+        self.assertEqual(
+            rows,
+            [
+                "  ~ forget localHostName (changed by hand; left as is)",
+                "  ~ forget computerName (cannot restore (not set): it was not set and settings"
+                " cannot unset it; left as is)",
+                "  ~ forget sleep.display (cannot restore AC Power 5, Battery 2: it differed per"
+                " power source and settings sets all of them at once; left as is)",
+            ],
+        )
+        self.assertTrue(self.install(None, state=state))
+        self.assertEqual(self.fake.sets(), [])
+        self.assertEqual(state, {})
+
+    def test_remote_login_is_restored_on_but_never_off(self):
+        self.fake.sshd = {"enabled": False, "loaded": False}
+        state = {"settingsctl": {"previous": {"remoteLogin": {"prior": True, "written": False}}}}
+        self.assertTrue(self.install(None, state=state))
+        self.assertEqual(self.fake.sets(), [["remotelogin", "set", "on"]])
+        self.assertEqual(state, {})
+
+    def test_failed_restore_fails_once_and_is_forgotten(self):
+        prior = {"sleep.display": {"prior": {"AC Power": 5}, "written": 10}}
+        state = {"settingsctl": {"previous": prior}}
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["sleep", "set"]:
+                return 1, "", "boom"
+            return orig(cmd, env, cwd)
+
+        self.assertFalse(self.install(None, state=state, run=run))
+        self.assertEqual(state, {})
+        self.assertTrue(self.install(None, state=state, run=run))
+
+    def test_zone_settings_no_longer_knows_is_forgotten(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "Gone/Zone", "written": "B"}}}}
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            args = cmd[2:]
+            if args[:2] == ["timezone", "get"] and len(args) == 4:
+                if args[2] == "Gone/Zone":
+                    return 1, "", "unknown time zone"
+                self.fake.matches = args[2] == "B"
+            return orig(cmd, env, cwd)
+
+        rows = self.diff(None, state=state, run=run)
+        self.assertEqual(
+            rows,
+            ["  ~ forget timeZone (settings no longer knows zone 'Gone/Zone'; left as is)"],
+        )
+        self.assertTrue(self.install(None, state=state, run=run))
+        self.assertEqual(self.fake.sets(), [])
+        self.assertEqual(state, {})
+
+    def test_partial_host_name_restore(self):
+        self.fake.names = {"hostName": "new", "localHostName": "new", "computerName": "Mac"}
+        records = {
+            "hostName": {"prior": "old", "written": "new"},
+            "localHostName": {"prior": None, "written": "new"},
+        }
+        state = {"settingsctl": {"previous": records}}
+        self.assertEqual(
+            self.diff(None, state=state),
+            [
+                "  - settings hostname set --host-name old (restore hostName)",
+                "  ~ forget localHostName (cannot restore (not set): it was not set and"
+                " settings cannot unset it; left as is)",
+            ],
+        )
+        self.assertTrue(self.install(None, state=state))
+        self.assertEqual(self.fake.sets(), [["hostname", "set", "--host-name", "old"]])
+        self.assertEqual(state, {})
+
+    def test_user_phase_hints_sudo_for_root_records(self):
+        root = {"settingsctl": {"previous": {"timeZone": {"prior": "A", "written": "B"}}}}
+        state = {"root": root}
+        self.assertTrue(settingsctl.has_work(None, state))
+        with mock.patch.object(settingsctl, "log") as log:
+            self.assertEqual(self.diff(None, root=False, state=state), [])
+            self.assertTrue(self.install(None, root=False, state=state))
+        hints = [c.args[0] for c in log.call_args_list if settingsctl.ROOT_HINT in c.args[0]]
+        self.assertEqual(len(hints), 2, log.call_args_list)
+        self.assertIn("timeZone", hints[0])
+        self.assertEqual(state, {"root": root})
+        self.assertEqual(self.fake.calls, [])
+
+    def test_no_sudo_hint_under_sudo_or_while_declared(self):
+        root = {"settingsctl": {"previous": {"timeZone": {"prior": "A", "written": "B"}}}}
+        state = {"root": root}
+        with mock.patch.object(settingsctl, "log") as log:
+            self.install({"timeZone": "B"}, root=False, state=state)
+            with mock.patch.object(privilege, "UNDER_SUDO", True):
+                self.install(None, root=False, state=state)
+        self.assertFalse(
+            [c for c in log.call_args_list if "root's records" in c.args[0]],
+            log.call_args_list,
+        )
+
+    def test_untracked_key_leaving_config_is_left_as_is(self):
+        state = {}
+        self.assertTrue(self.install(HOST, state=state))
+        self.assertEqual(state, {})
+        self.assertFalse(settingsctl.has_root_work(None, state))
+
+    def test_default_browser_restore_as_user(self):
+        self.fake.browser["defaultBrowser"] = "safari"
+        state = {}
+        self.assertTrue(self.install({"defaultBrowser": "firefox"}, root=False, state=state))
+        self.assertEqual(
+            self.prior(state), {"defaultBrowser": {"prior": "safari", "written": "firefox"}}
+        )
+        self.fake.browser["defaultBrowser"] = "firefox"
+        self.assertTrue(settingsctl.has_work(None, state))
+        self.assertEqual(
+            self.diff(None, root=False, state=state),
+            ["  - settings defaultbrowser set safari (restore defaultBrowser)"],
+        )
+        self.assertTrue(self.install(None, root=False, state=state))
+        self.assertEqual(self.fake.sets()[-1], ["defaultbrowser", "set", "safari"])
+        # Forgotten after one attempt: declining the macOS dialog is the user's choice.
+        self.assertEqual(state, {})
+        self.assertEqual(self.diff(None, root=False, state=state), [])
+
+    def test_unknown_written_zone_is_forgotten(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "A", "written": "Gone/Zone"}}}}
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["timezone", "get"] and cmd[4:5] == ["Gone/Zone"]:
+                return 1, "", "unknown time zone"
+            return orig(cmd, env, cwd)
+
+        self.assertEqual(
+            self.diff(None, state=state, run=run),
+            ["  ~ forget timeZone (settings no longer knows zone 'Gone/Zone'; left as is)"],
+        )
+        self.assertTrue(self.install(None, state=state, run=run))
+        self.assertEqual(state, {})
+
+    def test_unreadable_zone_keeps_record(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "A", "written": "B"}}}}
+        self.fake.fail.add("timezone")
+        self.assertEqual(len(self.diff(None, state=state)), 1)
+        self.assertFalse(self.install(None, state=state))
+        self.assertIn("timeZone", self.prior(state))
+
+    def test_sleep_without_power_sources_keeps_record(self):
+        prior = {"sleep.display": {"prior": {"AC Power": 5}, "written": 10}}
+        state = {"settingsctl": {"previous": prior}}
+        self.fake.sleep = {}
+        self.assertTrue(self.diff(None, state=state)[0].startswith("  ? sleep.display"))
+        self.assertFalse(self.install(None, state=state))
+        self.assertEqual(self.prior(state), prior)
+
+    def test_failed_read_keeps_written(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "P", "written": "A"}}}}
+        self.fake.fail.add("timezone")
+        self.assertFalse(self.install({"timeZone": "B"}, state=state))
+        self.assertEqual(self.prior(state)["timeZone"], {"prior": "P", "written": "A"})
+
+    def test_partly_applied_set_records_what_changed(self):
+        self.fake.names.update(hostName="a", localHostName="a")
+        records = {
+            "hostName": {"prior": "p", "written": "a"},
+            "localHostName": {"prior": "p", "written": "a"},
+        }
+        state = {"settingsctl": {"previous": records}}
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["hostname", "set"]:
+                self.fake.names["hostName"] = "h"
+                return 1, "", "boom"
+            return orig(cmd, env, cwd)
+
+        raw = {"hostName": "h", "localHostName": "l"}
+        self.assertFalse(self.install(raw, state=state, run=run))
+        self.assertEqual(self.prior(state)["hostName"]["written"], "h")
+        self.assertEqual(self.prior(state)["localHostName"]["written"], "a")
+
+    def test_failed_set_keeps_last_written_value(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "P", "written": "A"}}}}
+        self.fake.matches = False
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["timezone", "set"]:
+                return 1, "", "boom"
+            return orig(cmd, env, cwd)
+
+        self.assertFalse(self.install({"timeZone": "B"}, state=state, run=run))
+        self.assertEqual(self.prior(state)["timeZone"], {"prior": "P", "written": "A"})
+        self.fake.matches = True
+        self.assertTrue(self.install({"timeZone": "B"}, state=state))
+        self.assertEqual(self.prior(state)["timeZone"], {"prior": "P", "written": "B"})
+
+    def test_root_records_with_missing_cli_are_kept_when_section_is_gone(self):
+        state = {"settingsctl": {"previous": {"timeZone": {"prior": "A", "written": "B"}}}}
+        kw = {"executable": lambda _: False}
+        rows = self.diff(None, state=state, **kw)
+        self.assertTrue(rows[0].startswith("  ! `settings` not found"), rows)
+        self.assertFalse(self.install(None, state=state, **kw))
+        self.assertEqual(self.prior(state), {"timeZone": {"prior": "A", "written": "B"}})
+
+    def test_failed_first_set_records_no_written(self):
+        self.fake.zone, self.fake.matches = "P", False
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["timezone", "set"]:
+                return 1, "", "boom"
+            return orig(cmd, env, cwd)
+
+        state = {}
+        self.assertFalse(self.install({"timeZone": "B"}, state=state, run=run))
+        self.assertEqual(self.prior(state), {"timeZone": {"prior": "P"}})
+
+    def test_user_records_prior_before_applying(self):
+        self.fake.browser["defaultBrowser"] = "safari"
+        state = {}
+        seen = []
+        orig = self.fake.run
+
+        def run(cmd, env=None, cwd=None):
+            if cmd[2:4] == ["defaultbrowser", "set"]:
+                seen.append(json.loads(json.dumps(state)))
+            return orig(cmd, env, cwd)
+
+        self.assertTrue(
+            self.install({"defaultBrowser": "firefox"}, root=False, state=state, run=run)
+        )
+        self.assertEqual(
+            seen, [{"settingsctl": {"previous": {"defaultBrowser": {"prior": "safari"}}}}]
+        )
+
+
 class WiringTest(unittest.TestCase):
     def _deploy(self, config):
         with (
@@ -774,7 +1104,21 @@ class WiringTest(unittest.TestCase):
             raw = {**MINI, "timeZone": "Etc/Linked"}
             paths = {"uvBin": "/x"}
             self.assertTrue(cli._deploy({"settingsctl": raw, "paths": paths}, "/tmp", root=True))
-            inst.assert_called_once_with(raw, paths)
+            inst.assert_called_once_with(raw, paths, state={})
+
+    def test_root_phase_runs_for_recorded_priors(self):
+        full = {"version": 2, "root": {"settingsctl": {"previous": {"timeZone": {"prior": "X"}}}}}
+        with (
+            mock.patch.object(cli, "load_json", return_value=full),
+            mock.patch.object(cli, "save_json"),
+            mock.patch.object(cli, "_save_as_user"),
+            mock.patch.object(cli, "state_lock"),
+            mock.patch.object(cli, "install_settingsctl", return_value=True) as inst,
+        ):
+            self.assertTrue(cli._deploy({}, "/tmp", root=True))
+        inst.assert_called_once()
+        self.assertIsNone(inst.call_args.args[0])
+        self.assertEqual(inst.call_args.kwargs["state"], full["root"])
 
     def test_root_section(self):
         self.assertIn("settingsctl", privilege.ROOT_SECTIONS)

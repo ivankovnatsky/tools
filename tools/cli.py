@@ -630,8 +630,8 @@ def _run_root_sections(
     # After files, which may write /etc/shells.
     if "users" in active and users_has_work(config.get("users"), state):
         success &= install_users(config.get("users"), state)
-    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
-        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"))
+    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl"), state):
+        success &= install_settingsctl(config.get("settingsctl"), config.get("paths"), state=state)
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
         # A daemon created, updated or retried here starts fresh: no second restart later.
         done: set = set()

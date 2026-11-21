@@ -999,8 +999,8 @@ def _root_sections(
         changes = diff_users(config.get("users"), state)
         if changes:
             sections.append(("users", changes))
-    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl")):
-        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"))
+    if "settingsctl" in active and settingsctl_has_root_work(config.get("settingsctl"), state):
+        changes = diff_settingsctl(config.get("settingsctl"), config.get("paths"), state=state)
         if changes:
             sections.append(("settingsctl", changes))
     if "launchd" in active and launchd_has_work(config.get("launchd"), state):
