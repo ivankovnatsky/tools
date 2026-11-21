@@ -880,7 +880,9 @@ def show_diff(
             sections.append(("env", changes))
 
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
-        changes = diff_skills(config.get("skills") or {}, config_dir, state, update)
+        changes = diff_skills(
+            config.get("skills") or {}, config_dir, state, update, config.get("links")
+        )
         if changes:
             sections.append(("skills", changes))
 

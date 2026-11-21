@@ -320,6 +320,166 @@ class LinkRecordForgetTest(SkillsTestBase):
         self.assertNotIn("links", self.state["skills"])
         self.assertEqual(self.diff(cfg), [])
 
+    def test_link_to_removed_copy_is_removed(self):
+        cfg = self.config([], targets=[self.agents])
+
+        self.assertEqual(
+            self.diff(cfg),
+            [f"  - remove {self.copy}", f"  - remove {self.link} (link to a removed skill copy)"],
+        )
+        self.assertTrue(self.deploy(cfg))
+
+        self.assertFalse(os.path.lexists(self.copy))
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertNotIn("links", self.state["skills"])
+        self.assertEqual(self.diff(cfg), [])
+
+    def test_link_to_already_gone_copy_is_removed(self):
+        shutil.rmtree(self.copy)
+        cfg = self.config([], targets=[self.agents])
+
+        self.assertIn(f"  - remove {self.link} (link to a removed skill copy)", self.diff(cfg))
+        self.assertTrue(self.deploy(cfg))
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_failed_link_trash_keeps_record(self):
+        real_trash = skills.fsutil.trash
+
+        def trash(path):
+            if path == self.link:
+                raise OSError("boom")
+            return real_trash(path)
+
+        with mock.patch.object(skills.fsutil, "trash", side_effect=trash):
+            self.assertFalse(self.deploy(self.config([], targets=[self.agents])))
+        self.assertIn(self.link, self.state["skills"]["links"])
+        self.assertTrue(os.path.islink(self.link))
+        self.assertFalse(os.path.lexists(self.copy))
+        self.assertNotIn(self.copy, self.state["skills"]["installed"])
+
+        cfg = self.config([], targets=[self.agents])
+        self.assertEqual(self.diff(cfg), [f"  - remove {self.link} (link to a removed skill copy)"])
+        self.assertTrue(self.deploy(cfg))
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertNotIn("links", self.state["skills"])
+
+    def test_orphaned_record_kept_link_when_copy_reinstalled(self):
+        shutil.rmtree(self.copy)
+        self.state["skills"]["installed"].pop(self.copy)
+        self.state["skills"]["links"][self.link]["copyRemoved"] = True
+        cfg = self.config(["mine/pdf"], targets=[self.agents])
+
+        self.assertEqual(
+            self.diff(cfg),
+            [
+                f"  + install mine/pdf -> {self.copy}",
+                f"  ~ forget {self.link} (linkTargets was removed; left in place)",
+            ],
+        )
+        self.assertTrue(self.deploy(cfg))
+        self.assertEqual(os.readlink(self.link), self.copy)
+        self.assertTrue(os.path.isdir(self.copy))
+        self.assertNotIn("links", self.state["skills"])
+        self.assertEqual(self.diff(cfg), [])
+
+    def test_orphaned_record_kept_when_copy_awaits_clone(self):
+        shutil.rmtree(self.copy)
+        self.state["skills"]["installed"].pop(self.copy)
+        self.state["skills"]["links"][self.link]["copyRemoved"] = True
+        cfg = self.config(["up/pdf"], targets=[self.agents])
+        cfg["sources"] = {"up": {"url": os.path.join(self.tmp, "upstream")}}
+
+        diff = self.diff(cfg)
+        self.assertIn("  + install up/pdf (after fetch)", diff)
+        self.assertIn(f"  ~ forget {self.link} (linkTargets was removed; left in place)", diff)
+        self.assertNotIn(f"  - remove {self.link} (link to a removed skill copy)", diff)
+
+    def test_orphaned_record_for_repointed_link_forgotten(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.remove(self.link)
+        os.symlink(elsewhere, self.link)
+        shutil.rmtree(self.copy)
+        self.state["skills"]["installed"].pop(self.copy)
+        self.state["skills"]["links"][self.link]["copyRemoved"] = True
+
+        self.assertTrue(self.deploy(self.config([], targets=[self.agents])))
+        self.assertEqual(os.readlink(self.link), elsewhere)
+        self.assertNotIn("links", self.state["skills"])
+
+    def test_link_tracked_by_links_section_left_when_copy_removed(self):
+        self.state["links"] = {"installed": {self.link: {"source": self.copy}}}
+        cfg = self.config([], targets=[self.agents])
+
+        self.assertNotIn(f"  - remove {self.link} (link to a removed skill copy)", self.diff(cfg))
+        self.assertTrue(self.deploy(cfg))
+        self.assertEqual(os.readlink(self.link), self.copy)
+        self.assertNotIn("links", self.state["skills"])
+
+    def test_link_wanted_by_links_config_left_when_copy_removed(self):
+        cfg = self.config([], targets=[self.agents])
+        entries = [{"source": self.copy, "target": self.link}]
+
+        diff = skills.diff_skills(cfg, self.config_dir, self.state, links_entries=entries)
+        self.assertNotIn(f"  - remove {self.link} (link to a removed skill copy)", diff)
+        self.assertTrue(
+            skills.install_skills(cfg, self.config_dir, self.state, links_entries=entries)
+        )
+        self.assertEqual(os.readlink(self.link), self.copy)
+
+    def _assert_links_claim_kept(self, target):
+        cfg = self.config([], targets=[self.agents])
+        entries = [{"source": self.copy, "target": target}]
+        diff = skills.diff_skills(cfg, self.config_dir, self.state, links_entries=entries)
+        self.assertNotIn(f"  - remove {self.link} (link to a removed skill copy)", diff)
+        self.assertTrue(
+            skills.install_skills(cfg, self.config_dir, self.state, links_entries=entries)
+        )
+        self.assertEqual(os.readlink(self.link), self.copy)
+
+    def test_link_claimed_via_symlinked_parent_left(self):
+        alias = os.path.join(self.tmp, "alias")
+        os.symlink(self.t1, alias)
+        self._assert_links_claim_kept(os.path.join(alias, "pdf"))
+
+    def test_link_claimed_in_other_case_left(self):
+        upper = os.path.join(os.path.dirname(self.link), "PDF")
+        if not os.path.lexists(upper):
+            self.skipTest("case-sensitive filesystem")
+        self._assert_links_claim_kept(upper)
+
+    def test_link_tracked_by_links_section_via_alias_left(self):
+        alias = os.path.join(self.tmp, "alias")
+        os.symlink(self.t1, alias)
+        self.state["links"] = {"installed": {os.path.join(alias, "pdf"): {"source": self.copy}}}
+        self.assertTrue(self.deploy(self.config([], targets=[self.agents])))
+        self.assertEqual(os.readlink(self.link), self.copy)
+
+    def test_repointed_link_left_when_copy_removed(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        os.remove(self.link)
+        os.symlink(elsewhere, self.link)
+        cfg = self.config([], targets=[self.agents])
+
+        self.assertTrue(self.deploy(cfg))
+        self.assertEqual(os.readlink(self.link), elsewhere)
+        self.assertNotIn("links", self.state["skills"])
+
+    def test_link_to_untracked_source_left_dangling(self):
+        other = os.path.join(self.tmp, "other-copy")
+        os.remove(self.link)
+        os.symlink(other, self.link)
+        self.state["skills"]["links"] = {self.link: {"skill": "mine/pdf", "source": other}}
+
+        self.assertTrue(self.deploy(self.config([], targets=[self.agents])))
+        self.assertTrue(os.path.islink(self.link))
+
+    def test_replaced_by_real_dir_left_when_copy_removed(self):
+        os.remove(self.link)
+        os.makedirs(self.link)
+        self.assertTrue(self.deploy(self.config([], targets=[self.agents])))
+        self.assertTrue(os.path.isdir(self.link))
+
     def test_malformed_record_forgotten(self):
         self.state["skills"]["links"] = {self.link: "junk"}
         self.assertTrue(self.deploy(self.config(["mine/pdf"], targets=[self.agents])))

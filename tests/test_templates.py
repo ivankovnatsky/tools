@@ -824,8 +824,8 @@ class LinkOwnershipTest(TemplatesTestBase):
         ownership = self.ownership({}, links_raw=[])
         inside = os.path.join(self.tmp, "agents", "pdf", "secret")
         self.assertIn("a directory managed by skills", ownership[inside])
-        self.assertIn("managed by skills", ownership[os.path.join(self.tmp, "home", "pdf")])
         self.assertNotIn(os.path.join(self.tmp, "agents", "other"), ownership)
+        self.assertNotIn(os.path.join(self.tmp, "home", "pdf"), ownership)
 
     def test_symlinked_parent_matched_by_real_path(self):
         dotfiles = os.path.join(self.tmp, "dotfiles")

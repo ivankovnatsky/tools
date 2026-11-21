@@ -888,7 +888,9 @@ def _run_sections(
     # Gated on state too, like gitRepos: dropping the whole section must
     # still reach the reconciler so it can remove what it installed.
     if "skills" in active and skills_has_work(config.get("skills") or {}, state):
-        success &= install_skills(config.get("skills") or {}, config_dir, state, update)
+        success &= install_skills(
+            config.get("skills") or {}, config_dir, state, update, config.get("links")
+        )
 
     # After skills, so links into freshly installed skill dirs find their source.
     if "links" in active and links_has_work(config.get("links") or [], state):

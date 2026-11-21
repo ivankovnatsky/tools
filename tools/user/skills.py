@@ -28,7 +28,8 @@ never updates or removes one modified since it was written, and only ever
 removes directories it recorded.
 
 Symlinks recorded under ``links`` in state by the removed ``linkTargets``
-option are forgotten; the symlinks themselves are left in place.
+option are forgotten. One still pointing at a recorded copy that is removed
+(or already gone) is trashed with it; every other link is left in place.
 
 Git sources are cloned into ``cacheDir/<source>``. That directory belongs
 to this tool entirely, so it is fetched and force-checked-out freely. An
@@ -497,8 +498,13 @@ def _copy_tree(src: str, dest: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
-    """Compute what deploy would do against the current on-disk sources."""
+def plan(
+    skills_config: Dict, config_dir: str, state: Dict, links_claimed: frozenset = frozenset()
+) -> Dict[str, List]:
+    """Compute what deploy would do against the current on-disk sources.
+
+    ``links_claimed``: paths the links section tracks or wants; never removed here.
+    """
     installed = state.get("skills", {}).get("installed", {}) or {}
     linked = state.get("skills", {}).get("links", {}) or {}
     desired, errors, pending = resolve(skills_config, config_dir)
@@ -513,7 +519,8 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
         "remove": [],  # dest
         "forget": [],  # dest (tracked, already gone)
         "keep": [],  # dest (dropped from config but modified locally)
-        "link_forget": sorted(linked),  # records of the removed linkTargets option
+        "link_forget": [],  # records of the removed linkTargets option
+        "link_remove": [],  # (link, copy): recorded link to a copy that goes away
     }
 
     for dest, (skill_id, src_dir) in sorted(desired.items()):
@@ -551,7 +558,32 @@ def plan(skills_config: Dict, config_dir: str, state: Dict) -> Dict[str, List]:
         else:
             result["keep"].append(dest)
 
+    gone = set(result["remove"]) | set(result["forget"])
+    coming = set(desired) | set(pending_paths(skills_config, pending))
+    for link in sorted(linked):
+        copy = _linked_copy(link, linked[link])
+        orphaned = isinstance(linked[link], dict) and linked[link].get("copyRemoved")
+        if fsutil.canonical_path(link) in links_claimed:
+            result["link_forget"].append(link)
+        elif copy and (
+            copy in gone or (orphaned and copy not in coming and not os.path.lexists(copy))
+        ):
+            result["link_remove"].append((link, copy))
+        else:
+            result["link_forget"].append(link)
+
     return result
+
+
+def _linked_copy(link: str, record) -> Optional[str]:
+    """The recorded copy ``link`` still points at, or None."""
+    copy = record.get("source") if isinstance(record, dict) else None
+    if not isinstance(copy, str) or not copy or not os.path.islink(link):
+        return None
+    try:
+        return copy if os.readlink(link) == copy else None
+    except OSError:
+        return None
 
 
 def _entry(section: Dict, path: str) -> Dict:
@@ -586,7 +618,17 @@ def _source_fingerprint(source: Dict) -> Dict:
 # --------------------------------------------------------------------------
 
 
-def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bool = False) -> bool:
+def _links_claimed(state: Dict, links_entries) -> frozenset:
+    from tools.user import links as links_section
+
+    tracked = state.get("links", {}).get("installed", {}) or {}
+    wanted, _errors = links_section.resolve(links_entries or [])
+    return frozenset(fsutil.canonical_path(p) for p in [*tracked, *wanted] if isinstance(p, str))
+
+
+def install_skills(
+    skills_config: Dict, config_dir: str, state: Dict, update: bool = False, links_entries=None
+) -> bool:
     skills_config = skills_config or {}
     section = state.setdefault("skills", {})
     installed: Dict[str, Dict] = dict(section.get("installed", {}) or {})
@@ -614,7 +656,12 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
             failed.add(name)
             success = False
 
-    p = plan(skills_config, config_dir, {"skills": {"installed": installed, "links": linked}})
+    p = plan(
+        skills_config,
+        config_dir,
+        {"skills": {"installed": installed, "links": linked}},
+        _links_claimed(state, links_entries),
+    )
     # A failed fetch or checkout leaves the old ref in the cache; installing
     # from it would record the wrong content as the configured one.
     for key in ("install", "update", "adopt"):
@@ -667,6 +714,19 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
                 continue
             installed.pop(dest, None)
             log(f"Removed skill: {dest}", Color.RED)
+        for link, copy in p["link_remove"]:
+            if os.path.lexists(copy) or _linked_copy(link, linked.get(link)) != copy:
+                continue  # copy still there: retried next run
+            try:
+                fsutil.trash(link)
+            except OSError as e:
+                log(f"skills: failed to remove {link}: {e}", Color.RED)
+                # The copy's installed record is gone; this marks the retry.
+                linked[link] = {**linked[link], "copyRemoved": True}
+                success = False
+                continue
+            linked.pop(link, None)
+            log(f"Removed skill link: {link}", Color.RED)
 
         for name in sorted(set(cached) - set(git_sources)):
             path = os.path.join(cache_dir, name)
@@ -698,7 +758,7 @@ def install_skills(skills_config: Dict, config_dir: str, state: Dict, update: bo
 
 
 def diff_skills(
-    skills_config: Dict, config_dir: str, state: Dict, update: bool = False
+    skills_config: Dict, config_dir: str, state: Dict, update: bool = False, links_entries=None
 ) -> List[str]:
     skills_config = skills_config or {}
     changes: List[str] = []
@@ -722,7 +782,7 @@ def diff_skills(
         elif update:
             changes.append(f"  ~ refetch {name} (--update)")
 
-    p = plan(skills_config, config_dir, state)
+    p = plan(skills_config, config_dir, state, _links_claimed(state, links_entries))
     changes += [f"  ! {err}" for err in p["errors"]]
     changes += [f"  + install {skill} (after fetch)" for skill in p["pending"]]
     changes += [f"  + install {sid} -> {dest}" for dest, sid, _, _ in p["install"]]
@@ -731,6 +791,9 @@ def diff_skills(
     # Deploy holds every removal while anything is in error; so does the preview.
     if not p["errors"]:
         changes += [f"  - remove {dest}" for dest in p["remove"]]
+        changes += [
+            f"  - remove {link} (link to a removed skill copy)" for link, _ in p["link_remove"]
+        ]
         changes += [f"  ~ forget {dest}" for dest in p["forget"]]
         changes += [
             f"  ~ forget {link} (linkTargets was removed; left in place)"

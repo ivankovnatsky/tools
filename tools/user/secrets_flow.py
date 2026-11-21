@@ -173,10 +173,7 @@ def _link_owned_paths(links_raw, skills_raw, state: Dict, config_dir: str):
         trees.setdefault(_norm(source), pointee)
 
     managed = "a directory managed by skills"
-    skills_state = state.get("skills", {})
-    for path in skills_state.get("links", {}) or {}:
-        link_paths.setdefault(_norm(path), "skills")
-    for path in skills_state.get("installed", {}) or {}:
+    for path in state.get("skills", {}).get("installed", {}) or {}:
         trees[_norm(path)] = managed
     if isinstance(skills_raw, Mapping) and skills_raw:
         try:
