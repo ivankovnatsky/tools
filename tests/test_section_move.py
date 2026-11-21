@@ -4,9 +4,14 @@ import os
 import tempfile
 import unittest
 
+import trash_fake
+
 from tools import cli, diff
 from tools.user import secrets_flow
 from tools.user.files import _file_hash, _record
+
+setUpModule = trash_fake.start
+tearDownModule = trash_fake.stop
 
 
 class SectionMoveTest(unittest.TestCase):

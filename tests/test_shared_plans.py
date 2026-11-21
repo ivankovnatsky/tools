@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from tools import diff as diff_mod
+from tools import system_paths
 from tools.user import bun, cargo, git_repos, go, mcp, npm, pi, uv
 from tools.util import PACKAGE_ENTRY_KEYS
 
@@ -270,9 +271,11 @@ class SharedPlanTest(unittest.TestCase):
         state = {"gitRepos": {"installed": [pulled, gone]}}
         self.patch(git_repos, "_has_local_work", return_value=False)
         self.patch(git_repos, "origin_url", return_value=None)
+        self.patch(system_paths, "system_bin", return_value="git")
+        self.patch(git_repos, "system_bin", return_value="git")
+        self.patch(git_repos, "system_dir", return_value="/usr/bin")
         rows = diff_mod._diff_git_repos(repos, copy.deepcopy(state), True)
         rec = self.patch(git_repos, "run_command", Recorder())
-        self.patch(git_repos, "system_bin", return_value="git")
         trash = self.patch(git_repos.fsutil, "trash")
         self.assert_same_plan(
             git_repos,
