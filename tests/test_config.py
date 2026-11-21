@@ -105,6 +105,82 @@ class PinHostnameTest(unittest.TestCase):
                 self.assertIn("npm", load_config_dir(d))
 
 
+class DuplicateKeyTest(unittest.TestCase):
+    def load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.yaml")
+            _write(path, text)
+            return path, config_mod._load_raw(path)
+
+    def assertRejected(self, text, key, line, first):
+        with self.assertRaises(ConfigError) as cm:
+            self.load(text)
+        msg = str(cm.exception)
+        self.assertIn("c.yaml: ", msg)
+        self.assertIn(f"duplicate key {key!r} on line {line} (first defined on line {first})", msg)
+
+    def test_top_level_duplicate_rejected(self):
+        self.assertRejected("d: 1\nd: 2\n", "d", 2, 1)
+
+    def test_nested_duplicate_rejected(self):
+        text = (
+            "launchd:\n"
+            "  caddy.service:\n"
+            "    command: a\n"
+            "  other: {command: b}\n"
+            "  caddy.service:\n"
+            "    command: c\n"
+        )
+        self.assertRejected(text, "caddy.service", 5, 2)
+
+    def test_duplicate_in_flow_mapping_inside_list_rejected(self):
+        self.assertRejected("files:\n  - {source: a, source: b}\n", "source", 2, 2)
+
+    def test_keys_equal_after_resolution_rejected(self):
+        self.assertRejected("yes: 1\ntrue: 2\n", True, 2, 1)
+
+    def test_merge_keys_still_override(self):
+        text = (
+            "vars:\n"
+            "  base: &b {a: 1, b: 2}\n"
+            "  other: &o {a: 9, c: 3}\n"
+            "  one:\n"
+            "    <<: *b\n"
+            "    a: 3\n"
+            "  many:\n"
+            "    <<: [*b, *o]\n"
+        )
+        _path, data = self.load(text)
+        self.assertEqual(data["vars"]["one"], {"a": 3, "b": 2})
+        self.assertEqual(data["vars"]["many"], {"a": 1, "b": 2, "c": 3})
+
+    def test_nested_merge_reached_through_alias_first_still_loads(self):
+        text = "vars:\n  c: &c {a: 0}\n  deep: {deeper: {b: &b {<<: *c, a: 1}}}\n  use: {<<: *b}\n"
+        _path, data = self.load(text)
+        self.assertEqual(data["vars"]["use"], {"a": 1})
+
+    def test_aliased_key_repeating_its_anchor_rejected(self):
+        self.assertRejected("- {&k a: 1, *k : 2}\n", "a", 1, 1)
+
+    def test_duplicate_inside_inline_merge_source_rejected(self):
+        self.assertRejected("svc: {<<: {command: a, command: b}}\n", "command", 1, 1)
+
+    def test_value_key_still_loads(self):
+        _path, data = self.load("vars: {=: value}\n")
+        self.assertEqual(data, {"vars": {"=": "value"}})
+
+    def test_distinct_keys_load(self):
+        _path, data = self.load("a: 1\nb: {a: 2}\n'1': x\n1: y\n")
+        self.assertEqual(data, {"a": 1, "b": {"a": 2}, "1": "x", 1: "y"})
+
+    def test_load_config_surfaces_duplicate_in_include(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "inc.yaml"), "dock:\n  apps: [A]\ndock:\n  apps: [B]\n")
+            _write(os.path.join(d, "top.yaml"), "include: [inc.yaml]\n")
+            with self.assertRaisesRegex(ConfigError, r"inc\.yaml: duplicate key 'dock'"):
+                load_config(os.path.join(d, "top.yaml"))
+
+
 class IncludeTest(unittest.TestCase):
     def test_includes_are_merged_under_the_including_file(self):
         with tempfile.TemporaryDirectory() as d:

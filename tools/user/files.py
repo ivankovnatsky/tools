@@ -15,6 +15,7 @@ from tools.fsutil import (
     fingerprint,
     makedirs_secret,
     matches_fingerprint,
+    parse_mode,
     removal_blocked,
     respell,
     restore_aside,
@@ -178,31 +179,6 @@ def _ensure_dir(
 
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__"}
 SKIP_FILES = {".DS_Store", ".gitignore", ".gitkeep"}
-
-
-def _parse_mode(value) -> Optional[int]:
-    """Parse a mode value from config.
-
-    Only quoted octal strings are accepted (``mode: "0644"``). Bare YAML
-    ints are rejected because they are ambiguous: PyYAML (YAML 1.1)
-    parses ``0644`` as octal into int 420, which is indistinguishable
-    from a literal ``420`` — re-interpreting either as octal silently
-    yields the wrong permission bits for one of them.
-
-    Returns None when no mode was specified. Raises ValueError on a
-    bad string and TypeError on any other type.
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        mode = int(value, 8)
-        if not 0 <= mode <= 0o7777:
-            raise ValueError(f"files: mode {value!r} must be between 0000 and 7777")
-        return mode
-    raise TypeError(
-        f'files: mode must be a quoted octal string (e.g. "0644"), got {value!r} '
-        f"({type(value).__name__}); unquoted YAML ints are ambiguous"
-    )
 
 
 class FilePlan(NamedTuple):
@@ -647,7 +623,7 @@ def _resolve_entries(
                 errors.append(err)
                 continue
         try:
-            entry_mode = _parse_mode(entry.get("mode"))
+            entry_mode = parse_mode(entry.get("mode"), "files")
         except (TypeError, ValueError) as e:
             errors.append(f"invalid mode in entry {entry!r}: {e}")
             continue

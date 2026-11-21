@@ -56,7 +56,6 @@ from tools import fsutil, privilege
 from tools.fsutil import atomic_write, unmounted_volume
 from tools.log import Color, debug, log
 from tools.user import sops
-from tools.user.files import _parse_mode
 from tools.util import format_diff_bytes, looks_like_secret, run_command
 
 BASH = "/bin/bash"
@@ -442,11 +441,9 @@ def _extra_dirs(value, home: Optional[str] = None) -> List[ExtraDir]:
             if entry.get(key) is not None and not isinstance(entry[key], str):
                 raise ValueError(f"extraDirs.{key} must be a string")
         try:
-            mode = _parse_mode(entry.get("mode"))
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"extraDirs.mode: {e}") from e
-        if mode is not None and not 0 <= mode <= 0o7777:
-            raise ValueError(f"extraDirs.mode {entry['mode']!r} must be between 0000 and 7777")
+            mode = fsutil.parse_mode(entry.get("mode"), "extraDirs.mode")
+        except TypeError as e:
+            raise ValueError(str(e)) from e
         out.append(
             ExtraDir(
                 _runtime_path(entry["path"], "extraDirs.path", home),

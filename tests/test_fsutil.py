@@ -11,6 +11,24 @@ import trash_fake
 from tools import fsutil
 
 
+class ParseModeTest(unittest.TestCase):
+    def test_quoted_octal_string_accepted(self):
+        self.assertEqual(fsutil.parse_mode("0644", "files"), 0o644)
+        self.assertEqual(fsutil.parse_mode("600", "files"), 0o600)
+        self.assertEqual(fsutil.parse_mode("7777", "files"), 0o7777)
+        self.assertIsNone(fsutil.parse_mode(None, "files"))
+
+    def test_bare_int_and_bool_rejected_as_ambiguous(self):
+        for value in (644, 420, True):
+            with self.subTest(value=value), self.assertRaisesRegex(TypeError, "^files: "):
+                fsutil.parse_mode(value, "files")
+
+    def test_bad_string_names_section(self):
+        for value in ("abc", "0999", "", "10000", "-1"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "^sec: "):
+                fsutil.parse_mode(value, "sec")
+
+
 class _FileTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

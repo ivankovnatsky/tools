@@ -194,6 +194,59 @@ def check_top_level_keys(data: Dict[str, Any], source: str) -> None:
     )
 
 
+_UNIQUE_KEY_LOADER = None
+
+
+def _unique_key_loader():
+    """SafeLoader that rejects duplicate mapping keys instead of keeping the last."""
+    global _UNIQUE_KEY_LOADER
+    if _UNIQUE_KEY_LOADER is not None:
+        return _UNIQUE_KEY_LOADER
+    import yaml
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        def construct_document(self, node):
+            # Checked on the whole graph before construction: flatten_mapping
+            # rewrites an aliased mapping's node.value in place when a `<<:`
+            # reaches it first, and keys pulled in by `<<:` may legitimately be
+            # overridden locally.
+            self._check_duplicate_keys(node)
+            return super().construct_document(node)
+
+        def _check_duplicate_keys(self, root):
+            stack, visited = [root], set()
+            while stack:
+                node = stack.pop()
+                if id(node) in visited:
+                    continue
+                visited.add(id(node))
+                if isinstance(node, yaml.SequenceNode):
+                    stack.extend(node.value)
+                elif isinstance(node, yaml.MappingNode):
+                    seen: Dict[Any, Any] = {}
+                    for key_node, value_node in node.value:
+                        stack.extend((key_node, value_node))
+                        if key_node.tag == "tag:yaml.org,2002:merge" or not isinstance(
+                            key_node, yaml.ScalarNode
+                        ):
+                            continue
+                        if key_node.tag == "tag:yaml.org,2002:value":
+                            key = "="  # flatten_mapping later turns `=` keys into strings
+                        else:
+                            key = self.construct_object(key_node)
+                        if key in seen:
+                            raise yaml.constructor.ConstructorError(
+                                None,
+                                None,
+                                f"duplicate key {key!r} on line {key_node.start_mark.line + 1}"
+                                f" (first defined on line {seen[key].start_mark.line + 1})",
+                            )
+                        seen[key] = key_node
+
+    _UNIQUE_KEY_LOADER = UniqueKeyLoader
+    return UniqueKeyLoader
+
+
 def _load_raw(path: str) -> Dict[str, Any]:
     """Load a single config file without processing includes."""
     suffix = os.path.splitext(path)[1].lower()
@@ -210,7 +263,7 @@ def _load_raw(path: str) -> Dict[str, Any]:
 
         with open(path, "r") as f:
             try:
-                data = yaml.safe_load(f)
+                data = yaml.load(f, Loader=_unique_key_loader())
             except yaml.YAMLError as exc:
                 raise ConfigError(f"{path}: {exc}") from None
         return data or {}

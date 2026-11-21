@@ -24,7 +24,13 @@ _NO_LINK_ERRNOS = {
 
 
 def parse_mode(value, section: str) -> Optional[int]:
-    """Quoted octal string -> int; None stays None. See files._parse_mode for why."""
+    """Quoted octal string -> int; None stays None.
+
+    Bare YAML ints are rejected because they are ambiguous: PyYAML (YAML 1.1)
+    parses ``0644`` as octal into int 420, indistinguishable from a literal
+    ``420``, so re-reading either as octal gives one of them the wrong bits.
+    Raises ValueError on a bad string and TypeError on any other type.
+    """
     if value is None:
         return None
     if isinstance(value, str):
