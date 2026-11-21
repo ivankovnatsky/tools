@@ -354,6 +354,8 @@ def _diff_git_repos(git_repos: Dict, state: Dict, update: bool = False):
             changes.append(f"  ! not a git repo: {dest} (deploy skips it)")
         elif action == "track":
             changes.append(f"  + track {dest}")
+            if update:
+                changes.append(f"  ~ pull {dest}")
         elif action == "pull":
             changes.append(f"  ~ pull {dest}")
     # Removal trashes the whole checkout, so it must never reach the

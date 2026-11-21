@@ -380,6 +380,46 @@ class GitReposTest(unittest.TestCase):
                 self.assertTrue(_quiet(git_repos.install_git_repos, {dest: "u"}, state))
             self.assertEqual(calls, [["git", "clone", "u", dest]])
 
+    def _deploy(self, repos, state, update):
+        calls = []
+        with (
+            mock.patch.object(git_repos, "system_bin", return_value="git"),
+            mock.patch.object(git_repos, "system_dir", return_value="/usr/bin"),
+            mock.patch.object(git_repos, "origin_url", return_value="u"),
+            mock.patch.object(
+                git_repos,
+                "run_command",
+                side_effect=lambda cmd, env: calls.append(cmd) or (0, "", ""),
+            ),
+        ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ok = git_repos.install_git_repos(repos, state, update)
+        return ok, calls, out.getvalue()
+
+    def test_untracked_checkout_with_update_is_tracked_and_pulled(self):
+        with tempfile.TemporaryDirectory() as dest:
+            os.makedirs(os.path.join(dest, ".git"))
+            with mock.patch.object(git_repos, "origin_url", return_value="u"):
+                rows = diff_mod._diff_git_repos({dest: "u"}, {}, True)
+            ok, calls, _ = self._deploy({dest: "u"}, {}, True)
+            self.assertTrue(ok)
+            self.assertEqual(calls, [["git", "-C", dest, "pull", "--ff-only"]])
+            self.assertEqual(rows, [f"  + track {dest}", f"  ~ pull {dest}"])
+
+    def test_tracked_non_checkout_is_reported_without_update(self):
+        with tempfile.TemporaryDirectory() as dest:
+            open(os.path.join(dest, "other"), "w").close()
+            state = {"gitRepos": {"installed": [dest]}}
+            for update in (False, True):
+                with self.subTest(update=update):
+                    rows = diff_mod._diff_git_repos({dest: "u"}, state, update)
+                    ok, calls, out = self._deploy({dest: "u"}, state, update)
+                    self.assertEqual(rows, [f"  ! not a git repo: {dest} (deploy skips it)"])
+                    self.assertFalse(ok)
+                    self.assertEqual(calls, [])
+                    self.assertIn(f"Not a git repo, skipping {dest}", out)
+
     def test_tracked_non_checkout_is_released_not_removed(self):
         with tempfile.TemporaryDirectory() as d:
             state = {"gitRepos": {"installed": [d]}}

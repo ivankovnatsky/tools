@@ -119,13 +119,10 @@ def plan(repos: Dict[str, str], state: Dict, update: bool = False) -> Dict:
     # State keys match declared paths by file identity, not spelling.
     installed = set(fsutil.respell(dict.fromkeys(stored), repos.keys()))
     desired = set(repos.keys())
-    # A tracked checkout deleted (or emptied) by hand is cloned again.
+    # A tracked checkout deleted (or emptied) by hand is cloned again; one that
+    # lost its .git is reported by checkout_action rather than skipped silently.
     to_install = {
-        d
-        for d in desired
-        if d not in installed
-        or not os.path.exists(os.path.expanduser(d))
-        or _is_empty_dir(os.path.expanduser(d))
+        d for d in desired if d not in installed or not is_checkout(os.path.expanduser(d))
     }
     to_update = (
         {d for d in desired & installed if os.path.isdir(os.path.expanduser(d))}
