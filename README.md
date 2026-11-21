@@ -187,7 +187,21 @@ A config _directory_ needs a `machines/` subdirectory with one
 read; nothing else in the directory is.
 
 Any config file may declare `include: [relative/paths...]`; includes are
-resolved relative to the including file and merged underneath it.
+resolved relative to the including file and merged underneath it. Scalars
+from the including file win and mappings recurse. Lists a section manages
+(`files`, `links`, `env.path`, `skills.targets`/`enable`,
+`brew.brews`/`casks`/`taps`, `dock.apps`/`others`, `settingsctl` lists, ...)
+append: included items first, in include order, then the including file's.
+An item repeated later keeps only its last copy (it moves to that position),
+and a later `links:` entry replaces an earlier one with the same target.
+`dock.apps`/`others` append as written, repeats (spacers) included. Every
+other list (`defaults` values, template content, launchd arguments) is
+replaced whole. An included item cannot be removed, so share only items every
+including host wants, and keep order-sensitive lists that differ per host
+(`dock.apps`) out of shared files. Keyed entries still override as their
+section does: a later `files:` entry wins on the same target, and a `brews`
+`{name, restartUnits}` mapping adds units to a shared plain name. Repeated
+`--config` paths still replace lists.
 
 Each file may only use known top-level keys (every section, plus `stateFile`,
 `paths`, `vars`, `include`); anything else fails the load, naming the file.

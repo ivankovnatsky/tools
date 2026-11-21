@@ -120,20 +120,59 @@ class ConfigError(Exception):
     """Raised when the config cannot be resolved into a usable desired state."""
 
 
-def deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+# Managed lists that includes extend instead of replace.
+_APPEND_LISTS = frozenset(
+    (section, *path)
+    for section, keys in _MANAGED_KEYS.items()
+    for path, kind in keys.items()
+    if kind.startswith(_LIST)
+)
+
+
+# Managed lists whose entries an overlay replaces by this key, not only when identical.
+_LIST_ITEM_KEYS = {("links",): "target"}
+# Order and repeats (spacers) are meant: these append without dropping anything.
+_PLAIN_APPEND = frozenset({("dock", "apps"), ("dock", "others")})
+
+
+def _same_item(path: tuple, a: Any, b: Any) -> bool:
+    key = _LIST_ITEM_KEYS.get(path)
+    if key and isinstance(a, dict) and isinstance(b, dict) and key in a:
+        return a.get(key) == b.get(key)
+    return a == b
+
+
+def deep_merge(
+    base: Dict[str, Any], overlay: Dict[str, Any], append_lists: bool = False, _path: tuple = ()
+) -> Dict[str, Any]:
     """Deep-merge overlay into base.
 
     Rules:
       - scalar values: overlay wins
       - dict values: recurse
-      - list values: overlay REPLACES (not appends)
+      - list values: overlay REPLACES, except that with ``append_lists`` a
+        managed list (`files`, `brew.brews`, `dock.apps`, ...) is base's items
+        followed by overlay's, dropping a base item the overlay repeats (for
+        `links`, any base entry with the same target), so later sources win;
+        `dock` lists append as they are
       - missing keys: keep existing value
     """
     result = dict(base)
     for key, overlay_value in overlay.items():
         base_value = result.get(key)
+        path = (*_path, key)
         if isinstance(base_value, dict) and isinstance(overlay_value, dict):
-            result[key] = deep_merge(base_value, overlay_value)
+            result[key] = deep_merge(base_value, overlay_value, append_lists, path)
+        elif (
+            append_lists
+            and path in _APPEND_LISTS
+            and isinstance(base_value, list)
+            and isinstance(overlay_value, list)
+        ):
+            kept = base_value
+            if path not in _PLAIN_APPEND:
+                kept = [v for v in kept if not any(_same_item(path, v, o) for o in overlay_value)]
+            result[key] = kept + overlay_value
         else:
             result[key] = overlay_value
     return result
@@ -193,7 +232,8 @@ def load_config(
     If the file contains an ``include:`` key with a list of relative
     paths, each included file is loaded (recursively) and deep-merged
     in order. The including file's own keys are then merged on top,
-    so local values override included ones.
+    so local values override included ones, and managed lists append
+    (see ``deep_merge``).
 
     Paths in ``include:`` are resolved relative to the directory
     containing the file that declares them. Every file read is appended to
@@ -239,9 +279,9 @@ def load_config(
                 f"(included from {path})"
             )
         included = load_config(resolved, _seen, loaded)
-        merged = deep_merge(merged, included)
+        merged = deep_merge(merged, included, append_lists=True)
 
-    return deep_merge(merged, data)
+    return deep_merge(merged, data, append_lists=True)
 
 
 _PINNED_HOSTNAME: Optional[str] = None

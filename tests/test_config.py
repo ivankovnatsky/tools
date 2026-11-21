@@ -28,6 +28,24 @@ class DeepMergeTest(unittest.TestCase):
 
         self.assertEqual(deep_merge(base, overlay), {"a": {"x": 1, "y": 3}, "l": [9]})
 
+    def test_append_lists_extends_only_managed_lists(self):
+        base = {"brew": {"brews": ["a", "b"]}, "defaults": {"user": {"d": {"k": [1, 2]}}}}
+        overlay = {"brew": {"brews": ["b", "c"]}, "defaults": {"user": {"d": {"k": [3]}}}}
+
+        merged = deep_merge(base, overlay, append_lists=True)
+
+        self.assertEqual(merged["brew"]["brews"], ["a", "b", "c"])
+        self.assertEqual(merged["defaults"]["user"]["d"]["k"], [3])
+
+    def test_append_lists_dedupes_identical_mappings(self):
+        shared = {"source": "s", "target": "~/t"}
+        base = {"files": [shared]}
+        overlay = {"files": [dict(shared), {"source": "s", "target": "~/t", "mode": "0600"}]}
+
+        merged = deep_merge(base, overlay, append_lists=True)
+
+        self.assertEqual(merged["files"], [shared, overlay["files"][1]])
+
 
 class EmptyDesiredStateTest(unittest.TestCase):
     """An empty config now means 'remove everything tracked', so every path
@@ -100,6 +118,80 @@ class IncludeTest(unittest.TestCase):
 
             self.assertEqual(loaded["stateFile"], "/top")
             self.assertIn("a", loaded["npm"]["packages"])
+
+    def test_included_managed_lists_append_in_include_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "a.yaml"), "dock:\n  apps: [A, B]\n")
+            _write(
+                os.path.join(d, "b.yaml"),
+                "dock:\n  apps: [B, C]\ndefaults:\n  user:\n    d:\n      k: [0]\n",
+            )
+            _write(
+                os.path.join(d, "top.yaml"),
+                "include: [a.yaml, b.yaml]\ndock:\n  apps: [D, A]\n"
+                "defaults:\n  user:\n    d:\n      k: [1]\n",
+            )
+
+            loaded = load_config(os.path.join(d, "top.yaml"))
+
+            self.assertEqual(loaded["dock"]["apps"], ["A", "B", "B", "C", "D", "A"])
+            self.assertEqual(loaded["defaults"]["user"]["d"]["k"], [1])
+
+    def test_dock_spacers_repeat_across_includes(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "inc.yaml"), "dock:\n  apps: [A, spacer, B, {spacer: small}]\n")
+            _write(
+                os.path.join(d, "top.yaml"),
+                "include: [inc.yaml]\ndock:\n  apps: [spacer, C, {spacer: small}]\n",
+            )
+
+            loaded = load_config(os.path.join(d, "top.yaml"))
+
+            self.assertEqual(
+                loaded["dock"]["apps"],
+                ["A", "spacer", "B", {"spacer": "small"}, "spacer", "C", {"spacer": "small"}],
+            )
+
+    def test_host_repeating_an_earlier_include_entry_wins(self):
+        a = "- {source: a, target: ~/t}\n"
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "i1.yaml"), "files:\n  " + a)
+            _write(os.path.join(d, "i2.yaml"), "files:\n  - {source: b, target: ~/t}\n")
+            _write(os.path.join(d, "top.yaml"), "include: [i1.yaml, i2.yaml]\nfiles:\n  " + a)
+
+            loaded = load_config(os.path.join(d, "top.yaml"))
+
+            self.assertEqual(
+                loaded["files"],
+                [{"source": "b", "target": "~/t"}, {"source": "a", "target": "~/t"}],
+            )
+
+    def test_host_link_replaces_an_included_link_on_the_same_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(
+                os.path.join(d, "inc.yaml"),
+                "links:\n  - {source: ~/a, target: ~/t}\n  - {source: ~/k, target: ~/u}\n",
+            )
+            _write(
+                os.path.join(d, "top.yaml"),
+                "include: [inc.yaml]\nlinks:\n  - {source: ~/b, target: ~/t}\n",
+            )
+
+            loaded = load_config(os.path.join(d, "top.yaml"))
+
+            self.assertEqual(
+                loaded["links"],
+                [{"source": "~/k", "target": "~/u"}, {"source": "~/b", "target": "~/t"}],
+            )
+
+    def test_null_managed_list_over_an_include_stays_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "a.yaml"), "brew:\n  casks: [x]\n")
+            _write(os.path.join(d, "top.yaml"), "include: [a.yaml]\nbrew:\n  casks:\n")
+
+            loaded = load_config(os.path.join(d, "top.yaml"))
+
+            self.assertIsNone(loaded["brew"]["casks"])
 
     def test_missing_include_raises(self):
         with tempfile.TemporaryDirectory() as d:
