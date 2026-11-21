@@ -1644,3 +1644,49 @@ class BrewRestartUnitsTest(unittest.TestCase):
         self.assertTrue(self._run({"brews": [{"name": "jq"}]}, state, fake_run))
         self.assertIn(["/brew", "uninstall", "forgejo"], calls)
         self.assertEqual(state["brew"]["brews"], ["jq"])
+
+
+class BrewKeepTapOfKeptPackageTest(unittest.TestCase):
+    """A tap stays while a package tools still owns is installed from it."""
+
+    def _run(self, config, state, fake, phase=None):
+        with (
+            mock.patch.object(brew.sys, "platform", "darwin"),
+            mock.patch.object(brew, "_brew_bin", return_value="/brew"),
+            mock.patch.object(brew, "run_command", fake),
+        ):
+            return brew.install_brew_packages(config, state, phase=phase)
+
+    def _untaps(self, fake):
+        return [c[2] for c in fake.calls if c[1] == "untap"]
+
+    def test_failed_move_keeps_the_old_tap_until_the_old_package_is_gone(self):
+        fake = FakeBrew(formulae={"a/b/foo": {}, "user": {"deps": ["a/b/foo"]}}, taps=["a/b"])
+        state = _state(brews=["a/b/foo"], taps=["a/b"])
+        config = {"brews": ["c/d/foo"], "taps": ["c/d"]}
+        self.assertFalse(self._run(config, state, fake))
+        self.assertEqual(self._untaps(fake), [])
+        self.assertEqual(state["brew"]["brews"], ["a/b/foo"])
+        self.assertIn("a/b", state["brew"]["taps"])
+
+        del fake.formulae["user"]
+        fake.calls.clear()
+        self.assertTrue(self._run(config, state, fake))
+        self.assertEqual(self._untaps(fake), ["a/b"])
+        self.assertEqual(state["brew"]["brews"], ["c/d/foo"])
+        self.assertEqual(state["brew"]["taps"], ["c/d"])
+
+    def test_remove_phase_keeps_the_tap_of_a_move_the_install_phase_skipped(self):
+        fake = FakeBrew(formulae={"a/b/foo": {}}, taps=["a/b"])
+        state = _state(brews=["a/b/foo"], taps=["a/b"])
+        config = {"brews": ["c/d/foo"], "taps": ["c/d"]}
+        self._run(config, state, fake, phase=brew.REMOVE)
+        self.assertEqual(self._untaps(fake), [])
+        self.assertIn("a/b", state["brew"]["taps"])
+
+    def test_failed_removal_keeps_its_tap(self):
+        fake = FakeBrew(formulae={"a/b/bar": {}, "user": {"deps": ["a/b/bar"]}}, taps=["a/b"])
+        state = _state(brews=["a/b/bar"], taps=["a/b"])
+        self.assertFalse(self._run({"brews": []}, state, fake))
+        self.assertEqual(self._untaps(fake), [])
+        self.assertIn("a/b", state["brew"]["taps"])

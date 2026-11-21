@@ -1145,7 +1145,14 @@ def install_brew_packages(
             autoremove_failed = True
 
     # --- Untap and untrust last, once nothing installed still loads from them ---
+    # A dropped package still installed (failed removal, or a move not yet run)
+    # keeps its tap: brew refuses the untap. The next run retries it.
+    leftover = (set(whole["brews_remove"]) & inst_brews) | (set(whole["casks_remove"]) & inst_casks)
+    in_use = {_tap_of(n) for n in leftover}
     for tap in sorted(set(plan["taps_remove"]) | set(clean["taps"])):
+        if _normalize_tap(tap).lower() in in_use:
+            log(f"Keeping tap {tap}: a package from it is still installed", Color.YELLOW)
+            continue
         log(f"Untapping {tap}", Color.RED)
         rc, _, stderr = run_command([brew, "untap", tap], env)
         if rc != 0:
